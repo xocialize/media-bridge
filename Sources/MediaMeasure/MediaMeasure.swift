@@ -1,22 +1,20 @@
 //
 // MediaMeasure.swift — MediaMeasure
 //
-// Video quality measurement. The FFmpeg VMAF path (subprocess to `ffmpeg -lavfi libvmaf`) is
-// **dropped**; replaced by **SSIMULACRA2-video** (decision: results matter, not VMAF comparability).
-// PSNR/SSIM (pure-Swift luma math from format-bridge's QualityMeasure) are salvaged as cheap extras.
-//
-// Approach: decode reference + distorted natively (MediaImport) → score per-frame with SSIMULACRA2
-// (extends ImageBridge's still scorer) → aggregate. NOTE per the salvage audit: the SSIMULACRA2
-// scorer is a SUBPROCESS to libjxl's `ssimulacra2` binary (brew install jpeg-xl) — fine for
-// optimizer-time / content-prep use, but a pure-Swift/Metal port would be needed for on-device
-// scoring inside a shipping app. Tracked as a follow-up, not a Phase 4 blocker.
+// Video quality measurement. The FFmpeg VMAF path is dropped; quality = **SSIMULACRA2**, now a
+// pure-Swift port (`SSIMULACRA2.score`) — F1 done, NO external libjxl binary. Per-frame scoring for
+// a video pair (decode both via MediaImport, score each frame, aggregate) is the remaining wrapper;
+// the metric itself is complete and validated against the reference binary (~3 pt, exact at identity).
 //
 // Phase 4 of MEDIABRIDGE-PLAN.md.
 //
 
+import CoreGraphics
 import Foundation
-import ImageBridge
 
 public enum MediaMeasure {
-    public static let scaffolded = true
+    /// Image-pair SSIMULACRA2 score (100 = identical). See `SSIMULACRA2`.
+    public static func ssimulacra2(reference: CGImage, distorted: CGImage) throws -> Double {
+        try SSIMULACRA2.score(reference: reference, distorted: distorted)
+    }
 }
