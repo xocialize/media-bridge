@@ -34,10 +34,9 @@ let package = Package(
                                .product(name: "MatroskaDemux", package: "matroska-swift")],
                 swiftSettings: [.swiftLanguageMode(.v5)]),
         .target(name: "ImageBridge", swiftSettings: [.swiftLanguageMode(.v5)]),
-        .target(name: "MediaMeasure", dependencies: ["ImageBridge"],
-                swiftSettings: [.swiftLanguageMode(.v5)]),
+        .target(name: "MediaMeasure", swiftSettings: [.swiftLanguageMode(.v5)]),
         .testTarget(name: "MediaBridgeTests",
-                    dependencies: ["MediaBridge", "MediaImport", "MediaMeasure",
+                    dependencies: ["MediaBridge", "MediaImport", "MediaMeasure", "ImageBridge",
                                    .product(name: "MatroskaDemux", package: "matroska-swift")]),
     ]
 )

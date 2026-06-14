@@ -9,7 +9,13 @@ measure quality. Targets:
   `matroska-swift`'s `MatroskaDemux`. **CMTime conversion (ns→CMTime) happens here**, not in the demuxer.
 - **`MediaBridge`** — convert/normalize orchestration, native HEVC/H.264 + AAC encode (AVAssetWriter),
   probe, ShotDetector. The public surface.
-- **`ImageBridge`** — stills (ImageIO/oxipng/SSIMULACRA2/PDF/GIF), salvaged 1:1 from format-bridge.
+- **`ImageBridge`** — stills: ImageIO decode/encode (PNG/JPEG/HEIC/AVIF/TIFF), PDF rasterize, alpha
+  split, tiled `FrameProcessor` AI-chain seam (`ModelChain` — how ForgeOptimizer injects
+  Real-ESRGAN/NAFNet), decode→process→encode orchestrator. **Salvaged binary-free** — DROPPED on
+  copy: `OxipngOptimizer`/`COxipng` (vendored 6.2 MB liboxipng .a), `SSIMULACRA2Scorer` (libjxl
+  subprocess → use `MediaMeasure.SSIMULACRA2`), `StillQualityTarget`/`StillOptimizer` (redundant with
+  `MediaMeasure.ImageQualityTarget`), `AnimatedToVideoConverter`+CLI (video-encode coupling). Quality-
+  targeted still encode lives in `MediaMeasure.ImageQualityTarget` (pure SSIMULACRA2 oracle).
 - **`MediaMeasure`** — SSIMULACRA2-video quality (replaces the FFmpeg+libvmaf VMAF path).
 
 ## Doctrine (see ../CLAUDE.md for the full rules)
