@@ -25,9 +25,11 @@ MediaMeasure  SSIMULACRA2-video quality (replaces the FFmpeg+libvmaf VMAF path).
 
 ## Status
 
-Scaffold (Phase 0). Depends on [`matroska-swift`](../matroska-swift) by local path during dev (flips
-to a versioned `github.com/xocialize` URL at Phase 5). The SupportGate is implemented; decode/encode
-and the salvaged FormatBridge/ImageBridge surfaces land in Phases 2–4. See `MEDIABRIDGE-PLAN.md`.
+Working. Depends on [`matroska-swift`](https://github.com/xocialize/matroska-swift) by versioned URL
+(`from: "0.1.0"`). Implemented: the any-container→native HEVC+AAC normalizer (native-container fast
+path via `AVAssetExportSession`; MKV/WebM via the pure-Swift demuxer → VideoToolbox/AudioToolbox decode
+→ encode, memory-bounded), `MediaBridge.probe`, `ImageBridge` stills, and a pure-Swift `SSIMULACRA2`
+with quality-targeted encode. Native codecs: H.264 / HEVC / AV1 (M3+) video, AAC / Opus audio.
 
 ## Requirements
 
