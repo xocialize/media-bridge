@@ -16,6 +16,7 @@ import CoreVideo
 import Foundation
 import MatroskaDemux
 import MediaImport
+import VideoToolbox
 
 public enum MediaBridge {
 
@@ -48,14 +49,19 @@ public enum MediaBridge {
         guard SupportGate.status(forCodecID: track.codecID) == .nativeVideo else {
             throw NormalizeError.deferredCodec(track.codecID)
         }
+        // AV1 is HW-only (M3+): if this machine can't decode it, treat it as deferred, not a crash.
+        if track.codecID == "V_AV1", !VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1) {
+            throw NormalizeError.deferredCodec(track.codecID)
+        }
 
         let allPackets = try demuxer.readAllPackets()
         let videoPackets = allPackets
             .filter { $0.trackNumber == track.number }
             .map { (data: $0.data, ptsNanos: $0.ptsNanos) }
 
-        let formatDesc = try FormatDescriptionFactory.makeVideo(codecID: track.codecID,
-                                                                codecPrivate: track.codecPrivate)
+        let formatDesc = try FormatDescriptionFactory.makeVideo(
+            codecID: track.codecID, codecPrivate: track.codecPrivate,
+            width: track.video?.pixelWidth ?? 0, height: track.video?.pixelHeight ?? 0)
         let frames = try VideoDecodeSession(formatDescription: formatDesc).decode(videoPackets)
         guard let first = frames.first else { throw NormalizeError.noFramesDecoded }
 

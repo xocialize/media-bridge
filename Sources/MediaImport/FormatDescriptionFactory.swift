@@ -19,9 +19,10 @@ public enum FormatDescriptionError: Error, Equatable {
 
 public enum FormatDescriptionFactory {
 
-    /// Build a video format description for a natively-decodable codec. AV1 (`V_AV1`) is handled
-    /// separately (manual `av1C`, no convenience API) — not yet implemented here.
-    public static func makeVideo(codecID: String, codecPrivate: Data?) throws -> CMFormatDescription {
+    /// Build a video format description for a natively-decodable codec. `width`/`height` are required
+    /// only for AV1 (it has no parameter-set convenience API, so dimensions come from the track).
+    public static func makeVideo(codecID: String, codecPrivate: Data?,
+                                 width: Int = 0, height: Int = 0) throws -> CMFormatDescription {
         switch codecID {
         case "V_MPEG4/ISO/AVC":
             guard let p = codecPrivate else { throw FormatDescriptionError.missingCodecPrivate("avcC") }
@@ -29,9 +30,31 @@ public enum FormatDescriptionFactory {
         case "V_MPEGH/ISO/HEVC":
             guard let p = codecPrivate else { throw FormatDescriptionError.missingCodecPrivate("hvcC") }
             return try makeHEVC(hvcC: [UInt8](p))
+        case "V_AV1":
+            guard let p = codecPrivate else { throw FormatDescriptionError.missingCodecPrivate("av1C") }
+            return try makeAV1(av1C: p, width: width, height: height)
         default:
             throw FormatDescriptionError.unsupportedCodec(codecID)
         }
+    }
+
+    // MARK: - AV1 (av1C, no convenience API)
+
+    /// AV1 has no `CMVideoFormatDescriptionCreateFromAV1ParameterSets`; build the description manually
+    /// with `kCMVideoCodecType_AV1` + the `av1C` configuration record (which carries the sequence-
+    /// header OBU) as a sample-description extension atom. In Matroska, CodecPrivate **is** the av1C.
+    private static func makeAV1(av1C: Data, width: Int, height: Int) throws -> CMFormatDescription {
+        guard width > 0, height > 0 else { throw FormatDescriptionError.malformed("AV1 needs dimensions") }
+        let extensions: [CFString: Any] = [
+            kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: ["av1C": av1C],
+        ]
+        var fmt: CMFormatDescription?
+        let st = CMVideoFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault, codecType: kCMVideoCodecType_AV1,
+            width: Int32(width), height: Int32(height),
+            extensions: extensions as CFDictionary, formatDescriptionOut: &fmt)
+        guard st == noErr, let f = fmt else { throw FormatDescriptionError.vt(st) }
+        return f
     }
 
     // MARK: - H.264 (avcC, ISO/IEC 14496-15)
