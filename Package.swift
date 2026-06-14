@@ -21,8 +21,7 @@ let package = Package(
         .library(name: "MediaMeasure", targets: ["MediaMeasure"]),
     ],
     dependencies: [
-        // Local during dev; flips to a versioned github.com/xocialize URL when both publish (Phase 5).
-        .package(path: "../matroska-swift"),
+        .package(url: "https://github.com/xocialize/matroska-swift.git", from: "0.1.0"),
     ],
     targets: [
         .target(
