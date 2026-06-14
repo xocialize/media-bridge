@@ -93,7 +93,7 @@ public enum MediaBridge {
             audioCodecID: hasAudio ? "native" : nil)
     }
 
-    private static func fourCC(_ code: FourCharCode) -> String {
+    static func fourCC(_ code: FourCharCode) -> String {
         let bytes = [UInt8((code >> 24) & 0xFF), UInt8((code >> 16) & 0xFF),
                      UInt8((code >> 8) & 0xFF), UInt8(code & 0xFF)]
         return String(bytes: bytes, encoding: .ascii) ?? "?"
