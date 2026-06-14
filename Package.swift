@@ -30,7 +30,9 @@ let package = Package(
             dependencies: [.product(name: "MatroskaDemux", package: "matroska-swift")],
             swiftSettings: [.swiftLanguageMode(.v5)]   // CMSampleBuffer/CVPixelBuffer aren't Sendable
         ),
-        .target(name: "MediaBridge", dependencies: ["MediaImport"],
+        .target(name: "MediaBridge",
+                dependencies: ["MediaImport",
+                               .product(name: "MatroskaDemux", package: "matroska-swift")],
                 swiftSettings: [.swiftLanguageMode(.v5)]),
         .target(name: "ImageBridge", swiftSettings: [.swiftLanguageMode(.v5)]),
         .target(name: "MediaMeasure", dependencies: ["ImageBridge"],
