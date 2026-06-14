@@ -11,6 +11,7 @@
 // this is the video path; audio mux + AV1 land alongside the rest of Phase 2–3.
 //
 
+import AVFoundation
 import CoreMedia
 import CoreVideo
 import Foundation
@@ -35,11 +36,73 @@ public enum MediaBridge {
         /// future SupportGate fallback. Surfaced here, never silently produced as a broken file.
         case deferredCodec(String)
         case noFramesDecoded
+        case exportFailed(String)
     }
 
-    /// Normalize a Matroska/WebM file's video to a native HEVC/BT.709 mp4. Video-only for now.
+    /// Normalize any supported container's video to a native HEVC mp4 (with AAC audio). Routes:
+    /// AVFoundation-readable native containers (mp4/mov/m4v) take the fast AVAssetExportSession path
+    /// (passthrough if already HEVC, hardware transcode otherwise); non-native (MKV/WebM) take the
+    /// pure-Swift demux → native-decode → encode path.
     @discardableResult
     public static func normalizeVideoToHEVC(input: URL, output: URL) async throws -> NormalizeResult {
+        if let native = try await normalizeNativeContainer(input: input, output: output) {
+            return native
+        }
+        return try await normalizeMatroska(input: input, output: output)
+    }
+
+    // MARK: - Native-container fast path (AVFoundation)
+
+    /// Returns nil if AVFoundation can't read the input (→ caller falls back to the Matroska path).
+    private static func normalizeNativeContainer(input: URL, output: URL) async throws -> NormalizeResult? {
+        let asset = AVURLAsset(url: input)
+        guard let vtrack = (try? await asset.loadTracks(withMediaType: .video))?.first else {
+            return nil                                   // not AVFoundation-readable (e.g. MKV/WebM)
+        }
+        let size = try await vtrack.load(.naturalSize)
+        let frameRate = try await vtrack.load(.nominalFrameRate)
+        let duration = try await asset.load(.duration)
+        let formats = try await vtrack.load(.formatDescriptions)
+        let codec = formats.first.map { fourCC(CMFormatDescriptionGetMediaSubType($0)) } ?? "?"
+        let hasAudio = !((try? await asset.loadTracks(withMediaType: .audio)) ?? []).isEmpty
+
+        // Already HEVC → remux passthrough (no re-encode); otherwise hardware transcode to HEVC.
+        let alreadyHEVC = (codec == "hvc1" || codec == "hev1")
+        let preset = alreadyHEVC ? AVAssetExportPresetPassthrough : AVAssetExportPresetHEVCHighestQuality
+        guard let export = AVAssetExportSession(asset: asset, presetName: preset) else {
+            throw NormalizeError.exportFailed("no export session for preset \(preset)")
+        }
+        try? FileManager.default.removeItem(at: output)
+        export.outputURL = output
+        export.outputFileType = .mp4
+
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            export.exportAsynchronously {
+                switch export.status {
+                case .completed: cont.resume()
+                default: cont.resume(throwing: NormalizeError.exportFailed(
+                    export.error?.localizedDescription ?? "status \(export.status.rawValue)"))
+                }
+            }
+        }
+
+        return NormalizeResult(
+            sourceCodecID: codec,
+            width: Int(abs(size.width).rounded()), height: Int(abs(size.height).rounded()),
+            frameCount: Int((duration.seconds * Double(frameRate)).rounded()),
+            audioCodecID: hasAudio ? "native" : nil)
+    }
+
+    private static func fourCC(_ code: FourCharCode) -> String {
+        let bytes = [UInt8((code >> 24) & 0xFF), UInt8((code >> 16) & 0xFF),
+                     UInt8((code >> 8) & 0xFF), UInt8(code & 0xFF)]
+        return String(bytes: bytes, encoding: .ascii) ?? "?"
+    }
+
+    // MARK: - Non-native (Matroska/WebM) path
+
+    /// Pure-Swift demux → native decode → native HEVC/AAC encode for non-AVFoundation containers.
+    private static func normalizeMatroska(input: URL, output: URL) async throws -> NormalizeResult {
         let demuxer = MatroskaDemuxer(data: try Data(contentsOf: input))
         try demuxer.parseHeaders()
 
