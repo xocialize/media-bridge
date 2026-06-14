@@ -25,19 +25,52 @@ public final class AudioDecodeSession {
 
     private let converter: AudioConverterRef
     private let channels: Int
-    private let sampleRate: Double
+    private let sampleRate: Double          // the OUTPUT (PCM) sample rate
 
-    public init(codecID: String, codecPrivate: Data?, sampleRate: Double, channels: Int) throws {
-        guard codecID.hasPrefix("A_AAC") else { throw AudioDecodeError.unsupported(codecID) }
+    /// Matroska audio CodecIDs this session can decode via AudioConverter. AAC + Opus are verified.
+    /// FLAC is NOT here: AudioConverter rejects FLAC's ASBD ('bada' at AudioConverterNew) — macOS
+    /// decodes FLAC only via the file-based AVAudioFile/ExtAudioFile path (a heavier detour, deferred).
+    public static func isSupported(codecID: String) -> Bool {
+        codecID.hasPrefix("A_AAC") || codecID == "A_OPUS"
+    }
+
+    public init(codecID: String, codecPrivate: Data?, sampleRate: Double, channels: Int,
+                bitDepth: Int = 16) throws {
         self.channels = max(1, channels)
-        self.sampleRate = sampleRate
+
+        // codec → (AudioToolbox formatID, frames/packet hint, decode output sample rate, source bit
+        // depth). Opus always decodes at 48 kHz; AAC/FLAC at the track rate. FLAC is lossless, so its
+        // decoder needs the source bit depth in the input ASBD (0 → AudioConverterNew fails 'bada').
+        let formatID: AudioFormatID
+        let framesPerPacket: UInt32
+        let inputRate: Double
+        var inBits: UInt32 = 0
+        switch codecID {
+        case let c where c.hasPrefix("A_AAC"): formatID = kAudioFormatMPEG4AAC; framesPerPacket = 1024; inputRate = sampleRate
+        case "A_FLAC":                         formatID = kAudioFormatFLAC;      framesPerPacket = 4096; inputRate = sampleRate; inBits = UInt32(bitDepth > 0 ? bitDepth : 16)
+        case "A_OPUS":                         formatID = kAudioFormatOpus;      framesPerPacket = 960;  inputRate = 48_000
+        default: throw AudioDecodeError.unsupported(codecID)
+        }
+        self.sampleRate = inputRate
 
         var inASBD = AudioStreamBasicDescription(
-            mSampleRate: sampleRate, mFormatID: kAudioFormatMPEG4AAC, mFormatFlags: 0,
-            mBytesPerPacket: 0, mFramesPerPacket: 1024, mBytesPerFrame: 0,
-            mChannelsPerFrame: UInt32(self.channels), mBitsPerChannel: 0, mReserved: 0)
+            mSampleRate: inputRate, mFormatID: formatID, mFormatFlags: 0,
+            mBytesPerPacket: 0, mFramesPerPacket: framesPerPacket, mBytesPerFrame: 0,
+            mChannelsPerFrame: UInt32(self.channels), mBitsPerChannel: inBits, mReserved: 0)
+
+        // FLAC's decoder rejects a hand-built input ASBD ('bada'); derive the correct one from the
+        // magic cookie (fLaC + STREAMINFO) via the FormatList property.
+        if formatID == kAudioFormatFLAC, let cookie = codecPrivate, !cookie.isEmpty {
+            var item = AudioFormatListItem()
+            var sz = UInt32(MemoryLayout<AudioFormatListItem>.size)
+            let st = cookie.withUnsafeBytes {
+                AudioFormatGetProperty(kAudioFormatProperty_FormatList,
+                                       UInt32(cookie.count), $0.baseAddress, &sz, &item)
+            }
+            if st == noErr { inASBD = item.mASBD }
+        }
         var outASBD = AudioStreamBasicDescription(
-            mSampleRate: sampleRate, mFormatID: kAudioFormatLinearPCM,
+            mSampleRate: inputRate, mFormatID: kAudioFormatLinearPCM,
             mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
             mBytesPerPacket: UInt32(2 * self.channels), mFramesPerPacket: 1,
             mBytesPerFrame: UInt32(2 * self.channels), mChannelsPerFrame: UInt32(self.channels),
@@ -47,6 +80,8 @@ public final class AudioDecodeSession {
         let st = AudioConverterNew(&inASBD, &outASBD, &conv)
         guard st == noErr, let c = conv else { throw AudioDecodeError.converter(st) }
         converter = c
+        // Magic cookie: AAC = AudioSpecificConfig; FLAC = fLaC marker + STREAMINFO; Opus = OpusHead.
+        // In Matroska, each is exactly the track CodecPrivate.
         if let cookie = codecPrivate, !cookie.isEmpty {
             _ = cookie.withUnsafeBytes {
                 AudioConverterSetProperty(c, kAudioConverterDecompressionMagicCookie,

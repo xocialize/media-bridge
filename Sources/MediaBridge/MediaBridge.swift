@@ -62,20 +62,27 @@ public enum MediaBridge {
         let w = CVPixelBufferGetWidth(first.image)
         let h = CVPixelBufferGetHeight(first.image)
 
-        // Optional audio: decode a natively-supported track to PCM, then AAC-re-encode into the mp4
-        // (robust esds, vs. the AVFoundation-invalid hand-built passthrough). AAC first; FLAC/Opus
-        // extend AudioDecodeSession with their cookies/frames-per-packet next.
+        // Optional audio: decode a natively-supported track (AAC/FLAC/Opus) to PCM, then AAC-re-encode
+        // into the mp4 (robust esds, vs. the AVFoundation-invalid hand-built passthrough).
         let audioTrack = demuxer.tracks.first {
-            $0.type == .audio && $0.codecID.hasPrefix("A_AAC")
+            $0.type == .audio && AudioDecodeSession.isSupported(codecID: $0.codecID)
                 && SupportGate.status(forCodecID: $0.codecID) == .nativeAudio && $0.codecPrivate != nil
         }
+        // Best-effort: a problematic audio track degrades to a video-only output, never fails the job.
         var audioPCM: AudioDecodeSession.PCM?
+        var muxedAudioCodec: String?
         if let at = audioTrack {
-            let packets = allPackets.filter { $0.trackNumber == at.number }.map(\.data)
-            let decoder = try AudioDecodeSession(
-                codecID: at.codecID, codecPrivate: at.codecPrivate,
-                sampleRate: at.audio?.samplingFrequency ?? 48_000, channels: at.audio?.channels ?? 2)
-            audioPCM = try decoder.decode(packets)
+            do {
+                let packets = allPackets.filter { $0.trackNumber == at.number }.map(\.data)
+                let decoder = try AudioDecodeSession(
+                    codecID: at.codecID, codecPrivate: at.codecPrivate,
+                    sampleRate: at.audio?.samplingFrequency ?? 48_000,
+                    channels: at.audio?.channels ?? 2, bitDepth: at.audio?.bitDepth ?? 16)
+                let pcm = try decoder.decode(packets)
+                if pcm.frameCount > 0 { audioPCM = pcm; muxedAudioCodec = at.codecID }
+            } catch {
+                audioPCM = nil          // drop audio rather than fail the normalize
+            }
         }
 
         let basePTS = frames.map(\.ptsNanos).min() ?? 0   // re-base video so output starts at 0
@@ -90,6 +97,6 @@ public enum MediaBridge {
         try await writer.finish()
 
         return NormalizeResult(sourceCodecID: track.codecID, width: w, height: h,
-                               frameCount: frames.count, audioCodecID: audioTrack?.codecID)
+                               frameCount: frames.count, audioCodecID: muxedAudioCodec)
     }
 }
