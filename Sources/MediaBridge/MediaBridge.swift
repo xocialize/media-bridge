@@ -125,19 +125,13 @@ public enum MediaBridge {
         let formatDesc = try FormatDescriptionFactory.makeVideo(
             codecID: track.codecID, codecPrivate: track.codecPrivate,
             width: track.video?.pixelWidth ?? 0, height: track.video?.pixelHeight ?? 0)
-        let frames = try VideoDecodeSession(formatDescription: formatDesc).decode(videoPackets)
-        guard let first = frames.first else { throw NormalizeError.noFramesDecoded }
 
-        let w = CVPixelBufferGetWidth(first.image)
-        let h = CVPixelBufferGetHeight(first.image)
-
-        // Optional audio: decode a natively-supported track (AAC/FLAC/Opus) to PCM, then AAC-re-encode
-        // into the mp4 (robust esds, vs. the AVFoundation-invalid hand-built passthrough).
+        // Optional audio: decode a natively-supported track (AAC/Opus) to PCM up front, then AAC-
+        // re-encode into the mp4. Best-effort — a problematic audio track degrades to video-only.
         let audioTrack = demuxer.tracks.first {
             $0.type == .audio && AudioDecodeSession.isSupported(codecID: $0.codecID)
                 && SupportGate.status(forCodecID: $0.codecID) == .nativeAudio && $0.codecPrivate != nil
         }
-        // Best-effort: a problematic audio track degrades to a video-only output, never fails the job.
         var audioPCM: AudioDecodeSession.PCM?
         var muxedAudioCodec: String?
         if let at = audioTrack {
@@ -154,18 +148,32 @@ public enum MediaBridge {
             }
         }
 
-        let basePTS = frames.map(\.ptsNanos).min() ?? 0   // re-base video so output starts at 0
+        // Stream decode → encode: the writer is created lazily on the first frame (so it gets the
+        // real dimensions), and only a bounded reorder window of pixel buffers is ever live.
+        var writer: NativeMP4Writer?
+        var basePTS: Int64?
+        var outW = 0, outH = 0, frameCount = 0
+        try await VideoDecodeSession(formatDescription: formatDesc)
+            .decodeStreaming(videoPackets) { frame in
+                if writer == nil {
+                    outW = CVPixelBufferGetWidth(frame.image)
+                    outH = CVPixelBufferGetHeight(frame.image)
+                    basePTS = frame.ptsNanos          // first emitted frame = lowest PTS
+                    writer = try NativeMP4Writer(
+                        output: output, width: outW, height: outH,
+                        audioPCM: audioPCM.map { ($0.sampleRate, $0.channels) })
+                }
+                try await writer!.appendVideo(frame.image, ptsNanos: frame.ptsNanos - (basePTS ?? 0))
+                frameCount += 1
+            }
+        guard let writer else { throw NormalizeError.noFramesDecoded }
 
-        let writer = try NativeMP4Writer(
-            output: output, width: w, height: h,
-            audioPCM: audioPCM.map { ($0.sampleRate, $0.channels) })
-        for f in frames { try await writer.appendVideo(f.image, ptsNanos: f.ptsNanos - basePTS) }
         if let pcm = audioPCM, pcm.frameCount > 0 {
             try await writer.appendAudio(pcm.makeSampleBuffer(ptsNanos: 0))
         }
         try await writer.finish()
 
-        return NormalizeResult(sourceCodecID: track.codecID, width: w, height: h,
-                               frameCount: frames.count, audioCodecID: muxedAudioCodec)
+        return NormalizeResult(sourceCodecID: track.codecID, width: outW, height: outH,
+                               frameCount: frameCount, audioCodecID: muxedAudioCodec)
     }
 }

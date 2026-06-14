@@ -53,6 +53,21 @@ public final class VideoDecodeSession {
             lock.lock(); defer { lock.unlock() }
             return frames.sorted { $0.ptsNanos < $1.ptsNanos }
         }
+        /// Remove and return the lowest-PTS frame only once the buffer exceeds the reorder window —
+        /// by then no not-yet-emitted frame can have an earlier PTS, so the min is final.
+        func popMinIfOver(_ window: Int) -> DecodedVideoFrame? {
+            lock.lock(); defer { lock.unlock() }
+            guard frames.count > window else { return nil }
+            var mi = 0
+            for i in 1..<frames.count where frames[i].ptsNanos < frames[mi].ptsNanos { mi = i }
+            return frames.remove(at: mi)
+        }
+        func drainSortedByPTS() -> [DecodedVideoFrame] {
+            lock.lock(); defer { lock.unlock() }
+            let out = frames.sorted { $0.ptsNanos < $1.ptsNanos }
+            frames.removeAll()
+            return out
+        }
     }
 
     /// Decode AVCC packets (`(data, ptsNanos)`) → BGRA frames, sorted by PTS.
@@ -73,6 +88,32 @@ public final class VideoDecodeSession {
         }
         VTDecompressionSessionWaitForAsynchronousFrames(session)
         return sink.sortedByPTS()
+    }
+
+    /// Streaming decode: emits each frame in PTS order via `onFrame` while keeping only a bounded
+    /// reorder window (`reorderWindow` ≥ the codec's max reorder depth) of pixel buffers live, so
+    /// memory stays bounded regardless of clip length. `onFrame` is awaited (back-pressure from the
+    /// encoder), and the held frames drain as it consumes them.
+    public func decodeStreaming(_ packets: [(data: Data, ptsNanos: Int64)],
+                                reorderWindow: Int = 32,
+                                onFrame: (DecodedVideoFrame) async throws -> Void) async throws {
+        let sink = Sink()
+        for pkt in packets {
+            let sample = try makeSampleBuffer(avcc: pkt.data, ptsNanos: pkt.ptsNanos)
+            var infoOut = VTDecodeInfoFlags()
+            let status = VTDecompressionSessionDecodeFrame(
+                session, sampleBuffer: sample,
+                flags: [._EnableAsynchronousDecompression], infoFlagsOut: &infoOut
+            ) { status, _, imageBuffer, pts, _ in
+                guard status == noErr, let img = imageBuffer else { return }
+                let ns = pts.isValid ? Int64((pts.seconds * 1_000_000_000).rounded()) : pkt.ptsNanos
+                sink.append(DecodedVideoFrame(image: img, ptsNanos: ns))
+            }
+            guard status == noErr else { throw DecodeError.decode(status) }
+            while let frame = sink.popMinIfOver(reorderWindow) { try await onFrame(frame) }
+        }
+        VTDecompressionSessionWaitForAsynchronousFrames(session)
+        for frame in sink.drainSortedByPTS() { try await onFrame(frame) }
     }
 
     // MARK: - CMSampleBuffer construction
