@@ -11,6 +11,7 @@
 // this is the video path; audio mux + AV1 land alongside the rest of Phase 2–3.
 //
 
+import CoreMedia
 import CoreVideo
 import Foundation
 import MatroskaDemux
@@ -23,6 +24,8 @@ public enum MediaBridge {
         public let width: Int
         public let height: Int
         public let frameCount: Int
+        /// The source audio codec muxed (passthrough), or nil if there was no mp4-muxable audio.
+        public let audioCodecID: String?
     }
 
     public enum NormalizeError: Error, Equatable {
@@ -46,24 +49,47 @@ public enum MediaBridge {
             throw NormalizeError.deferredCodec(track.codecID)
         }
 
-        let packets = try demuxer.readAllPackets()
+        let allPackets = try demuxer.readAllPackets()
+        let videoPackets = allPackets
             .filter { $0.trackNumber == track.number }
             .map { (data: $0.data, ptsNanos: $0.ptsNanos) }
 
         let formatDesc = try FormatDescriptionFactory.makeVideo(codecID: track.codecID,
                                                                 codecPrivate: track.codecPrivate)
-        let frames = try VideoDecodeSession(formatDescription: formatDesc).decode(packets)
+        let frames = try VideoDecodeSession(formatDescription: formatDesc).decode(videoPackets)
         guard let first = frames.first else { throw NormalizeError.noFramesDecoded }
 
         let w = CVPixelBufferGetWidth(first.image)
         let h = CVPixelBufferGetHeight(first.image)
-        let basePTS = frames.map(\.ptsNanos).min() ?? 0   // re-base so output starts at 0
 
-        let encoder = try NativeVideoEncoder(output: output, width: w, height: h)
-        for f in frames { try await encoder.append(f.image, ptsNanos: f.ptsNanos - basePTS) }
-        try await encoder.finish()
+        // Optional audio: decode a natively-supported track to PCM, then AAC-re-encode into the mp4
+        // (robust esds, vs. the AVFoundation-invalid hand-built passthrough). AAC first; FLAC/Opus
+        // extend AudioDecodeSession with their cookies/frames-per-packet next.
+        let audioTrack = demuxer.tracks.first {
+            $0.type == .audio && $0.codecID.hasPrefix("A_AAC")
+                && SupportGate.status(forCodecID: $0.codecID) == .nativeAudio && $0.codecPrivate != nil
+        }
+        var audioPCM: AudioDecodeSession.PCM?
+        if let at = audioTrack {
+            let packets = allPackets.filter { $0.trackNumber == at.number }.map(\.data)
+            let decoder = try AudioDecodeSession(
+                codecID: at.codecID, codecPrivate: at.codecPrivate,
+                sampleRate: at.audio?.samplingFrequency ?? 48_000, channels: at.audio?.channels ?? 2)
+            audioPCM = try decoder.decode(packets)
+        }
+
+        let basePTS = frames.map(\.ptsNanos).min() ?? 0   // re-base video so output starts at 0
+
+        let writer = try NativeMP4Writer(
+            output: output, width: w, height: h,
+            audioPCM: audioPCM.map { ($0.sampleRate, $0.channels) })
+        for f in frames { try await writer.appendVideo(f.image, ptsNanos: f.ptsNanos - basePTS) }
+        if let pcm = audioPCM, pcm.frameCount > 0 {
+            try await writer.appendAudio(pcm.makeSampleBuffer(ptsNanos: 0))
+        }
+        try await writer.finish()
 
         return NormalizeResult(sourceCodecID: track.codecID, width: w, height: h,
-                               frameCount: frames.count)
+                               frameCount: frames.count, audioCodecID: audioTrack?.codecID)
     }
 }
