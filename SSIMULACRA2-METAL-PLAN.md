@@ -26,10 +26,16 @@ caveats at bottom). Pairs with the MOS score scale (`90 visually-lossless / 80 v
   compiled once) is injected into `ImageQualityTarget.encodeHEIC`'s search → the real optimize path is
   GPU-accelerated. **Measured 1080p balanced: 9.17 s → 2.31 s (~4×)** (kernels amortize across the 8
   search iterations), **byte-identical output**. CPU fallback when no Metal device.
-- **Remaining (more speed):** the residual 0.52 s is the still-CPU XYB + SSIM/edge maps + L1/L4
-  reductions. Next: GPU those (keep planes on-GPU across a scale → avoid the 90 per-blur readbacks) →
-  toward the research's few-ms target. Then **V2** = recursive-IIR Gaussian for canonical parity
-  (re-baselines floors separately).
+- **FULL-GPU per-channel DONE** (media-bridge `9efaf87` + Kit `1cd3366`): raised the seam to an
+  injectable `ChannelScalars`; `SSIMULACRA2Metal.channelScalarsFunction` runs **products + 5 blurs +
+  SSIM/edge maps + a threadgroup reduction all on-device** (one resident scratch buffer, hazard-tracked;
+  fp32 partials → fp64 CPU cross-sum), reading back only `numTG*6` partials. Parity vs Swift Δ<0.1; wired
+  into `ImageQualityTarget`/optimize. **Measured 1080p optimize: 9.17 s (CPU) → 2.08 s (~4.4×)**,
+  byte-identical. Residual ~2 s is now the **CPU encode/decode/raster floor** (HEIC + linearRGB/XYB per
+  iteration), not the SSIMULACRA2 compute.
+- **Remaining (diminishing returns):** GPU the XYB ingest + 2×2 downsample + a buffer pool; the bigger
+  lever now is fewer HEIC encode/decode round-trips in the search. Then **V2** = recursive-IIR Gaussian
+  for canonical parity (re-baselines floors separately).
 
 ## The decisive calls
 
