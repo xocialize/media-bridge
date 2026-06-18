@@ -32,6 +32,14 @@ public final class SSIMULACRA2Metal {
         self.blurVPipe = pv
     }
 
+    /// Shared instance — kernels compile once. `nil` when no Metal device is available (→ CPU fallback).
+    public static let shared = SSIMULACRA2Metal()
+
+    /// The GPU blur exposed as an injectable `SSIMULACRA2.BlurFunction` (for `ImageQualityTarget` / `score`).
+    public var blurFunction: SSIMULACRA2.BlurFunction {
+        { src, w, h, k in self.blur(src, width: w, height: h, kernel: k) }
+    }
+
     /// Full SSIMULACRA2 score with the **GPU blur injected** into the pure-Swift pipeline — only the
     /// σ=1.5 blur (the 90×/score bottleneck) runs on the GPU; XYB / SSIM+edge maps / reductions / final
     /// stay the validated CPU path, so this agrees with `SSIMULACRA2.score` to fp tolerance.
