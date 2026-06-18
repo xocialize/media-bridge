@@ -40,6 +40,19 @@ final class SSIMULACRA2MetalTests: XCTestCase {
                           "metal=\(metalScore) swift=\(swiftScore) Δ=\(abs(metalScore - swiftScore))")
     }
 
+    /// Full-GPU per-channel path (products + blur + maps + reduction on-device) vs the pure-Swift score.
+    func testFullGPUChannelScalarsMatchesSwift() throws {
+        guard let metal = SSIMULACRA2Metal() else { throw XCTSkip("no Metal device") }
+        let ref = gradientImage(160, 120, shift: 0)
+        let dist = gradientImage(160, 120, shift: 0.05)
+
+        let swiftScore = try SSIMULACRA2.score(reference: ref, distorted: dist)
+        let gpuScore = try SSIMULACRA2.score(reference: ref, distorted: dist,
+                                             channelScalars: metal.channelScalarsFunction)
+        XCTAssertLessThan(abs(gpuScore - swiftScore), 0.1,
+                          "full-GPU=\(gpuScore) swift=\(swiftScore) Δ=\(abs(gpuScore - swiftScore))")
+    }
+
     // MARK: - Reference (mirrors SSIMULACRA2.gaussianKernel + blur)
 
     private func firKernel(sigma: Float) -> [Float] {

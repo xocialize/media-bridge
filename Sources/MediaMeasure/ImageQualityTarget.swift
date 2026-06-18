@@ -24,20 +24,21 @@ public enum ImageQualityTarget {
     public enum EncodeError: Error { case encodeFailed, decodeFailed }
 
     /// Encode `image` as HEIC at the lowest quality whose decoded result scores ≥ `targetScore`.
-    /// `blur` injects a backend for SSIMULACRA2's σ=1.5 blur (e.g. `SSIMULACRA2Metal.shared?.blurFunction`)
-    /// — the search calls SSIMULACRA2 up to `iterations` times, so a GPU blur ~halves the encode time
-    /// while keeping the achieved score within fp tolerance of the CPU path. `nil` = pure-Swift.
+    /// `channelScalars` injects SSIMULACRA2's per-channel hot path (e.g.
+    /// `SSIMULACRA2Metal.shared?.channelScalarsFunction` = all-GPU) — the search calls SSIMULACRA2 up to
+    /// `iterations` times, so a GPU backend cuts the encode time multiple-fold while keeping the achieved
+    /// score within fp tolerance of the CPU path. `nil` = pure-Swift.
     public static func encodeHEIC(_ image: CGImage, targetScore: Double,
                                   iterations: Int = 8,
-                                  blur: SSIMULACRA2.BlurFunction? = nil) throws -> Result {
+                                  channelScalars: SSIMULACRA2.ChannelScalars? = nil) throws -> Result {
         var bestData: Data?
         let search = try QualityTargetSearch.search(target: targetScore, lo: 0.1, hi: 1.0,
                                                     iterations: iterations) { q in
             let data = try encode(image, quality: q)
             let decoded = try decode(data)
             let score: Double
-            if let blur {
-                score = try SSIMULACRA2.score(reference: image, distorted: decoded, blur: blur)
+            if let channelScalars {
+                score = try SSIMULACRA2.score(reference: image, distorted: decoded, channelScalars: channelScalars)
             } else {
                 score = try SSIMULACRA2.score(reference: image, distorted: decoded)
             }

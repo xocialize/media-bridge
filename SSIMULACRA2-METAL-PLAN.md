@@ -22,6 +22,10 @@ caveats at bottom). Pairs with the MOS score scale (`90 visually-lossless / 80 v
   passes the GPU blur. Drop-in parity: blur vs CPU-FIR maxErr < 1e-5; full GPU score vs Swift score
   Δ < 0.05. **Measured 1080p: CPU 1.09 s → Metal 0.52 s (~2×)**, CPU-time 0.93 → 0.13 s (blur off-CPU).
   `forge score --metal` for A/B.
+- **WIRED INTO OPTIMIZE** (media-bridge `6d4c120` + Kit `e4e618f`): `SSIMULACRA2Metal.shared` (kernels
+  compiled once) is injected into `ImageQualityTarget.encodeHEIC`'s search → the real optimize path is
+  GPU-accelerated. **Measured 1080p balanced: 9.17 s → 2.31 s (~4×)** (kernels amortize across the 8
+  search iterations), **byte-identical output**. CPU fallback when no Metal device.
 - **Remaining (more speed):** the residual 0.52 s is the still-CPU XYB + SSIM/edge maps + L1/L4
   reductions. Next: GPU those (keep planes on-GPU across a scale → avoid the 90 per-blur readbacks) →
   toward the research's few-ms target. Then **V2** = recursive-IIR Gaussian for canonical parity

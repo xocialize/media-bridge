@@ -27,19 +27,80 @@ public enum SSIMULACRA2 {
     /// validated CPU path. Keeps the GPU backend a thin, parity-preserving wrapper.
     public typealias BlurFunction = (_ src: [Float], _ width: Int, _ height: Int, _ kernel: [Float]) -> [Float]
 
-    public static func score(reference: CGImage, distorted: CGImage) throws -> Double {
-        try score(reference: reference, distorted: distorted, blur: blur)
+    /// Per-channel scalar backend: given the two XYB planes for one channel, return the 6 pooled values
+    /// (SSIM L1/L4, artifact L1/L4, detail L1/L4). Injectable so a GPU implementation can run the whole
+    /// hot path — products + σ=1.5 blur + SSIM/edge maps + L1/L4 reductions — with planes resident
+    /// on-device (no per-blur readback). The default uses the FIR blur + CPU maps.
+    public typealias ChannelScalars =
+        (_ i1: [Float], _ i2: [Float], _ width: Int, _ height: Int, _ kernel: [Float]) -> ChannelResult
+
+    public struct ChannelResult: Sendable {
+        public let ssimL1, ssimL4, artifactL1, artifactL4, detailL1, detailL4: Double
+        public init(ssimL1: Double, ssimL4: Double, artifactL1: Double, artifactL4: Double,
+                    detailL1: Double, detailL4: Double) {
+            self.ssimL1 = ssimL1; self.ssimL4 = ssimL4
+            self.artifactL1 = artifactL1; self.artifactL4 = artifactL4
+            self.detailL1 = detailL1; self.detailL4 = detailL4
+        }
     }
 
-    /// Score with an injected blur backend (default = the pure-Swift FIR `blur`).
+    public static func score(reference: CGImage, distorted: CGImage) throws -> Double {
+        try score(reference: reference, distorted: distorted, channelScalars: cpuChannelScalars(blur: blur))
+    }
+
+    /// Score with an injected **blur** backend (GPU blur, CPU maps).
     public static func score(reference: CGImage, distorted: CGImage,
-                             blur: BlurFunction) throws -> Double {
+                             blur: @escaping BlurFunction) throws -> Double {
+        try score(reference: reference, distorted: distorted, channelScalars: cpuChannelScalars(blur: blur))
+    }
+
+    /// Score with a fully-injected **per-channel** backend (e.g. all-GPU).
+    public static func score(reference: CGImage, distorted: CGImage,
+                             channelScalars: ChannelScalars) throws -> Double {
         guard reference.width == distorted.width, reference.height == distorted.height else {
             throw ScoreError.dimensionMismatch
         }
         guard reference.width >= 8, reference.height >= 8 else { throw ScoreError.tooSmall }
         return try multiScale(reference: reference, distorted: distorted,
-                              kernel: gaussianKernel(sigma: 1.5), blur: blur)
+                              kernel: gaussianKernel(sigma: 1.5), channelScalars: channelScalars)
+    }
+
+    /// Default per-channel computation: σ=1.5 blur (injectable) + SSIM/edge maps + L1/L4 reductions, on CPU.
+    static func cpuChannelScalars(blur: @escaping BlurFunction) -> ChannelScalars {
+        { i1, i2, w, h, kernel in
+            let mu1 = blur(i1, w, h, kernel)
+            let mu2 = blur(i2, w, h, kernel)
+            let s11 = blur(mul(i1, i1), w, h, kernel)
+            let s22 = blur(mul(i2, i2), w, h, kernel)
+            let s12 = blur(mul(i1, i2), w, h, kernel)
+            let n = w * h
+            var sumD = 0.0, sumD4 = 0.0
+            for p in 0..<n {
+                let m1 = mu1[p], m2 = mu2[p]
+                let muDiff = m1 - m2
+                let numM = 1.0 - Double(muDiff * muDiff)
+                let numS = 2.0 * Double(s12[p] - m1 * m2) + C2
+                let denomS = Double((s11[p] - m1 * m1) + (s22[p] - m2 * m2)) + C2
+                var d = 1.0 - (numM * numS) / denomS
+                d = max(d, 0.0)
+                sumD += d
+                sumD4 += d * d * d * d
+            }
+            var aSum = 0.0, a4 = 0.0, dSum = 0.0, d4 = 0.0
+            for p in 0..<n {
+                let d1 = (1.0 + Double(abs(i2[p] - mu2[p]))) /
+                         (1.0 + Double(abs(i1[p] - mu1[p]))) - 1.0
+                let artifact = max(d1, 0.0)
+                let detail = max(-d1, 0.0)
+                aSum += artifact; a4 += artifact * artifact * artifact * artifact
+                dSum += detail;   d4 += detail * detail * detail * detail
+            }
+            let dn = Double(n)
+            return ChannelResult(
+                ssimL1: sumD / dn, ssimL4: (sumD4 / dn).squareRoot().squareRoot(),
+                artifactL1: aSum / dn, artifactL4: (a4 / dn).squareRoot().squareRoot(),
+                detailL1: dSum / dn, detailL4: (d4 / dn).squareRoot().squareRoot())
+        }
     }
 
     private struct Scale {
@@ -48,7 +109,7 @@ public enum SSIMULACRA2 {
     }
 
     private static func multiScale(reference: CGImage, distorted: CGImage,
-                                   kernel: [Float], blur: BlurFunction) throws -> Double {
+                                   kernel: [Float], channelScalars: ChannelScalars) throws -> Double {
         var p1 = try linearRGB(from: reference)
         var p2 = try linearRGB(from: distorted)
         var w = reference.width, h = reference.height
@@ -69,44 +130,13 @@ public enum SSIMULACRA2 {
 
             var s = Scale()
             for c in 0..<3 {
-                let i1 = x1[c], i2 = x2[c]
-                let mu1 = blur(i1, w, h, kernel)
-                let mu2 = blur(i2, w, h, kernel)
-                let s11 = blur(mul(i1, i1), w, h, kernel)
-                let s22 = blur(mul(i2, i2), w, h, kernel)
-                let s12 = blur(mul(i1, i2), w, h, kernel)
-
-                // SSIM map.
-                let n = w * h
-                var sumD = 0.0, sumD4 = 0.0
-                for p in 0..<n {
-                    let m1 = mu1[p], m2 = mu2[p]
-                    let muDiff = m1 - m2
-                    let numM = 1.0 - Double(muDiff * muDiff)
-                    let numS = 2.0 * Double(s12[p] - m1 * m2) + C2
-                    let denomS = Double((s11[p] - m1 * m1) + (s22[p] - m2 * m2)) + C2
-                    var d = 1.0 - (numM * numS) / denomS
-                    d = max(d, 0.0)
-                    sumD += d
-                    sumD4 += d * d * d * d
-                }
-                s.avgSsim[c * 2 + 0] = sumD / Double(n)
-                s.avgSsim[c * 2 + 1] = (sumD4 / Double(n)).squareRoot().squareRoot()
-
-                // Edge-difference map.
-                var aSum = 0.0, a4 = 0.0, dSum = 0.0, d4 = 0.0
-                for p in 0..<n {
-                    let d1 = (1.0 + Double(abs(i2[p] - mu2[p]))) /
-                             (1.0 + Double(abs(i1[p] - mu1[p]))) - 1.0
-                    let artifact = max(d1, 0.0)
-                    let detail = max(-d1, 0.0)
-                    aSum += artifact; a4 += artifact * artifact * artifact * artifact
-                    dSum += detail;   d4 += detail * detail * detail * detail
-                }
-                s.avgEdge[c * 4 + 0] = aSum / Double(n)
-                s.avgEdge[c * 4 + 1] = (a4 / Double(n)).squareRoot().squareRoot()
-                s.avgEdge[c * 4 + 2] = dSum / Double(n)
-                s.avgEdge[c * 4 + 3] = (d4 / Double(n)).squareRoot().squareRoot()
+                let r = channelScalars(x1[c], x2[c], w, h, kernel)
+                s.avgSsim[c * 2 + 0] = r.ssimL1
+                s.avgSsim[c * 2 + 1] = r.ssimL4
+                s.avgEdge[c * 4 + 0] = r.artifactL1
+                s.avgEdge[c * 4 + 1] = r.artifactL4
+                s.avgEdge[c * 4 + 2] = r.detailL1
+                s.avgEdge[c * 4 + 3] = r.detailL4
             }
             scales.append(s)
         }
