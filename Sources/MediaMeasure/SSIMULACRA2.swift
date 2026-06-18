@@ -21,12 +21,25 @@ public enum SSIMULACRA2 {
     public enum ScoreError: Error { case tooSmall, dimensionMismatch, rasterFailed }
 
     /// SSIMULACRA2 score for `distorted` vs `reference` (must be same dimensions, ≥ 8×8). 100 = identical.
+    /// A separable-blur backend: `(src, width, height, kernel) -> blurred`. Injectable so a GPU
+    /// implementation (`SSIMULACRA2Metal`) can replace the σ=1.5 blur — the only per-pixel hot stage,
+    /// run 90× per score — while every other stage (XYB, SSIM/edge maps, reductions, final) stays the
+    /// validated CPU path. Keeps the GPU backend a thin, parity-preserving wrapper.
+    public typealias BlurFunction = (_ src: [Float], _ width: Int, _ height: Int, _ kernel: [Float]) -> [Float]
+
     public static func score(reference: CGImage, distorted: CGImage) throws -> Double {
+        try score(reference: reference, distorted: distorted, blur: blur)
+    }
+
+    /// Score with an injected blur backend (default = the pure-Swift FIR `blur`).
+    public static func score(reference: CGImage, distorted: CGImage,
+                             blur: BlurFunction) throws -> Double {
         guard reference.width == distorted.width, reference.height == distorted.height else {
             throw ScoreError.dimensionMismatch
         }
         guard reference.width >= 8, reference.height >= 8 else { throw ScoreError.tooSmall }
-        return try multiScale(reference: reference, distorted: distorted, kernel: gaussianKernel(sigma: 1.5))
+        return try multiScale(reference: reference, distorted: distorted,
+                              kernel: gaussianKernel(sigma: 1.5), blur: blur)
     }
 
     private struct Scale {
@@ -35,7 +48,7 @@ public enum SSIMULACRA2 {
     }
 
     private static func multiScale(reference: CGImage, distorted: CGImage,
-                                   kernel: [Float]) throws -> Double {
+                                   kernel: [Float], blur: BlurFunction) throws -> Double {
         var p1 = try linearRGB(from: reference)
         var p2 = try linearRGB(from: distorted)
         var w = reference.width, h = reference.height

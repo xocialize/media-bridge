@@ -1,5 +1,6 @@
 import Foundation
 import Metal
+import CoreGraphics
 
 /// GPU backend for SSIMULACRA2's hot path. **V1 mirrors the pure-Swift `SSIMULACRA2` pipeline exactly**
 /// (FIR σ=1.5 Gaussian, same constants) — a drop-in faster backend that *agrees with the CPU scores*, so
@@ -29,6 +30,15 @@ public final class SSIMULACRA2Metal {
         self.queue = queue
         self.blurHPipe = ph
         self.blurVPipe = pv
+    }
+
+    /// Full SSIMULACRA2 score with the **GPU blur injected** into the pure-Swift pipeline — only the
+    /// σ=1.5 blur (the 90×/score bottleneck) runs on the GPU; XYB / SSIM+edge maps / reductions / final
+    /// stay the validated CPU path, so this agrees with `SSIMULACRA2.score` to fp tolerance.
+    public func score(reference: CGImage, distorted: CGImage) throws -> Double {
+        try SSIMULACRA2.score(reference: reference, distorted: distorted) { src, w, h, k in
+            self.blur(src, width: w, height: h, kernel: k)
+        }
     }
 
     /// Separable FIR Gaussian blur on a `w×h` float plane (edge-clamped), matching `SSIMULACRA2.blur`.

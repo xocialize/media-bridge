@@ -1,4 +1,5 @@
 import XCTest
+import CoreGraphics
 import MediaMeasure
 
 /// Stage-1 parity: the Metal separable Gaussian blur must match the pure-Swift FIR (`SSIMULACRA2.blur`)
@@ -22,6 +23,21 @@ final class SSIMULACRA2MetalTests: XCTestCase {
         var maxErr: Float = 0
         for i in 0..<reference.count { maxErr = max(maxErr, abs(got[i] - reference[i])) }
         XCTAssertLessThan(maxErr, 1e-5, "Metal blur vs CPU FIR maxErr=\(maxErr)")
+    }
+
+    /// End-to-end: GPU-blur score agrees with the full pure-Swift score (only the blur differs, and it's
+    /// parity-tested) — so the Metal backend is a drop-in that preserves the corpus-validated floors.
+    func testMetalScoreMatchesSwiftScore() throws {
+        guard let metal = SSIMULACRA2Metal() else { throw XCTSkip("no Metal device") }
+        let ref = gradientImage(160, 120, shift: 0)
+        let dist = gradientImage(160, 120, shift: 0.05)
+
+        let swiftScore = try SSIMULACRA2.score(reference: ref, distorted: dist)
+        let metalScore = try metal.score(reference: ref, distorted: dist)
+
+        XCTAssertGreaterThan(swiftScore, 0)
+        XCTAssertLessThan(abs(metalScore - swiftScore), 0.05,
+                          "metal=\(metalScore) swift=\(swiftScore) Δ=\(abs(metalScore - swiftScore))")
     }
 
     // MARK: - Reference (mirrors SSIMULACRA2.gaussianKernel + blur)
@@ -53,5 +69,21 @@ final class SSIMULACRA2MetalTests: XCTestCase {
             }
         }
         return out
+    }
+
+    private func gradientImage(_ w: Int, _ h: Int, shift: Float) -> CGImage {
+        let cs = CGColorSpaceCreateDeviceRGB()
+        let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                            space: cs, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        let buf = ctx.data!.bindMemory(to: UInt8.self, capacity: w * h * 4)
+        func u8(_ f: Float) -> UInt8 { UInt8(min(max(f, 0), 1) * 255) }
+        for y in 0..<h {
+            for x in 0..<w {
+                let gx = Float(x) / Float(w), gy = Float(y) / Float(h)
+                let i = (y * w + x) * 4
+                buf[i] = u8(gx + shift); buf[i + 1] = u8(gy); buf[i + 2] = u8(1 - gx + shift * 0.5); buf[i + 3] = 255
+            }
+        }
+        return ctx.makeImage()!
     }
 }

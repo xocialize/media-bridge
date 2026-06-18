@@ -8,6 +8,20 @@ LESSONS), so re-baselining is tractable on CPU. Metal is now for **(1) real-time
 Still worth building for those + the parity-correct reference. Distilled from a deep-research pass (2026-06;
 caveats at bottom). Pairs with the MOS score scale (`90 visually-lossless / 80 very-high / 70 high`).
 
+## Status (2026-06-18)
+
+- **Headless Metal compute CONFIRMED** on Apple M5 Max — runtime-compiled kernels via
+  `device.makeLibrary(source:)` + dispatch run in a plain `swift`/SPM-test process (NOT the MLX metallib
+  boundary). So the whole port is buildable + testable **package-side, headless**.
+- **V1 decision: mirror our pure-Swift `SSIMULACRA2` exactly** (FIR σ=1.5, same constants) → a drop-in
+  faster backend that *agrees with our CPU scores*, so the corpus-validated 90/80/70 floors stay correct.
+  The recursive-IIR / canonical re-anchor below is **V2** (separate, re-baselines floors).
+- **Stage 1 DONE** (`MediaMeasure/SSIMULACRA2Metal.swift`, git `7c32154`): the separable Gaussian blur
+  kernel (the 30×/score bottleneck + parity-critical stage). Parity test vs the CPU FIR: maxErr < 1e-5.
+- **Remaining (V1):** XYB ingest kernel · products · SSIM + edge-diff maps · L1/L4 reductions ·
+  2×2 downsample · the 6-scale orchestration + 108-weight final → then gate `SSIMULACRA2Metal.score`
+  vs `SSIMULACRA2.score` (our Swift) end-to-end, and time it vs the ~1 s/1080p CPU-Release baseline.
+
 ## The decisive calls
 
 1. **Hand-written Metal compute, NOT MPS primitives.** The parity-critical stage is the **Gaussian blur
