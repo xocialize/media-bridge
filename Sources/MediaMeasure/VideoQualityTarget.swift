@@ -13,6 +13,8 @@ public enum VideoQualityTarget {
         public let score: Double          // achieved p10 per-frame SSIMULACRA2
         public let inputBytes: Int
         public let outputBytes: Int
+        public let width: Int
+        public let height: Int
         public let metTarget: Bool
         public var savedFraction: Double {
             inputBytes > 0 ? Double(max(0, inputBytes - outputBytes)) / Double(inputBytes) : 0
@@ -27,6 +29,11 @@ public enum VideoQualityTarget {
                               iterations: Int = 6, searchStride: Int = 20) async throws -> Result {
         let asset = AVURLAsset(url: input)
         let duration = try await asset.load(.duration).seconds
+        guard let vtrack = try await asset.loadTracks(withMediaType: .video).first else {
+            throw EncodeError.noVideoTrack
+        }
+        let vsize = try await vtrack.load(.naturalSize)
+        let vw = Int(abs(vsize.width).rounded()), vh = Int(abs(vsize.height).rounded())
         let inBytes = (try? input.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         let sourceBitrate = duration > 0 ? Double(inBytes) * 8 / duration : 8_000_000
 
@@ -65,55 +72,77 @@ public enum VideoQualityTarget {
 
         let outBytes = (try? output.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         return Result(bitrate: chosen.bitrate, score: chosen.score, inputBytes: inBytes,
-                      outputBytes: outBytes, metTarget: best != nil)
+                      outputBytes: outBytes, width: vw, height: vh, metTarget: best != nil)
     }
 
-    /// Transcode the video track to HEVC at a target average bitrate. Video-only.
+    /// Transcode the video track to HEVC at a target average bitrate; **passthrough-mux the audio** if
+    /// present (no re-encode → no audio quality loss). No-audio sources produce a video-only output.
     static func reencodeVideo(input: URL, output: URL, bitrate: Int) async throws {
         let asset = AVURLAsset(url: input)
-        guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+        guard let vtrack = try await asset.loadTracks(withMediaType: .video).first else {
             throw EncodeError.noVideoTrack
         }
-        let size = try await track.load(.naturalSize)
-        let transform = try await track.load(.preferredTransform)
+        let size = try await vtrack.load(.naturalSize)
+        let transform = try await vtrack.load(.preferredTransform)
         let w = Int(abs(size.width).rounded()), h = Int(abs(size.height).rounded())
+        let atrack = try await asset.loadTracks(withMediaType: .audio).first
+        // Passthrough audio needs the source format up front, else the writer can't add the input.
+        let audioFormat = try await atrack?.load(.formatDescriptions).first
 
         let reader = try AVAssetReader(asset: asset)
-        let readerOutput = AVAssetReaderTrackOutput(
-            track: track,
+        let videoOut = AVAssetReaderTrackOutput(
+            track: vtrack,
             outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
-        readerOutput.alwaysCopiesSampleData = false
-        reader.add(readerOutput)
+        videoOut.alwaysCopiesSampleData = false
+        reader.add(videoOut)
+        var audioOut: AVAssetReaderTrackOutput?
+        if let atrack {
+            let ao = AVAssetReaderTrackOutput(track: atrack, outputSettings: nil)   // stored format → passthrough
+            ao.alwaysCopiesSampleData = false
+            if reader.canAdd(ao) { reader.add(ao); audioOut = ao }
+        }
 
         try? FileManager.default.removeItem(at: output)
         let writer = try AVAssetWriter(outputURL: output, fileType: .mp4)
-        let writerInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
+        let videoIn = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.hevc,
-            AVVideoWidthKey: w,
-            AVVideoHeightKey: h,
+            AVVideoWidthKey: w, AVVideoHeightKey: h,
             AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: bitrate],
         ])
-        writerInput.transform = transform
-        writerInput.expectsMediaDataInRealTime = false
-        writer.add(writerInput)
+        videoIn.transform = transform
+        videoIn.expectsMediaDataInRealTime = false
+        writer.add(videoIn)
+        var audioIn: AVAssetWriterInput?
+        if audioOut != nil {
+            let ai = AVAssetWriterInput(mediaType: .audio, outputSettings: nil,     // passthrough mux
+                                       sourceFormatHint: audioFormat)
+            ai.expectsMediaDataInRealTime = false
+            if writer.canAdd(ai) { writer.add(ai); audioIn = ai }
+        }
 
         guard reader.startReading() else { throw EncodeError.readFailed }
         guard writer.startWriting() else { throw EncodeError.encodeFailed }
         writer.startSession(atSourceTime: .zero)
 
-        let queue = DispatchQueue(label: "vqt.reencode")
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            writerInput.requestMediaDataWhenReady(on: queue) {
-                while writerInput.isReadyForMoreMediaData {
-                    if let sample = readerOutput.copyNextSampleBuffer() {
-                        writerInput.append(sample)
-                    } else {
-                        writerInput.markAsFinished()
-                        cont.resume()
-                        return
-                    }
+        let group = DispatchGroup()
+        func pump(_ input: AVAssetWriterInput, _ out: AVAssetReaderTrackOutput, _ label: String) {
+            group.enter()
+            input.requestMediaDataWhenReady(on: DispatchQueue(label: "vqt.\(label)")) {
+                while input.isReadyForMoreMediaData {
+                    if let s = out.copyNextSampleBuffer() {
+                        if !input.append(s) {
+                            FileHandle.standardError.write(Data("vqt: \(label) append failed: \(String(describing: writer.error))\n".utf8))
+                            input.markAsFinished(); group.leave(); return
+                        }
+                    } else { input.markAsFinished(); group.leave(); return }
                 }
             }
+        }
+        pump(videoIn, videoOut, "video")
+        if let audioIn, let audioOut { pump(audioIn, audioOut, "audio") }
+
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            group.notify(queue: DispatchQueue(label: "vqt.done")) { cont.resume() }
         }
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             writer.finishWriting { cont.resume() }
