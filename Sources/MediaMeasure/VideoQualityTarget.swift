@@ -75,8 +75,29 @@ public enum VideoQualityTarget {
                       outputBytes: outBytes, width: vw, height: vh, metTarget: best != nil)
     }
 
+    /// Map a video format description's colour attachments to an `AVVideoColorPropertiesKey` dict,
+    /// defaulting each missing axis to BT.709 — the safe signage default (an untagged stream otherwise
+    /// gets misread as 601, drifting saturated brand colours). Preserves HDR/BT.2020 tags when present.
+    static func colorProperties(from format: CMFormatDescription?) -> [String: Any] {
+        func ext(_ key: CFString, _ fallback: String) -> String {
+            guard let format,
+                  let v = CMFormatDescriptionGetExtension(format, extensionKey: key) as? String
+            else { return fallback }
+            return v
+        }
+        return [
+            AVVideoColorPrimariesKey: ext(kCMFormatDescriptionExtension_ColorPrimaries,
+                                          AVVideoColorPrimaries_ITU_R_709_2),
+            AVVideoTransferFunctionKey: ext(kCMFormatDescriptionExtension_TransferFunction,
+                                            AVVideoTransferFunction_ITU_R_709_2),
+            AVVideoYCbCrMatrixKey: ext(kCMFormatDescriptionExtension_YCbCrMatrix,
+                                       AVVideoYCbCrMatrix_ITU_R_709_2),
+        ]
+    }
+
     /// Transcode the video track to HEVC at a target average bitrate; **passthrough-mux the audio** if
     /// present (no re-encode → no audio quality loss). No-audio sources produce a video-only output.
+    /// Colour primaries/transfer/matrix are preserved from the source (BT.709 default) for brand fidelity.
     static func reencodeVideo(input: URL, output: URL, bitrate: Int) async throws {
         let asset = AVURLAsset(url: input)
         guard let vtrack = try await asset.loadTracks(withMediaType: .video).first else {
@@ -88,6 +109,11 @@ public enum VideoQualityTarget {
         let atrack = try await asset.loadTracks(withMediaType: .audio).first
         // Passthrough audio needs the source format up front, else the writer can't add the input.
         let audioFormat = try await atrack?.load(.formatDescriptions).first
+        // Preserve the source's colour tags; default to BT.709 when untagged. Decoding to BGRA drops
+        // the matrix, so an untagged re-encode can get misread as 601 → saturated brand colours drift
+        // while white stays put (the signage-playbook colour-fidelity gate). Pin primaries/transfer/matrix.
+        let videoFormat = try await vtrack.load(.formatDescriptions).first
+        let colorProperties = Self.colorProperties(from: videoFormat)
 
         let reader = try AVAssetReader(asset: asset)
         let videoOut = AVAssetReaderTrackOutput(
@@ -107,6 +133,7 @@ public enum VideoQualityTarget {
         let videoIn = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.hevc,
             AVVideoWidthKey: w, AVVideoHeightKey: h,
+            AVVideoColorPropertiesKey: colorProperties,
             AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: bitrate],
         ])
         videoIn.transform = transform
