@@ -13,7 +13,9 @@ public enum VideoQualityTarget {
         public let score: Double          // achieved p10 per-frame SSIMULACRA2
         public let inputBytes: Int
         public let outputBytes: Int
-        public let width: Int
+        public let sourceWidth: Int       // input resolution (= width/height unless downscaled)
+        public let sourceHeight: Int
+        public let width: Int             // output resolution
         public let height: Int
         public let metTarget: Bool
         public var savedFraction: Double {
@@ -25,7 +27,12 @@ public enum VideoQualityTarget {
 
     /// Binary-search the target bitrate (down from the source bitrate); gate on the p10 frame so one bad
     /// frame can't pass. Smallest output whose p10 ≥ `targetScore` wins.
-    public static func encode(input: URL, output: URL, targetScore: Double,
+    ///
+    /// `maxHeight` steps the resolution down (e.g. 1080 = 4K→HD): the output is resampled to ≤ that height
+    /// (aspect preserved, even dims) and the quality floor is measured *at the target resolution* (the
+    /// reference is downscaled to match — the encode quality of the HD version, not HD-vs-4K). nil = keep
+    /// the source resolution (the same-res optimize path).
+    public static func encode(input: URL, output: URL, targetScore: Double, maxHeight: Int? = nil,
                               iterations: Int = 6, searchStride: Int = 20) async throws -> Result {
         let asset = AVURLAsset(url: input)
         let duration = try await asset.load(.duration).seconds
@@ -37,19 +44,52 @@ public enum VideoQualityTarget {
         let inBytes = (try? input.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         let sourceBitrate = duration > 0 ? Double(inBytes) * 8 / duration : 8_000_000
 
+        // Resolve the output resolution; downscale only (never upscale here — that's the SR path).
+        var outW = vw, outH = vh
+        if let maxHeight, vh > maxHeight {
+            outH = maxHeight - (maxHeight % 2)
+            outW = Int((Double(vw) * Double(outH) / Double(vh)).rounded()); outW -= outW % 2
+        }
+        let downscaled = (outW != vw || outH != vh)
+        // Ceiling = source bitrate (file-size cap: same bitrate × same duration ⇒ ≤ source size, and at a
+        // lower resolution the search converges to a much lower clearing bitrate anyway). NOT scaled by the
+        // pixel ratio — an already-compressed master would then ceiling below the quality floor at HD.
+        let ceiling = sourceBitrate
+
         let tmpDir = FileManager.default.temporaryDirectory
-        var lo = sourceBitrate * 0.04, hi = sourceBitrate    // never exceed the source bitrate
-        var best: (bitrate: Int, score: Double, url: URL)?
         var temps: [URL] = []
+
+        // Scoring reference. Same-res: the source itself. Downscale: a HIGH-quality HD render via OUR OWN
+        // pipeline — so candidates are scored at the target resolution against the same downscaler, gating
+        // the *added compression* (not HD-vs-4K, and free of the CG↔VideoToolbox resampler-delta artifact
+        // that otherwise caps the achievable score a couple points below the floor).
+        let scoreRef: URL
+        if downscaled {
+            let ref = tmpDir.appendingPathComponent("vqt-ref-\(UUID().uuidString).mp4")
+            temps.append(ref)
+            try await reencodeVideo(input: input, output: ref, bitrate: Int(ceiling),
+                                    outWidth: outW, outHeight: outH)
+            scoreRef = ref
+        } else {
+            scoreRef = input
+        }
+
+        var lo = ceiling * 0.04, hi = ceiling
+        var best: (bitrate: Int, score: Double, url: URL)?
+
+        func scoreOf(_ url: URL) throws -> Double {
+            try VideoQuality.videoScore(reference: scoreRef, distorted: url, sampleStride: searchStride).p10
+        }
 
         for _ in 0..<iterations {
             let b = (lo + hi) / 2
             let tmp = tmpDir.appendingPathComponent("vqt-\(UUID().uuidString).mp4")
             temps.append(tmp)
-            try await reencodeVideo(input: input, output: tmp, bitrate: Int(b))
-            let vs = try VideoQuality.videoScore(reference: input, distorted: tmp, sampleStride: searchStride)
-            if vs.p10 >= targetScore {
-                best = (Int(b), vs.p10, tmp); hi = b     // clears → try smaller (lower bitrate)
+            try await reencodeVideo(input: input, output: tmp, bitrate: Int(b),
+                                    outWidth: outW, outHeight: outH)
+            let p10 = try scoreOf(tmp)
+            if p10 >= targetScore {
+                best = (Int(b), p10, tmp); hi = b        // clears → try smaller (lower bitrate)
             } else {
                 lo = b                                    // below floor → need more bitrate
             }
@@ -61,9 +101,9 @@ public enum VideoQualityTarget {
         } else {
             let tmp = tmpDir.appendingPathComponent("vqt-final-\(UUID().uuidString).mp4")
             temps.append(tmp)
-            try await reencodeVideo(input: input, output: tmp, bitrate: Int(hi))
-            let s = (try VideoQuality.videoScore(reference: input, distorted: tmp, sampleStride: searchStride)).p10
-            chosen = (Int(hi), s, tmp)
+            try await reencodeVideo(input: input, output: tmp, bitrate: Int(hi),
+                                    outWidth: outW, outHeight: outH)
+            chosen = (Int(hi), try scoreOf(tmp), tmp)
         }
 
         try? FileManager.default.removeItem(at: output)
@@ -72,7 +112,8 @@ public enum VideoQualityTarget {
 
         let outBytes = (try? output.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         return Result(bitrate: chosen.bitrate, score: chosen.score, inputBytes: inBytes,
-                      outputBytes: outBytes, width: vw, height: vh, metTarget: best != nil)
+                      outputBytes: outBytes, sourceWidth: vw, sourceHeight: vh,
+                      width: outW, height: outH, metTarget: best != nil)
     }
 
     /// Map a video format description's colour attachments to an `AVVideoColorPropertiesKey` dict,
@@ -98,14 +139,17 @@ public enum VideoQualityTarget {
     /// Transcode the video track to HEVC at a target average bitrate; **passthrough-mux the audio** if
     /// present (no re-encode → no audio quality loss). No-audio sources produce a video-only output.
     /// Colour primaries/transfer/matrix are preserved from the source (BT.709 default) for brand fidelity.
-    static func reencodeVideo(input: URL, output: URL, bitrate: Int) async throws {
+    /// `outWidth`/`outHeight` (when given) scale the video via VideoToolbox — the 4K→HD downscale lever.
+    static func reencodeVideo(input: URL, output: URL, bitrate: Int,
+                              outWidth: Int? = nil, outHeight: Int? = nil) async throws {
         let asset = AVURLAsset(url: input)
         guard let vtrack = try await asset.loadTracks(withMediaType: .video).first else {
             throw EncodeError.noVideoTrack
         }
         let size = try await vtrack.load(.naturalSize)
         let transform = try await vtrack.load(.preferredTransform)
-        let w = Int(abs(size.width).rounded()), h = Int(abs(size.height).rounded())
+        let w = outWidth ?? Int(abs(size.width).rounded())
+        let h = outHeight ?? Int(abs(size.height).rounded())
         let atrack = try await asset.loadTracks(withMediaType: .audio).first
         // Passthrough audio needs the source format up front, else the writer can't add the input.
         let audioFormat = try await atrack?.load(.formatDescriptions).first
