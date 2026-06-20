@@ -27,12 +27,12 @@ final class CorpusVideoTests: XCTestCase {
 
         // Floor override (default Balanced ≥80). `FORGE_VIDEO_FLOOR=70` runs the Aggressive tier.
         let floor = Double(ProcessInfo.processInfo.environment["FORGE_VIDEO_FLOOR"] ?? "") ?? 80
-        // Frames scored = clipFrames / stride; on short AI clips stride 20 collapses p10 to ~min-of-3 (noisy).
-        // `FORGE_VIDEO_STRIDE` lets the harness probe whether denser sampling stabilizes the p10 search.
-        let stride = Int(ProcessInfo.processInfo.environment["FORGE_VIDEO_STRIDE"] ?? "") ?? 20
+        // Sampling: default = ADAPTIVE (encode targets ≥12 frames). `FORGE_VIDEO_STRIDE=N` forces a fixed
+        // stride to compare against the old min-of-3 behaviour.
+        let stride = Int(ProcessInfo.processInfo.environment["FORGE_VIDEO_STRIDE"] ?? "")
 
-        print(String(format: "\nCORPUS GeneratedVideo — floor ≥%.0f, per-frame SSIMU2, 6 iters, stride %d",
-                     floor, stride))
+        print(String(format: "\nCORPUS GeneratedVideo — floor ≥%.0f, per-frame SSIMU2, 6 iters, %@",
+                     floor, (stride.map { "stride \($0)" } ?? "adaptive sampling") as NSString))
         print(String(format: "%-34@ %11@ %6@ %5@ %8@ %7@ %9@",
                      "clip" as NSString, "WxH" as NSString, "dur" as NSString, "aud" as NSString,
                      "srcMbps" as NSString, "result" as NSString, "p10/saved" as NSString))

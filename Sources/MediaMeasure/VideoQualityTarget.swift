@@ -45,8 +45,14 @@ public enum VideoQualityTarget {
     /// (aspect preserved, even dims) and the quality floor is measured *at the target resolution* (the
     /// reference is downscaled to match — the encode quality of the HD version, not HD-vs-4K). nil = keep
     /// the source resolution (the same-res optimize path).
+    /// `searchStride` overrides the sampling stride directly (legacy/explicit). Left nil (the default), the
+    /// stride is **adaptive**: it targets `[minScoredFrames, maxScoredFrames]` frames spread across the clip,
+    /// so a short clip can't collapse p10 to a noisy min-of-3. A fixed stride on a 49-frame clip scored ~3
+    /// frames → p10 ≈ the single worst (noisy) frame → a non-monotonic, jittery bitrate search (worst on
+    /// temporally-inconsistent AI video). Targeting ≥12 samples gives a stable 10th-percentile.
     public static func encode(input: URL, output: URL, targetScore: Double, maxHeight: Int? = nil,
-                              iterations: Int = 6, searchStride: Int = 20) async throws -> Result {
+                              iterations: Int = 6, searchStride: Int? = nil,
+                              minScoredFrames: Int = 12, maxScoredFrames: Int = 16) async throws -> Result {
         let asset = AVURLAsset(url: input)
         let duration = try await asset.load(.duration).seconds
         guard let vtrack = try await asset.loadTracks(withMediaType: .video).first else {
@@ -69,8 +75,20 @@ public enum VideoQualityTarget {
         // pixel ratio — an already-compressed master would then ceiling below the quality floor at HD.
         let ceiling = sourceBitrate
 
+        // Adaptive sampling: pick a stride that scores ≥ minScoredFrames across the clip (capped at
+        // maxScoredFrames), so p10 is a real 10th-percentile, not a noisy min-of-3 on short clips. An
+        // explicit `searchStride` overrides. Frame count ≈ duration × nominal fps (no full decode needed).
+        let fpsRaw = Double((try? await vtrack.load(.nominalFrameRate)) ?? 30)
+        let fps = fpsRaw > 0 ? fpsRaw : 30                       // some tracks report 0
+        let frameCount = max(1, Int((fps * duration).rounded()))
+        let stride = searchStride.map { max(1, $0) }
+            ?? max(1, frameCount / max(1, minScoredFrames))
+        let frameCap = searchStride == nil ? maxScoredFrames : 60
+
         MediaProfile.log("video optimize: \(vw)×\(vh)\(downscaled ? " → \(outW)×\(outH)" : "") · src "
-            + String(format: "%.1f Mbps · %d iters · stride %d", sourceBitrate / 1e6, iterations, searchStride))
+            + String(format: "%.1f Mbps · %d iters · ~%d frames (stride %d of %d)",
+                     sourceBitrate / 1e6, iterations, min(frameCap, (frameCount + stride - 1) / stride),
+                     stride, frameCount))
         MediaProfile.log("SSIMULACRA2 backend → \(SSIMULACRA2Metal.diagnostics())")
         var profTranscodeMs = 0.0, profScoreMs = 0.0
 
@@ -98,7 +116,8 @@ public enum VideoQualityTarget {
         var best: (bitrate: Int, score: Double, url: URL)?
 
         func scoreOf(_ url: URL) throws -> Double {
-            try VideoQuality.videoScore(reference: scoreRef, distorted: url, sampleStride: searchStride).p10
+            try VideoQuality.videoScore(reference: scoreRef, distorted: url,
+                                        sampleStride: stride, maxFrames: frameCap).p10
         }
 
         for i in 0..<iterations {
