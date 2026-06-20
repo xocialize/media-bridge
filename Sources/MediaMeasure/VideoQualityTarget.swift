@@ -119,8 +119,22 @@ public enum VideoQualityTarget {
             chosen = (Int(hi), try scoreOf(tmp), tmp)
         }
 
-        try? FileManager.default.removeItem(at: output)
-        try FileManager.default.copyItem(at: chosen.url, to: output)
+        // Deliverable lands at the host's `output` ONLY on a genuine win (cleared the floor AND smaller),
+        // and ATOMICALLY (same-dir staging + rename — rename(2) is atomic, so `output` appears whole or not
+        // at all; a non-atomic copy could leave a partial file if the source invalidates mid-copy). On a
+        // miss, leave NO file at `output` — never orphan a best-effort encode. (Fixes EMBED-003 skip-orphan
+        // + EMBED-005 partial-write-on-failure.)
+        let outBytes = (try? chosen.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        let didWin = best != nil && outBytes < inBytes
+        if didWin {
+            let staging = output.deletingLastPathComponent()
+                .appendingPathComponent(".forge-\(UUID().uuidString).tmp")
+            try FileManager.default.copyItem(at: chosen.url, to: staging)
+            try? FileManager.default.removeItem(at: output)
+            try FileManager.default.moveItem(at: staging, to: output)
+        } else {
+            try? FileManager.default.removeItem(at: output)
+        }
         for t in temps { try? FileManager.default.removeItem(at: t) }
 
         let profTotal = profTranscodeMs + profScoreMs
@@ -130,7 +144,6 @@ public enum VideoQualityTarget {
                                     profScoreMs, 100 * profScoreMs / profTotal))
         }
 
-        let outBytes = (try? output.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         return Result(bitrate: chosen.bitrate, score: chosen.score, inputBytes: inBytes,
                       outputBytes: outBytes, sourceWidth: vw, sourceHeight: vh,
                       width: outW, height: outH, metTarget: best != nil)

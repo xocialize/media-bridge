@@ -48,7 +48,10 @@ public final class SSIMULACRA2Metal {
     /// Pinpoints WHERE GPU setup fails (device vs command-queue vs runtime shader compile vs pipeline) — so a
     /// host can tell a missing device (fixable by injecting one) from a `makeLibrary(source:)` failure (needs
     /// a precompiled metallib instead). Returns "OK …" when the GPU path is fully available.
-    public static func diagnostics() -> String {
+    public static func diagnostics() -> String { cachedDiagnostics }
+
+    /// Computed once (each run recompiles the Metal library — don't pay that per call).
+    private static let cachedDiagnostics: String = {
         guard let device = MTLCreateSystemDefaultDevice() else {
             return "FAIL: no Metal device (MTLCreateSystemDefaultDevice == nil)"
         }
@@ -65,7 +68,7 @@ public final class SSIMULACRA2Metal {
             }
         }
         return "OK: GPU SSIMULACRA2 available on \(device.name)"
-    }
+    }()
 
     /// The GPU blur exposed as an injectable `SSIMULACRA2.BlurFunction` (for `ImageQualityTarget` / `score`).
     public var blurFunction: SSIMULACRA2.BlurFunction {
