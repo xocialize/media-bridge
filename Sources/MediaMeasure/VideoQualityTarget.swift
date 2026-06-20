@@ -23,7 +23,20 @@ public enum VideoQualityTarget {
         }
     }
 
-    public enum EncodeError: Error { case noVideoTrack, encodeFailed, readFailed }
+    public enum EncodeError: Error, CustomStringConvertible {
+        case noVideoTrack, encodeFailed, readFailed
+        /// The source decoded partway then the reader/writer aborted (truncated/garbled container,
+        /// `FigExport`-class failures). Carries the underlying AVFoundation error when available.
+        case sourceAborted(Error?)
+        public var description: String {
+            switch self {
+            case .noVideoTrack:        return "no video track"
+            case .encodeFailed:        return "video encode failed"
+            case .readFailed:          return "source could not be read"
+            case .sourceAborted(let e): return "source aborted mid-encode: \(e.map(String.init(describing:)) ?? "unknown")"
+            }
+        }
+    }
 
     /// Binary-search the target bitrate (down from the source bitrate); gate on the p10 frame so one bad
     /// frame can't pass. Smallest output whose p10 ≥ `targetScore` wins.
@@ -248,9 +261,18 @@ public enum VideoQualityTarget {
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             group.notify(queue: DispatchQueue(label: "vqt.done")) { cont.resume() }
         }
+        // A reader failure mid-pump surfaces as `copyNextSampleBuffer() == nil` — indistinguishable from
+        // a clean EOF — so a truncated/garbled source (FigExport-class faults) would otherwise finalize a
+        // SHORT "successful" encode and silently pass. Check the terminal status explicitly and THROW, so
+        // the request layer's catch yields a single terminal `.failed` (never an empty stream / orphan).
+        // (EMBED-005 #1 — fail-fast terminal-result guarantee.)
+        if reader.status == .failed {
+            writer.cancelWriting()
+            throw EncodeError.sourceAborted(reader.error)
+        }
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             writer.finishWriting { cont.resume() }
         }
-        if writer.status == .failed { throw EncodeError.encodeFailed }
+        if writer.status == .failed { throw EncodeError.sourceAborted(writer.error) }
     }
 }
