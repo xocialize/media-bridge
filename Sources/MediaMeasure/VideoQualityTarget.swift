@@ -56,6 +56,11 @@ public enum VideoQualityTarget {
         // pixel ratio — an already-compressed master would then ceiling below the quality floor at HD.
         let ceiling = sourceBitrate
 
+        MediaProfile.log("video optimize: \(vw)×\(vh)\(downscaled ? " → \(outW)×\(outH)" : "") · src "
+            + String(format: "%.1f Mbps · %d iters · stride %d", sourceBitrate / 1e6, iterations, searchStride))
+        MediaProfile.log("SSIMULACRA2 backend → \(SSIMULACRA2Metal.diagnostics())")
+        var profTranscodeMs = 0.0, profScoreMs = 0.0
+
         let tmpDir = FileManager.default.temporaryDirectory
         var temps: [URL] = []
 
@@ -67,8 +72,10 @@ public enum VideoQualityTarget {
         if downscaled {
             let ref = tmpDir.appendingPathComponent("vqt-ref-\(UUID().uuidString).mp4")
             temps.append(ref)
+            let tRef = DispatchTime.now()
             try await reencodeVideo(input: input, output: ref, bitrate: Int(ceiling),
                                     outWidth: outW, outHeight: outH)
+            profTranscodeMs += MediaProfile.ms(since: tRef)
             scoreRef = ref
         } else {
             scoreRef = input
@@ -81,13 +88,19 @@ public enum VideoQualityTarget {
             try VideoQuality.videoScore(reference: scoreRef, distorted: url, sampleStride: searchStride).p10
         }
 
-        for _ in 0..<iterations {
+        for i in 0..<iterations {
             let b = (lo + hi) / 2
             let tmp = tmpDir.appendingPathComponent("vqt-\(UUID().uuidString).mp4")
             temps.append(tmp)
+            let tEnc = DispatchTime.now()
             try await reencodeVideo(input: input, output: tmp, bitrate: Int(b),
                                     outWidth: outW, outHeight: outH)
+            let encMs = MediaProfile.ms(since: tEnc); profTranscodeMs += encMs
+            let tSc = DispatchTime.now()
             let p10 = try scoreOf(tmp)
+            let scMs = MediaProfile.ms(since: tSc); profScoreMs += scMs
+            MediaProfile.log(String(format: "iter %d: %.2f Mbps · transcode %.0f ms · score %.0f ms · p10 %.1f",
+                                    i + 1, b / 1e6, encMs, scMs, p10))
             if p10 >= targetScore {
                 best = (Int(b), p10, tmp); hi = b        // clears → try smaller (lower bitrate)
             } else {
@@ -109,6 +122,13 @@ public enum VideoQualityTarget {
         try? FileManager.default.removeItem(at: output)
         try FileManager.default.copyItem(at: chosen.url, to: output)
         for t in temps { try? FileManager.default.removeItem(at: t) }
+
+        let profTotal = profTranscodeMs + profScoreMs
+        if profTotal > 0 {
+            MediaProfile.log(String(format: "TOTAL: transcode %.0f ms (%.0f%%) · score %.0f ms (%.0f%%)",
+                                    profTranscodeMs, 100 * profTranscodeMs / profTotal,
+                                    profScoreMs, 100 * profScoreMs / profTotal))
+        }
 
         let outBytes = (try? output.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         return Result(bitrate: chosen.bitrate, score: chosen.score, inputBytes: inBytes,

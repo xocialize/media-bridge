@@ -30,24 +30,38 @@ public enum VideoQuality {
                                   maxFrames: Int = 60, matchSize: CGSize? = nil) throws -> VideoQualityScore {
         let ref = try FrameStream(reference)
         let dist = try FrameStream(distorted)
+        // Use the **full-GPU per-channel path** (products + blur + map/reduce on device), the same one the
+        // image optimize uses — NOT `gpu.score()`, which only offloads the blur and leaves the rest of the
+        // SSIM math on the CPU (the dominant cost on large frames; ~565 ms/4K-frame → mostly CPU).
         let gpu = SSIMULACRA2Metal.shared
         func score(_ r: CGImage, _ d: CGImage) throws -> Double {
-            if let gpu { return try gpu.score(reference: r, distorted: d) }
+            if let gpu {
+                return try SSIMULACRA2.score(reference: r, distorted: d,
+                                             channelScalars: gpu.channelScalarsFunction)
+            }
             return try SSIMULACRA2.score(reference: r, distorted: d)
         }
 
         var scores: [Double] = []
-        var idx = 0
-        while scores.count < maxFrames, let r0 = ref.next(), let d0 = dist.next() {
+        var idx = 0, decoded = 0
+        var decodeMs = 0.0, ssimMs = 0.0      // frame plumbing (decode+CGImage convert) vs the SSIMULACRA2 math
+        while scores.count < maxFrames {
+            let tN = DispatchTime.now()
+            guard let r0 = ref.next(), let d0 = dist.next() else { break }
+            decodeMs += MediaProfile.ms(since: tN); decoded += 1
             if idx % max(1, sampleStride) == 0 {
                 let r = resample(r0, to: matchSize)
                 let d = resample(d0, to: matchSize)
                 guard r.width == d.width, r.height == d.height else { throw ScoreError.dimensionMismatch }
+                let tS = DispatchTime.now()
                 scores.append(try score(r, d))
+                ssimMs += MediaProfile.ms(since: tS)
             }
             idx += 1
         }
         guard !scores.isEmpty else { throw ScoreError.noFramesScored }
+        MediaProfile.log(String(format: "  videoScore: decoded %d (decode+convert %.0f ms) · scored %d "
+            + "(ssimu2 %.0f ms, %@)", decoded, decodeMs, scores.count, ssimMs, gpu != nil ? "GPU" : "CPU"))
 
         let sorted = scores.sorted()
         let mean = scores.reduce(0, +) / Double(scores.count)

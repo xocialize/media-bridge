@@ -45,6 +45,28 @@ public final class SSIMULACRA2Metal {
     /// Shared instance — kernels compile once. `nil` when no Metal device is available (→ CPU fallback).
     public static let shared = SSIMULACRA2Metal()
 
+    /// Pinpoints WHERE GPU setup fails (device vs command-queue vs runtime shader compile vs pipeline) — so a
+    /// host can tell a missing device (fixable by injecting one) from a `makeLibrary(source:)` failure (needs
+    /// a precompiled metallib instead). Returns "OK …" when the GPU path is fully available.
+    public static func diagnostics() -> String {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            return "FAIL: no Metal device (MTLCreateSystemDefaultDevice == nil)"
+        }
+        guard device.makeCommandQueue() != nil else {
+            return "FAIL: \(device.name): makeCommandQueue == nil"
+        }
+        let lib: MTLLibrary
+        do { lib = try device.makeLibrary(source: kernelSource, options: nil) }
+        catch { return "FAIL: \(device.name): makeLibrary(source:) threw — \(error)" }
+        for fn in ["ssimu2_blur_h", "ssimu2_blur_v", "ssimu2_products", "ssimu2_map_reduce"] {
+            guard let f = lib.makeFunction(name: fn) else { return "FAIL: missing kernel \(fn)" }
+            guard (try? device.makeComputePipelineState(function: f)) != nil else {
+                return "FAIL: pipeline \(fn)"
+            }
+        }
+        return "OK: GPU SSIMULACRA2 available on \(device.name)"
+    }
+
     /// The GPU blur exposed as an injectable `SSIMULACRA2.BlurFunction` (for `ImageQualityTarget` / `score`).
     public var blurFunction: SSIMULACRA2.BlurFunction {
         { src, w, h, k in self.blur(src, width: w, height: h, kernel: k) }
