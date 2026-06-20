@@ -115,9 +115,14 @@ public enum VideoQualityTarget {
         var lo = ceiling * 0.04, hi = ceiling
         var best: (bitrate: Int, score: Double, url: URL)?
 
-        func scoreOf(_ url: URL) throws -> Double {
-            try VideoQuality.videoScore(reference: scoreRef, distorted: url,
-                                        sampleStride: stride, maxFrames: frameCap).p10
+        // Score off the cooperative pool at .utility QoS (EMBED-004): the host drives encode from a
+        // .userInitiated Task, so scoring inline would block a high-QoS thread on CoreGraphics's
+        // Default-QoS rasterization → a priority inversion. Awaiting the hop suspends instead of blocking.
+        func scoreOf(_ url: URL) async throws -> Double {
+            try await ScoringExecutor.run {
+                try VideoQuality.videoScore(reference: scoreRef, distorted: url,
+                                            sampleStride: stride, maxFrames: frameCap).p10
+            }
         }
 
         for i in 0..<iterations {
@@ -129,7 +134,7 @@ public enum VideoQualityTarget {
                                     outWidth: outW, outHeight: outH)
             let encMs = MediaProfile.ms(since: tEnc); profTranscodeMs += encMs
             let tSc = DispatchTime.now()
-            let p10 = try scoreOf(tmp)
+            let p10 = try await scoreOf(tmp)
             let scMs = MediaProfile.ms(since: tSc); profScoreMs += scMs
             MediaProfile.log(String(format: "iter %d: %.2f Mbps · transcode %.0f ms · score %.0f ms · p10 %.1f",
                                     i + 1, b / 1e6, encMs, scMs, p10))
@@ -148,7 +153,7 @@ public enum VideoQualityTarget {
             temps.append(tmp)
             try await reencodeVideo(input: input, output: tmp, bitrate: Int(hi),
                                     outWidth: outW, outHeight: outH)
-            chosen = (Int(hi), try scoreOf(tmp), tmp)
+            chosen = (Int(hi), try await scoreOf(tmp), tmp)
         }
 
         // Deliverable lands at the host's `output` ONLY on a genuine win (cleared the floor AND smaller),

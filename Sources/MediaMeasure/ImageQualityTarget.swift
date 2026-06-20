@@ -52,6 +52,18 @@ public enum ImageQualityTarget {
                       metTarget: search.metTarget)
     }
 
+    /// Async entry point: identical to the sync `encodeHEIC` but runs the CPU-bound search **off the
+    /// cooperative pool** at `.utility` QoS, so a `.userInitiated` caller doesn't invert against
+    /// CoreGraphics's Default-QoS rasterization (EMBED-004). Prefer this from async contexts.
+    public static func encodeHEIC(_ image: CGImage, targetScore: Double,
+                                  iterations: Int = 8,
+                                  channelScalars: SSIMULACRA2.ChannelScalars? = nil) async throws -> Result {
+        try await ScoringExecutor.run {
+            try encodeHEIC(image, targetScore: targetScore, iterations: iterations,
+                           channelScalars: channelScalars)
+        }
+    }
+
     // MARK: - ImageIO HEIC
 
     static func encode(_ image: CGImage, quality: Double) throws -> Data {
