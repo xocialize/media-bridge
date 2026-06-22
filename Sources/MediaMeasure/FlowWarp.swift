@@ -52,6 +52,28 @@ public enum FlowWarp {
         return (warped, valid)
     }
 
+    /// Temporal confidence blend: fuse the freshly-computed matte with the flow-warped previous matte.
+    /// Where the warp is **valid** and the two **agree** (the stable-region case), trust the warped-prev to
+    /// kill frame-to-frame flicker; where they **disagree** (a moving edge / genuinely new coverage) or the
+    /// warp is **invalid** (disocclusion), trust the fresh matte so real changes aren't smeared.
+    ///
+    /// `agreement = max(0, 1 − |fresh−warped| / tolerance)` (1 when equal, 0 once the gap reaches `tolerance`);
+    /// `w = strength · agreement` is the weight on the warped-prev; `out = w·warped + (1−w)·fresh`.
+    /// `strength` ∈ [0,1] is the max temporal smoothing (0 = per-frame, no smoothing); `tolerance` is the
+    /// matte-difference at which a region is treated as genuinely changed.
+    public static func confidenceBlend(fresh: [Float], warped: [Float], valid: [Bool],
+                                       strength: Float, tolerance: Float) -> [Float] {
+        precondition(fresh.count == warped.count && fresh.count == valid.count, "size mismatch")
+        let invTol = tolerance > 0 ? 1 / tolerance : 0
+        var out = fresh
+        for i in 0..<fresh.count where valid[i] {
+            let agreement = max(0, 1 - abs(fresh[i] - warped[i]) * invTol)
+            let w = strength * agreement
+            out[i] = w * warped[i] + (1 - w) * fresh[i]
+        }
+        return out
+    }
+
     /// Bilinear sample of a row-major grayscale buffer at fractional `(x, y)` (caller guarantees in-bounds).
     @inline(__always)
     static func bilinear(_ buf: [Float], width: Int, height: Int, x: Float, y: Float) -> Float {
