@@ -84,8 +84,9 @@ public enum VideoQuality {
     }
 }
 
-/// Decodes a video's frames one at a time (BGRA → CGImage), bounded memory.
-private final class FrameStream {
+/// Decodes a video's frames one at a time (BGRA → CGImage), bounded memory. Internal — also drives the
+/// video-matte pipeline.
+final class FrameStream {
     private let reader: AVAssetReader
     private let output: AVAssetReaderTrackOutput
 
