@@ -17,6 +17,36 @@ public struct DenseFlow: Sendable, Equatable {
         let i = (y * width + x) * 2
         return (uv[i], uv[i + 1])
     }
+
+    /// Resample this field to `toWidth × toHeight`, scaling the displacements by the resolution ratio.
+    /// Used by the **flow-downscale** perf lever: flow is estimated on shrunk frames (cheap — SEA-RAFT's
+    /// correlation volume is `(H/8·W/8)²`), then the reduced field is upscaled back to source resolution.
+    /// A displacement of 1 px at the reduced scale is `toWidth/width` px at full scale, so `u` is scaled by
+    /// the X ratio and `v` by the Y ratio. Bilinear sample with pixel-center alignment. No-op if already sized.
+    public func upscaled(toWidth tw: Int, toHeight th: Int) -> DenseFlow {
+        if tw == width && th == height { return self }
+        let sx = Float(tw) / Float(width), sy = Float(th) / Float(height)
+        let maxX = Float(width - 1), maxY = Float(height - 1)
+        var out = [Float](repeating: 0, count: tw * th * 2)
+        for y in 0..<th {
+            let srcY = min(max((Float(y) + 0.5) / sy - 0.5, 0), maxY)
+            let y0 = Int(srcY.rounded(.down)), y1 = min(Int(srcY.rounded(.down)) + 1, height - 1)
+            let fy = srcY - Float(y0)
+            for x in 0..<tw {
+                let srcX = min(max((Float(x) + 0.5) / sx - 0.5, 0), maxX)
+                let x0 = Int(srcX.rounded(.down)), x1 = min(Int(srcX.rounded(.down)) + 1, width - 1)
+                let fx = srcX - Float(x0)
+                let o = (y * tw + x) * 2
+                for c in 0..<2 {                                  // u (c=0), v (c=1)
+                    let p00 = uv[(y0 * width + x0) * 2 + c], p10 = uv[(y0 * width + x1) * 2 + c]
+                    let p01 = uv[(y1 * width + x0) * 2 + c], p11 = uv[(y1 * width + x1) * 2 + c]
+                    let top = p00 + (p10 - p00) * fx, bot = p01 + (p11 - p01) * fx
+                    out[o + c] = (top + (bot - top) * fy) * (c == 0 ? sx : sy)
+                }
+            }
+        }
+        return DenseFlow(width: tw, height: th, uv: out)
+    }
 }
 
 /// Flow-guided temporal warping for video-matte consistency.

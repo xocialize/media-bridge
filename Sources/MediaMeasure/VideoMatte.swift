@@ -7,9 +7,15 @@ public struct VideoMatteOptions: Sendable {
     public var temporalStrength: Float
     /// Matte difference at which a region is treated as genuinely changed (→ trust the fresh matte).
     public var agreementTolerance: Float
-    public init(temporalStrength: Float = 0.6, agreementTolerance: Float = 0.15) {
+    /// **Flow-downscale perf lever.** Estimate optical flow on frames shrunk by this integer factor, then
+    /// upscale the field back to source resolution. SEA-RAFT's cost is dominated by an `(H/8·W/8)²`
+    /// correlation volume, so `2` cuts that ~16× for a large speedup; the matte stays full-resolution and
+    /// the confidence-blend self-heals the small precision loss in the flow. `1` = full-res flow (default).
+    public var flowDownsample: Int
+    public init(temporalStrength: Float = 0.6, agreementTolerance: Float = 0.15, flowDownsample: Int = 1) {
         self.temporalStrength = temporalStrength
         self.agreementTolerance = agreementTolerance
+        self.flowDownsample = max(1, flowDownsample)
     }
 }
 
@@ -50,7 +56,7 @@ public final class VideoMatteProcessor {
         let w = freshCG.width, h = freshCG.height
 
         if let prevFrame, let prevStable, w == width, h == height {
-            let f = try await flow(frame, prevFrame)            // cur→prev for backward warp
+            let f = try await flowField(cur: frame, prev: prevFrame, width: w, height: h)
             guard f.width == w && f.height == h else {
                 throw MatteError.flowSizeMismatch(matte: (w, h), flow: (f.width, f.height))
             }
@@ -68,6 +74,17 @@ public final class VideoMatteProcessor {
 
     /// Reset between independent clips/shots (clears the temporal history so frame 0 is fresh).
     public func reset() { prevFrame = nil; prevStable = nil }
+
+    /// cur→prev flow at `width × height`. With `flowDownsample > 1`, estimate on shrunk frames (cheap) and
+    /// upscale the field back to source resolution — the matte stays full-res; the blend absorbs the slack.
+    private func flowField(cur: CGImage, prev: CGImage, width w: Int, height h: Int) async throws -> DenseFlow {
+        let k = options.flowDownsample
+        guard k > 1 else { return try await flow(cur, prev) }
+        let sw = max(1, w / k), sh = max(1, h / k)
+        let size = CGSize(width: sw, height: sh)
+        let f = try await flow(VideoQuality.resample(cur, to: size), VideoQuality.resample(prev, to: size))
+        return f.upscaled(toWidth: w, toHeight: h)
+    }
 
     // MARK: - grayscale CGImage ⇄ [Float] (0…1, row-major)
 

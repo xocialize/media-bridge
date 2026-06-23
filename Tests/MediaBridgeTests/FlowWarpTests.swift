@@ -28,6 +28,26 @@ final class FlowWarpTests: XCTestCase {
         XCTAssertFalse(valid[w - 1])                    // x=3 + u=1 = 4 > maxX → disocclusion
     }
 
+    func testUpscaleScalesDisplacementsByRatio() {
+        // Constant field (u=2, v=3) at 4×4, upscaled ×2 → 8×8 with displacements scaled by the ratio
+        // (u→4, v→6): a 1-px move at the reduced scale is 2 px at full scale.
+        let w = 4, h = 4
+        var uv = [Float](repeating: 0, count: w * h * 2)
+        for p in 0..<(w * h) { uv[p * 2] = 2; uv[p * 2 + 1] = 3 }
+        let up = DenseFlow(width: w, height: h, uv: uv).upscaled(toWidth: 8, toHeight: 8)
+        XCTAssertEqual(up.width, 8); XCTAssertEqual(up.height, 8)
+        XCTAssertEqual(up.uv.count, 8 * 8 * 2)
+        for (i, c) in up.uv.enumerated() {
+            XCTAssertEqual(c, i % 2 == 0 ? 4 : 6, accuracy: 1e-4)   // u=4, v=6 everywhere
+        }
+    }
+
+    func testUpscaleSameSizeIsIdentity() {
+        let w = 4, h = 4
+        let f = DenseFlow(width: w, height: h, uv: ramp(w, h).flatMap { [$0, -$0] })
+        XCTAssertEqual(f.upscaled(toWidth: w, toHeight: h), f)      // no-op when already sized
+    }
+
     func testOutOfBoundsMarkedInvalid() {
         let w = 4, h = 4, m = ramp(w, h)
         var uv = [Float](repeating: 0, count: w * h * 2)
