@@ -41,6 +41,12 @@ public final class VideoMatteProcessor {
     private var prevStable: [Float]?
     private var width = 0, height = 0
 
+    // Motion-compensated temporal-stability accumulators (pixel-weighted across the clip; see `stability()`).
+    private var stabTransitions = 0
+    private var stabValidPixels = 0
+    private var stabInputSum: Double = 0     // Σ |rawMatte − warpedPrevStable| over valid pixels
+    private var stabOutputSum: Double = 0    // Σ |stabilized − warpedPrevStable| over valid pixels
+
     public init(options: VideoMatteOptions = .init(),
                 matte: @escaping (CGImage) async throws -> CGImage,
                 flow: @escaping (CGImage, CGImage) async throws -> DenseFlow) {
@@ -61,9 +67,11 @@ public final class VideoMatteProcessor {
                 throw MatteError.flowSizeMismatch(matte: (w, h), flow: (f.width, f.height))
             }
             let (warped, valid) = FlowWarp.backwardWarp(prevMatte: prevStable, width: w, height: h, flow: f)
-            fresh = FlowWarp.confidenceBlend(fresh: fresh, warped: warped, valid: valid,
+            let raw = fresh
+            fresh = FlowWarp.confidenceBlend(fresh: raw, warped: warped, valid: valid,
                                              strength: options.temporalStrength,
                                              tolerance: options.agreementTolerance)
+            accumulateStability(raw: raw, output: fresh, warped: warped, valid: valid)
         }
 
         prevFrame = frame
@@ -72,8 +80,32 @@ public final class VideoMatteProcessor {
         return Self.grayCGImage(fresh, width: w, height: h)
     }
 
-    /// Reset between independent clips/shots (clears the temporal history so frame 0 is fresh).
+    /// Reset between independent clips/shots (clears the temporal history so frame 0 is fresh). Stability
+    /// accumulation persists across resets (it's a whole-clip stat; shot boundaries simply contribute no
+    /// transition, since the first frame after a reset has no previous matte to compare).
     public func reset() { prevFrame = nil; prevStable = nil }
+
+    /// Whole-clip motion-compensated temporal stability (flicker), or nil if no transitions were measured.
+    public func stability() -> TemporalStability? {
+        guard stabTransitions > 0, stabValidPixels > 0 else { return nil }
+        return TemporalStability(transitions: stabTransitions,
+                                 inputFlicker: Float(stabInputSum / Double(stabValidPixels)),
+                                 outputFlicker: Float(stabOutputSum / Double(stabValidPixels)))
+    }
+
+    /// Accumulate one transition's flicker: mean-|·| of raw and stabilized mattes vs the flow-warped previous
+    /// stabilized matte, over valid pixels (pixel-weighted so larger valid areas count proportionally).
+    private func accumulateStability(raw: [Float], output: [Float], warped: [Float], valid: [Bool]) {
+        var inSum = 0.0, outSum = 0.0, n = 0
+        for i in 0..<valid.count where valid[i] {
+            inSum += Double(abs(raw[i] - warped[i]))
+            outSum += Double(abs(output[i] - warped[i]))
+            n += 1
+        }
+        guard n > 0 else { return }
+        stabTransitions += 1; stabValidPixels += n
+        stabInputSum += inSum; stabOutputSum += outSum
+    }
 
     /// cur→prev flow at `width × height`. With `flowDownsample > 1`, estimate on shrunk frames (cheap) and
     /// upscale the field back to source resolution — the matte stays full-res; the blend absorbs the slack.

@@ -20,6 +20,18 @@ public enum VideoMattePipeline {
         matte: @escaping (CGImage) async throws -> CGImage,
         flow: @escaping (CGImage, CGImage) async throws -> DenseFlow
     ) async throws -> Int {
+        try await matteToProRes4444Measured(input: input, output: output, options: options,
+                                            matte: matte, flow: flow).framesWritten
+    }
+
+    /// As `matteToProRes4444`, but also returns the motion-compensated temporal-stability metric (the flicker
+    /// gate) — residual jitter of the stabilized matte and how much the temporal blend removed.
+    @discardableResult
+    public static func matteToProRes4444Measured(
+        input: URL, output: URL, options: VideoMatteOptions = .init(),
+        matte: @escaping (CGImage) async throws -> CGImage,
+        flow: @escaping (CGImage, CGImage) async throws -> DenseFlow
+    ) async throws -> VideoMatteOutcome {
         let asset = AVURLAsset(url: input)
         guard let track = try await asset.loadTracks(withMediaType: .video).first else {
             throw PipelineError.noVideoTrack
@@ -36,7 +48,7 @@ public enum VideoMattePipeline {
         // unchanged for a faithful cutout.
         let ci = CIContext(options: [.workingColorSpace: NSNull()])
 
-        return try await AlphaVideoWriter.writeProRes4444(to: output, width: w, height: h, frameRate: fps) {
+        let frames = try await AlphaVideoWriter.writeProRes4444(to: output, width: w, height: h, frameRate: fps) {
             guard let frame = reader.next() else { return nil }
             let stable = try await proc.next(frame)                 // matte + flow + temporal blend
             guard let cutout = Self.compose(frame: frame, matte: stable, ci: ci) else {
@@ -44,6 +56,7 @@ public enum VideoMattePipeline {
             }
             return cutout
         }
+        return VideoMatteOutcome(framesWritten: frames, stability: proc.stability())
     }
 
     /// Composite foreground over transparent using the matte as alpha → premultiplied-BGRA `CVPixelBuffer`
