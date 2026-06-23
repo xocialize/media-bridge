@@ -7,10 +7,12 @@ public struct VideoMatteOptions: Sendable {
     public var temporalStrength: Float
     /// Matte difference at which a region is treated as genuinely changed (→ trust the fresh matte).
     public var agreementTolerance: Float
-    /// **Flow-downscale perf lever.** Estimate optical flow on frames shrunk by this integer factor, then
-    /// upscale the field back to source resolution. SEA-RAFT's cost is dominated by an `(H/8·W/8)²`
-    /// correlation volume, so `2` cuts that ~16× for a large speedup; the matte stays full-resolution and
-    /// the confidence-blend self-heals the small precision loss in the flow. `1` = full-res flow (default).
+    /// **Flow-downscale lever.** Estimate optical flow on frames shrunk by this integer factor, then upscale
+    /// the field back to source resolution. SEA-RAFT's cost is an `(H/8·W/8)²` correlation volume, so `2` cuts
+    /// flow compute ~16×; the matte stays full-resolution and the confidence-blend self-heals the small
+    /// precision loss. NB at typical resolution the per-frame **matte** dominates clip wall-time (measured:
+    /// BiRefNet Best ~2–2.5 s/frame ≫ flow), so this primarily bounds flow cost at HIGH resolution — it is not
+    /// the e2e video speed lever (that's the matte tier / matte downscale). `1` = full-res flow (default).
     public var flowDownsample: Int
     public init(temporalStrength: Float = 0.6, agreementTolerance: Float = 0.15, flowDownsample: Int = 1) {
         self.temporalStrength = temporalStrength
