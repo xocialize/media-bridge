@@ -59,6 +59,58 @@ public enum VideoMattePipeline {
         return VideoMatteOutcome(framesWritten: frames, stability: proc.stability())
     }
 
+    /// Run the matte pipeline but, instead of compositing a cutout, map each **temporally-stabilized matte**
+    /// through `transform` and write the result as an opaque video — the basis for a **control-mask** sequence
+    /// (matte → discrete palette frame), distinct from the alpha cutout. `transform` MUST preserve frame size.
+    /// Uses the ProRes 4444 writer (visually lossless, so a hard palette survives the downstream >225 threshold).
+    @discardableResult
+    public static func mattesToVideo(
+        input: URL, output: URL, options: VideoMatteOptions = .init(),
+        matte: @escaping (CGImage) async throws -> CGImage,
+        flow: @escaping (CGImage, CGImage) async throws -> DenseFlow,
+        transform: @escaping (CGImage) throws -> CGImage
+    ) async throws -> VideoMatteOutcome {
+        let asset = AVURLAsset(url: input)
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+            throw PipelineError.noVideoTrack
+        }
+        let size = try await track.load(.naturalSize)
+        let fpsRaw = try await track.load(.nominalFrameRate)
+        let w = Int(abs(size.width).rounded()), h = Int(abs(size.height).rounded())
+        let fps = Double(fpsRaw > 0 ? fpsRaw : 30)
+
+        let reader = try FrameStream(input)
+        let proc = VideoMatteProcessor(options: options, matte: matte, flow: flow)
+        let frames = try await AlphaVideoWriter.writeProRes4444(to: output, width: w, height: h, frameRate: fps) {
+            guard let frame = reader.next() else { return nil }
+            let stable = try await proc.next(frame)
+            let outFrame = try transform(stable)
+            guard let pb = Self.bgraBuffer(outFrame, width: w, height: h) else { throw PipelineError.composeFailed }
+            return pb
+        }
+        return VideoMatteOutcome(framesWritten: frames, stability: proc.stability())
+    }
+
+    /// Render an opaque RGB `CGImage` into a premultiplied-BGRA `CVPixelBuffer` (alpha 255 → premult is identity,
+    /// so palette colours pass through unchanged). No colour management — the mask carries labels, not colour.
+    static func bgraBuffer(_ image: CGImage, width w: Int, height h: Int) -> CVPixelBuffer? {
+        var pb: CVPixelBuffer?
+        CVPixelBufferCreate(nil, w, h, kCVPixelFormatType_32BGRA,
+                            [kCVPixelBufferCGImageCompatibilityKey: true,
+                             kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &pb)
+        guard let buf = pb else { return nil }
+        CVPixelBufferLockBaseAddress(buf, [])
+        defer { CVPixelBufferUnlockBaseAddress(buf, []) }
+        guard let base = CVPixelBufferGetBaseAddress(buf),
+              let ctx = CGContext(data: base, width: w, height: h, bitsPerComponent: 8,
+                                  bytesPerRow: CVPixelBufferGetBytesPerRow(buf),
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue
+                                      | CGBitmapInfo.byteOrder32Little.rawValue) else { return nil }
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return buf
+    }
+
     /// Composite foreground over transparent using the matte as alpha → premultiplied-BGRA `CVPixelBuffer`
     /// (the form `AlphaVideoWriter` encodes). Colour-preserving (`blendWithMask` keeps source RGB).
     static func compose(frame: CGImage, matte: CGImage, ci: CIContext) -> CVPixelBuffer? {
