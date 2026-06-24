@@ -104,6 +104,68 @@ public enum FlowWarp {
         return out
     }
 
+    /// Multi-channel backward warp — the `backwardWarp` generalization for an interleaved **C-channel** frame
+    /// (row-major, channels innermost: `[y*W*C + x*C + c]`). Used to flow-warp a previous **upscaled RGB**
+    /// frame for video temporal-consistency (the upscale analog of warping the previous matte). Out-of-bounds
+    /// samples → `valid[i]=false` so the blend falls back to the fresh frame there.
+    public static func backwardWarpChannels(prev: [Float], width: Int, height: Int, channels c: Int,
+                                            flow: DenseFlow) -> (warped: [Float], valid: [Bool]) {
+        precondition(prev.count == width * height * c, "prev size mismatch")
+        precondition(flow.width == width && flow.height == height, "flow size mismatch")
+        var warped = [Float](repeating: 0, count: width * height * c)
+        var valid = [Bool](repeating: false, count: width * height)
+        let maxX = Float(width - 1), maxY = Float(height - 1)
+        for y in 0..<height {
+            for x in 0..<width {
+                let (u, v) = flow.flow(x, y)
+                let sx = Float(x) + u, sy = Float(y) + v
+                if sx < 0 || sy < 0 || sx > maxX || sy > maxY { continue }
+                let o = (y * width + x) * c
+                for ch in 0..<c {
+                    warped[o + ch] = bilinearChannel(prev, width: width, height: height, channels: c,
+                                                     channel: ch, x: sx, y: sy)
+                }
+                valid[y * width + x] = true
+            }
+        }
+        return (warped, valid)
+    }
+
+    /// Multi-channel confidence blend — the `confidenceBlend` generalization. Agreement is a **single per-pixel
+    /// scalar** from the mean absolute channel difference (so all channels move together, no colour-fringing):
+    /// `agreement = max(0, 1 − meanAbs(fresh−warped)/tolerance)`, `w = strength·agreement`, then
+    /// `out = w·warped + (1−w)·fresh` per channel. Stable regions (consecutive frames agree) get smoothed to
+    /// kill flicker; moving/changed regions (disagreement) or disocclusions (invalid) keep the fresh frame, so
+    /// real detail and motion aren't smeared.
+    public static func confidenceBlendChannels(fresh: [Float], warped: [Float], valid: [Bool],
+                                               channels c: Int, strength: Float, tolerance: Float) -> [Float] {
+        precondition(fresh.count == warped.count && fresh.count == valid.count * c, "size mismatch")
+        let invTol = tolerance > 0 ? 1 / tolerance : 0
+        var out = fresh
+        for p in 0..<valid.count where valid[p] {
+            let o = p * c
+            var diff: Float = 0
+            for ch in 0..<c { diff += abs(fresh[o + ch] - warped[o + ch]) }
+            let agreement = max(0, 1 - (diff / Float(c)) * invTol)
+            let w = strength * agreement
+            if w > 0 { for ch in 0..<c { out[o + ch] = w * warped[o + ch] + (1 - w) * fresh[o + ch] } }
+        }
+        return out
+    }
+
+    /// Bilinear sample of channel `ch` in an interleaved C-channel buffer at fractional `(x, y)` (in-bounds).
+    @inline(__always)
+    static func bilinearChannel(_ buf: [Float], width: Int, height: Int, channels c: Int, channel ch: Int,
+                                x: Float, y: Float) -> Float {
+        let x0 = Int(x.rounded(.down)), y0 = Int(y.rounded(.down))
+        let x1 = min(x0 + 1, width - 1), y1 = min(y0 + 1, height - 1)
+        let fx = x - Float(x0), fy = y - Float(y0)
+        let p00 = buf[(y0 * width + x0) * c + ch], p10 = buf[(y0 * width + x1) * c + ch]
+        let p01 = buf[(y1 * width + x0) * c + ch], p11 = buf[(y1 * width + x1) * c + ch]
+        let top = p00 + (p10 - p00) * fx, bot = p01 + (p11 - p01) * fx
+        return top + (bot - top) * fy
+    }
+
     /// Bilinear sample of a row-major grayscale buffer at fractional `(x, y)` (caller guarantees in-bounds).
     @inline(__always)
     static func bilinear(_ buf: [Float], width: Int, height: Int, x: Float, y: Float) -> Float {
