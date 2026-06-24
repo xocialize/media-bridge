@@ -27,8 +27,8 @@ public struct TemporalStability: Sendable, Equatable {
     public var reduction: Float { inputFlicker > 0 ? max(0, 1 - outputFlicker / inputFlicker) : 0 }
 }
 
-/// Outcome of a measured video-matte run: frames written + the temporal-stability metric (nil when there were
-/// no transitions to measure — e.g. a single-frame clip).
+/// Outcome of a measured per-frame video run (matte *or* enhance): frames written + the temporal-stability
+/// metric (nil when there were no transitions to measure — e.g. a single-frame clip).
 public struct VideoMatteOutcome: Sendable, Equatable {
     public let framesWritten: Int
     public let stability: TemporalStability?
