@@ -14,6 +14,13 @@ import VideoToolbox
 public struct DecodedVideoFrame: Sendable {
     public let image: CVPixelBuffer
     public let ptsNanos: Int64
+
+    // Public so an out-of-package `ExternalVideoDecoder` (e.g. vpx-swift) can build frames to hand back
+    // through the deferred-codec seam — the synthesized memberwise init is only internal.
+    public init(image: CVPixelBuffer, ptsNanos: Int64) {
+        self.image = image
+        self.ptsNanos = ptsNanos
+    }
 }
 
 public final class VideoDecodeSession {
