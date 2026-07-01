@@ -19,6 +19,10 @@ let package = Package(
         .library(name: "MediaBridge", targets: ["MediaBridge"]),
         .library(name: "ImageBridge", targets: ["ImageBridge"]),
         .library(name: "MediaMeasure", targets: ["MediaMeasure"]),
+        // Exposed so a SEPARATE package (e.g. vpx-swift) can conform to `ExternalVideoDecoder` and
+        // build `DecodedVideoFrame`s to hand back through `MediaBridge.register(externalDecoder:)` —
+        // the binary-free seam for deferred codecs (VP9/VP8/…). See DEFERRED-CODEC-PLAN.md §9.
+        .library(name: "MediaImport", targets: ["MediaImport"]),
     ],
     dependencies: [
         .package(url: "https://github.com/xocialize/matroska-swift.git", from: "0.1.0"),
