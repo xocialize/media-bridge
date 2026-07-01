@@ -222,9 +222,52 @@ permissive-only constraint is relaxed to allow LGPL dynamic linking.
 
 0. **Phase 0** — encoder stall guard. S. Prerequisite; mirrors `frame-stream-native` `a80c26e`. Do first.
 1. **Phase A** — native audio. S–M. Reuses the `AudioConverter` path wholesale. Biggest coverage win.
-2. **Phase B** — native VP9. S–M. One `FormatDescriptionFactory` case + the gate subtlety in §4.1.
-3. **Phase C** — Vorbis. M–L. Vendoring is trivial; the Matroska header unpack + pushdata is the work.
-4. **Phase D** — MPEG-2 probe. S. Cheap to try; may end in a documented permanent defer.
+2. ~~**Phase B** — native VP9.~~ ⛔ Not possible on Apple Silicon (§4). Path is the libvpx seam (§9).
+3. **Phase C** — Vorbis. M–L. DEFERRED — bundle with the libvpx package (§9) so one binary unlocks WebM.
+4. **Phase D** — MPEG-2 probe. ✅ DONE — native.
 
 Encode side is unchanged throughout — every path still normalizes to **HEVC + AAC**. This plan only
 widens what the front-door will accept.
+
+---
+
+## 9. External-decoder seam + libvpx package (the VP9/VP8/Vorbis path)
+
+VP9 has **no native macOS decoder** (§4) and **no pure-Swift decoder exists** — the only option is
+`libvpx` (BSD-3 + PATENTS grant, actively maintained), a vendored binary. Unlike oxipng (dropped because
+a pure-Swift equivalent existed to hold out for), there is no alternative here, so the question isn't
+*whether* to accept the binary but *where to put it* — and the answer is **not in media-bridge**.
+
+### Step 1 — the seam ✅ DONE (binary-free, in media-bridge)
+
+`ExternalVideoDecoder` (protocol, `MediaImport`) + `MediaBridge.register(externalDecoder:)` /
+`unregisterAllExternalDecoders()` (registry) + a hand-off in `normalizeMatroska`: when a codec is
+`.deferred`, the normalizer consults the registry; a registered decoder produces `DecodedVideoFrame`s
+that flow through the **same** HEVC-encode/mux path as native decode. With nothing registered, behavior
+is byte-for-byte unchanged (the codec defers). media-bridge stays **pure-Swift, zero binaries**. Proven
+end-to-end by `ExternalDecoderTests` with a pure-Swift fake VP9 decoder — register rescues VP9, unregister
+restores the deferral. 64 tests green.
+
+### Step 2 — `vpx-swift` package (the quarantine, NOT YET BUILT)
+
+A **separate** package (ships open in `MetalToolBox/PROD`, alongside matroska-swift) that carries ALL the
+binary encumbrance and conforms to `ExternalVideoDecoder`:
+- Build upstream libvpx **VP9(+VP8)-decode-only** (`--disable-vp8_encoder --disable-vp9_encoder
+  --disable-examples --disable-docs`, ~1–2 MB/arch) for arm64(+x86_64) macOS → `.xcframework` → SPM
+  `binaryTarget`. **No usable prebuilt exists** (`denghe/libvpx_prebuilt` is Android/Windows, dead) — build our own.
+- Thin Swift C-interop wrapper: `vpx_codec_dec_init(vpx_codec_vp9_dx())` → `vpx_codec_decode(pkt)` →
+  `vpx_codec_get_frame()` → I420 `vpx_image_t` (the `examples/simple_decoder.c` surface).
+- `vImage` I420→BGRA `CVPixelBuffer` → emit `DecodedVideoFrame` per the protocol. We already demux WebM
+  (matroska-swift), so **libwebm is NOT needed** — decoder only.
+- **The FFmpeg lesson:** keep it small — decode-only config, one codec family, no encoder/tools. The
+  ~100 MB FFmpeg mess came from linking everything; a VP9-decode-only libvpx is a couple MB per arch.
+
+### Step 3 — wire into a consumer (e.g. Forge Erase)
+
+The consumer depends on `media-bridge` **and** `vpx-swift`, and calls
+`MediaBridge.register(externalDecoder: VpxDecoder())` once at startup → **transparent WebM** (Forge Erase
+use case). Consumers that don't need VP9 depend on media-bridge alone and stay binary-free. Bundle Vorbis
+(Phase C) into the same package effort so one binary unlocks the whole WebM stack (VP8 + VP9 + Vorbis).
+
+**License containment:** media-bridge stays MIT-pure; only a consumer that links `vpx-swift` accepts
+BSD-3 + the libvpx PATENTS grant.

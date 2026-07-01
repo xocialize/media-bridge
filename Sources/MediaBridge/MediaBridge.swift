@@ -118,11 +118,17 @@ public enum MediaBridge {
         guard let track = demuxer.tracks.first(where: { $0.type == .video }) else {
             throw NormalizeError.noVideoTrack
         }
-        guard SupportGate.status(forCodecID: track.codecID) == .nativeVideo else {
+        // Native decode, OR hand off to a registered ExternalVideoDecoder (e.g. VP9/VP8 supplied by a
+        // separate permissive libvpx package). media-bridge carries NO decoder binary — the external
+        // package is the demarcation. With none registered, an unsupported codec defers exactly as before.
+        let status = SupportGate.status(forCodecID: track.codecID)
+        let external = (status == .deferred) ? externalDecoder(for: track.codecID) : nil
+        guard status == .nativeVideo || external != nil else {
             throw NormalizeError.deferredCodec(track.codecID)
         }
         // AV1 is HW-only (M3+): if this machine can't decode it, treat it as deferred, not a crash.
-        if track.codecID == "V_AV1", !VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1) {
+        // (Only native codecs reach the HW probe; an externally-decoded codec is .deferred by definition.)
+        if external == nil, track.codecID == "V_AV1", !VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1) {
             throw NormalizeError.deferredCodec(track.codecID)
         }
 
@@ -130,10 +136,6 @@ public enum MediaBridge {
         let videoPackets = allPackets
             .filter { $0.trackNumber == track.number }
             .map { (data: $0.data, ptsNanos: $0.ptsNanos) }
-
-        let formatDesc = try FormatDescriptionFactory.makeVideo(
-            codecID: track.codecID, codecPrivate: track.codecPrivate,
-            width: track.video?.pixelWidth ?? 0, height: track.video?.pixelHeight ?? 0)
 
         // Optional audio: decode a natively-supported track (AAC/Opus) to PCM up front, then AAC-
         // re-encode into the mp4. Best-effort — a problematic audio track degrades to video-only.
@@ -160,33 +162,46 @@ public enum MediaBridge {
             }
         }
 
-        // Stream decode → encode: the writer is created lazily on the first frame (so it gets the
-        // real dimensions), and only a bounded reorder window of pixel buffers is ever live.
+        // Stream decode → encode: the writer is created lazily on the first frame (so it gets the real
+        // dimensions), and only a bounded reorder window of pixel buffers is ever live. The frame
+        // consumer is SHARED by both decode backends — native VideoToolbox and any ExternalVideoDecoder —
+        // so the downstream encode/mux path is identical regardless of who produced the frames.
         var writer: NativeMP4Writer?
         var basePTS: Int64?
         var outW = 0, outH = 0, frameCount = 0
-        // Creating the session is the true runtime capability probe: a host that can't actually decode
-        // the codec (VideoToolbox returns no decoder) fails here → surface as a clean deferral, not a
-        // crash. Guards codecs whose availability is machine-dependent (e.g. MPEG-2 on Apple Silicon).
-        let decodeSession: VideoDecodeSession
-        do {
-            decodeSession = try VideoDecodeSession(formatDescription: formatDesc)
-        } catch VideoDecodeSession.DecodeError.sessionCreate {
-            throw NormalizeError.deferredCodec(track.codecID)
-        }
-        try await decodeSession
-            .decodeStreaming(videoPackets) { frame in
-                if writer == nil {
-                    outW = CVPixelBufferGetWidth(frame.image)
-                    outH = CVPixelBufferGetHeight(frame.image)
-                    basePTS = frame.ptsNanos          // first emitted frame = lowest PTS
-                    writer = try NativeMP4Writer(
-                        output: output, width: outW, height: outH,
-                        audioPCM: audioPCM.map { ($0.sampleRate, $0.channels) })
-                }
-                try await writer!.appendVideo(frame.image, ptsNanos: frame.ptsNanos - (basePTS ?? 0))
-                frameCount += 1
+        let onFrame: (DecodedVideoFrame) async throws -> Void = { frame in
+            if writer == nil {
+                outW = CVPixelBufferGetWidth(frame.image)
+                outH = CVPixelBufferGetHeight(frame.image)
+                basePTS = frame.ptsNanos          // first emitted frame = lowest PTS
+                writer = try NativeMP4Writer(
+                    output: output, width: outW, height: outH,
+                    audioPCM: audioPCM.map { ($0.sampleRate, $0.channels) })
             }
+            try await writer!.appendVideo(frame.image, ptsNanos: frame.ptsNanos - (basePTS ?? 0))
+            frameCount += 1
+        }
+
+        if let external {
+            // Hand off to the external package — the decoder binary lives there, not in media-bridge.
+            try await external.decodeStreaming(
+                codecID: track.codecID, codecPrivate: track.codecPrivate,
+                packets: videoPackets, onFrame: onFrame)
+        } else {
+            let formatDesc = try FormatDescriptionFactory.makeVideo(
+                codecID: track.codecID, codecPrivate: track.codecPrivate,
+                width: track.video?.pixelWidth ?? 0, height: track.video?.pixelHeight ?? 0)
+            // Creating the session is the true runtime capability probe: a host that can't actually
+            // decode the codec (VideoToolbox returns no decoder) fails here → a clean deferral, not a
+            // crash. Guards codecs whose availability is machine-dependent (e.g. MPEG-2 on Apple Silicon).
+            let decodeSession: VideoDecodeSession
+            do {
+                decodeSession = try VideoDecodeSession(formatDescription: formatDesc)
+            } catch VideoDecodeSession.DecodeError.sessionCreate {
+                throw NormalizeError.deferredCodec(track.codecID)
+            }
+            try await decodeSession.decodeStreaming(videoPackets, onFrame: onFrame)
+        }
         guard let writer else { throw NormalizeError.noFramesDecoded }
 
         if let pcm = audioPCM, pcm.frameCount > 0 {
