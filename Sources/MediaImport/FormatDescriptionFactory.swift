@@ -33,9 +33,32 @@ public enum FormatDescriptionFactory {
         case "V_AV1":
             guard let p = codecPrivate else { throw FormatDescriptionError.missingCodecPrivate("av1C") }
             return try makeAV1(av1C: p, width: width, height: height)
+        // NOTE: no V_VP9 case — VideoToolbox has no VP9 decoder on Apple Silicon (verified: session-create
+        // returns kVTCouldNotFindVideoDecoderErr even with a synthesized vpcC). VP9 stays .deferred in
+        // SupportGate; a permissive libvpx (BSD) binaryTarget is the only re-enable path.
+        case "V_MPEG2":
+            return try makeSimpleVideo(kCMVideoCodecType_MPEG2Video, name: "MPEG-2", width: width, height: height)
+        case "V_MPEG1":
+            return try makeSimpleVideo(kCMVideoCodecType_MPEG1Video, name: "MPEG-1", width: width, height: height)
         default:
             throw FormatDescriptionError.unsupportedCodec(codecID)
         }
+    }
+
+    // MARK: - Simple codec-type + dimensions (MPEG-1/2 video)
+
+    /// MPEG-1/2 video carry their sequence header in-band in the elementary stream, so the format
+    /// description needs only the codec type + track dimensions (no parameter-set atom). Whether this
+    /// host actually has the decoder is a runtime question answered by VTDecompressionSessionCreate.
+    private static func makeSimpleVideo(_ codecType: CMVideoCodecType, name: String,
+                                        width: Int, height: Int) throws -> CMFormatDescription {
+        guard width > 0, height > 0 else { throw FormatDescriptionError.malformed("\(name) needs dimensions") }
+        var fmt: CMFormatDescription?
+        let st = CMVideoFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault, codecType: codecType,
+            width: Int32(width), height: Int32(height), extensions: nil, formatDescriptionOut: &fmt)
+        guard st == noErr, let f = fmt else { throw FormatDescriptionError.vt(st) }
+        return f
     }
 
     // MARK: - AV1 (av1C, no convenience API)

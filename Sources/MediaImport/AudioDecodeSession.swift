@@ -27,11 +27,22 @@ public final class AudioDecodeSession {
     private let channels: Int
     private let sampleRate: Double          // the OUTPUT (PCM) sample rate
 
-    /// Matroska audio CodecIDs this session can decode via AudioConverter. AAC + Opus are verified.
-    /// FLAC is NOT here: AudioConverter rejects FLAC's ASBD ('bada' at AudioConverterNew) — macOS
-    /// decodes FLAC only via the file-based AVAudioFile/ExtAudioFile path (a heavier detour, deferred).
+    /// Matroska audio CodecIDs this session can decode via AudioConverter. AAC + Opus verified; AC-3 /
+    /// E-AC-3 / MPEG Layer I-III are first-class AudioToolbox decoders (unlike FLAC, they need no magic
+    /// cookie). FLAC is NOT here: AudioConverter rejects FLAC's ASBD ('bada' at AudioConverterNew) —
+    /// macOS decodes FLAC only via the file-based AVAudioFile/ExtAudioFile path (a heavier detour).
     public static func isSupported(codecID: String) -> Bool {
         codecID.hasPrefix("A_AAC") || codecID == "A_OPUS"
+            || codecID == "A_AC3" || codecID == "A_EAC3"
+            || codecID == "A_MPEG/L1" || codecID == "A_MPEG/L2" || codecID == "A_MPEG/L3"
+    }
+
+    /// AAC/Opus/FLAC carry a MANDATORY magic cookie in CodecPrivate (AudioSpecificConfig / OpusHead /
+    /// STREAMINFO) — AudioConverter can't decode them without it. AC-3/E-AC-3/MPEG Layer I-III are
+    /// self-describing and Matroska stores no CodecPrivate for them, so a track selector must not
+    /// require one for these.
+    public static func requiresCodecPrivate(codecID: String) -> Bool {
+        codecID.hasPrefix("A_AAC") || codecID == "A_OPUS" || codecID == "A_FLAC"
     }
 
     public init(codecID: String, codecPrivate: Data?, sampleRate: Double, channels: Int,
@@ -49,6 +60,14 @@ public final class AudioDecodeSession {
         case let c where c.hasPrefix("A_AAC"): formatID = kAudioFormatMPEG4AAC; framesPerPacket = 1024; inputRate = sampleRate
         case "A_FLAC":                         formatID = kAudioFormatFLAC;      framesPerPacket = 4096; inputRate = sampleRate; inBits = UInt32(bitDepth > 0 ? bitDepth : 16)
         case "A_OPUS":                         formatID = kAudioFormatOpus;      framesPerPacket = 960;  inputRate = 48_000
+        // AC-3 / E-AC-3 / MPEG Layer I-III: native AudioToolbox decoders, no magic cookie. framesPerPacket
+        // is the nominal samples-per-syncframe hint; AudioConverter derives the true count per packet
+        // description (E-AC-3 blocks and MPEG-2 Layer III at 576 vary). AC-3 since macOS 10.2, E-AC-3 10.11.
+        case "A_AC3":                          formatID = kAudioFormatAC3;         framesPerPacket = 1536; inputRate = sampleRate
+        case "A_EAC3":                         formatID = kAudioFormatEnhancedAC3; framesPerPacket = 1536; inputRate = sampleRate
+        case "A_MPEG/L3":                      formatID = kAudioFormatMPEGLayer3;  framesPerPacket = 1152; inputRate = sampleRate
+        case "A_MPEG/L2":                      formatID = kAudioFormatMPEGLayer2;  framesPerPacket = 1152; inputRate = sampleRate
+        case "A_MPEG/L1":                      formatID = kAudioFormatMPEGLayer1;  framesPerPacket = 384;  inputRate = sampleRate
         default: throw AudioDecodeError.unsupported(codecID)
         }
         self.sampleRate = inputRate

@@ -26,12 +26,16 @@ public enum SupportGate {
         switch id {
         case "V_MPEG4/ISO/AVC",      // H.264 — VideoToolbox HW
              "V_MPEGH/ISO/HEVC",     // HEVC  — VideoToolbox HW
-             "V_AV1":                // AV1   — VideoToolbox HW (M3+), runtime-gated
-            return .nativeVideo
+             "V_AV1",                // AV1   — VideoToolbox HW (M3+), runtime-gated by VTIsHardwareDecodeSupported
+             "V_MPEG2", "V_MPEG1":   // MPEG-1/2 — legacy VideoToolbox decoder, availability machine-
+            return .nativeVideo      //            dependent → runtime-gated by session-create success.
 
         case "A_OPUS",               // AudioToolbox (macOS 14+)
              "A_FLAC",               // AudioToolbox (macOS 10.13+)
              "A_ALAC",               // AudioToolbox
+             "A_AC3",                // AudioToolbox (macOS 10.2+)
+             "A_EAC3",               // AudioToolbox (macOS 10.11+)
+             "A_MPEG/L1", "A_MPEG/L2", "A_MPEG/L3",   // AudioToolbox MPEG Layer I/II/III
              "A_PCM/INT/LIT", "A_PCM/INT/BIG", "A_PCM/FLOAT/IEEE":
             return .nativeAudio
 
@@ -39,7 +43,11 @@ public enum SupportGate {
             return .nativeAudio
 
         default:
-            // V_VP9 / V_VP8 / A_VORBIS / A_AC3 / A_EAC3 / A_DTS* / A_TRUEHD / V_MPEG1 / V_MPEG2 / …
+            // V_VP9 / V_VP8 / A_VORBIS / A_DTS* / A_TRUEHD / …
+            // NOTE: VP9 has NO native decode on Apple Silicon — VTDecompressionSessionCreate returns
+            // kVTCouldNotFindVideoDecoderErr (-12906), and AVFoundation can't read a VP9 track either
+            // (verified macOS 27, M-series 2026-07-01). Apple's "macOS 11 VP9" is Safari-internal only.
+            // Re-enable path is permissive libvpx (BSD) as an optional binaryTarget, deferred until needed.
             return .deferred
         }
     }

@@ -53,11 +53,20 @@ public enum MediaBridge {
 
     // MARK: - Native-container fast path (AVFoundation)
 
-    /// Returns nil if AVFoundation can't read the input (→ caller falls back to the Matroska path).
+    /// Native containers AVFoundation both demuxes AND reliably transcodes via AVAssetExportSession.
+    /// NOT keyed on `loadTracks` success alone: modern macOS can *read* a WebM/VP9 track (so loadTracks
+    /// returns non-nil), but AVAssetExportSession then fails to process it — those must take the
+    /// pure-Swift demux → native-decode path instead. Mirrors frame-stream-native's `nativeExtensions`.
+    private static let nativeContainerExtensions: Set<String> = ["mp4", "mov", "m4v", "qt"]
+
+    /// Returns nil if the input isn't a native container (→ caller falls back to the Matroska path).
     private static func normalizeNativeContainer(input: URL, output: URL) async throws -> NormalizeResult? {
+        guard nativeContainerExtensions.contains(input.pathExtension.lowercased()) else {
+            return nil                                   // MKV/WebM/etc. → pure-Swift demux path
+        }
         let asset = AVURLAsset(url: input)
         guard let vtrack = (try? await asset.loadTracks(withMediaType: .video))?.first else {
-            return nil                                   // not AVFoundation-readable (e.g. MKV/WebM)
+            return nil                                   // native extension but unreadable → Matroska path
         }
         let size = try await vtrack.load(.naturalSize)
         let frameRate = try await vtrack.load(.nominalFrameRate)
@@ -128,9 +137,12 @@ public enum MediaBridge {
 
         // Optional audio: decode a natively-supported track (AAC/Opus) to PCM up front, then AAC-
         // re-encode into the mp4. Best-effort — a problematic audio track degrades to video-only.
+        // AAC/Opus/FLAC need their CodecPrivate cookie; AC-3/E-AC-3/MPEG audio are cookie-less and
+        // Matroska stores none — only require CodecPrivate for the codecs that actually need it.
         let audioTrack = demuxer.tracks.first {
             $0.type == .audio && AudioDecodeSession.isSupported(codecID: $0.codecID)
-                && SupportGate.status(forCodecID: $0.codecID) == .nativeAudio && $0.codecPrivate != nil
+                && SupportGate.status(forCodecID: $0.codecID) == .nativeAudio
+                && (!AudioDecodeSession.requiresCodecPrivate(codecID: $0.codecID) || $0.codecPrivate != nil)
         }
         var audioPCM: AudioDecodeSession.PCM?
         var muxedAudioCodec: String?
@@ -153,7 +165,16 @@ public enum MediaBridge {
         var writer: NativeMP4Writer?
         var basePTS: Int64?
         var outW = 0, outH = 0, frameCount = 0
-        try await VideoDecodeSession(formatDescription: formatDesc)
+        // Creating the session is the true runtime capability probe: a host that can't actually decode
+        // the codec (VideoToolbox returns no decoder) fails here → surface as a clean deferral, not a
+        // crash. Guards codecs whose availability is machine-dependent (e.g. MPEG-2 on Apple Silicon).
+        let decodeSession: VideoDecodeSession
+        do {
+            decodeSession = try VideoDecodeSession(formatDescription: formatDesc)
+        } catch VideoDecodeSession.DecodeError.sessionCreate {
+            throw NormalizeError.deferredCodec(track.codecID)
+        }
+        try await decodeSession
             .decodeStreaming(videoPackets) { frame in
                 if writer == nil {
                     outW = CVPixelBufferGetWidth(frame.image)
