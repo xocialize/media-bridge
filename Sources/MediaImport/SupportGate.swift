@@ -2,10 +2,11 @@
 // SupportGate.swift — MediaImport
 //
 // The native-decode-support matrix: a pure `CodecID → SupportStatus` lookup, independent of the
-// parser. The convert/normalize layer asks the gate and, on `.deferred`, raises a clear
-// "unsupported codec" error WITHOUT failing the demux. This is the clean seam that lets a future
-// permissive per-codec fallback (dav1d/libvpx — BSD, never FFmpeg) slot in behind the gate as an
-// optional binaryTarget, with the parser unchanged. See MEDIABRIDGE-PLAN.md §4.
+// parser. The convert/normalize layer asks the gate and, on `.deferred`, either hands off to a
+// registered `ExternalVideoDecoder` or raises a clear "unsupported codec" error — WITHOUT failing the
+// demux. A `.deferred` codec (VP9/VP8/…) is re-enabled by a permissive decoder (e.g. libvpx — BSD,
+// never FFmpeg) that lives in a SEPARATE package and plugs in via `MediaBridge.register(externalDecoder:)`,
+// so the binary never enters media-bridge. See MEDIABRIDGE-PLAN.md §4 + DEFERRED-CODEC-PLAN.md §9.
 //
 
 import Foundation
