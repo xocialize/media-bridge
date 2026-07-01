@@ -58,21 +58,25 @@ final class TranscodeTests: XCTestCase {
         XCTAssertEqual(vtracks.count, 1)
     }
 
-    func testNonNativeCodecIsDeferred() async throws {
+    /// VP9 and VP8 both stay deferred — no native VideoToolbox decoder on Apple Silicon (VP9 verified:
+    /// VTDecompressionSessionCreate → kVTCouldNotFindVideoDecoderErr). The demux succeeds; decode is
+    /// surfaced as `.deferredCodec`, never silently failed. Permissive libvpx (BSD) is the future path.
+    func testNonNativeVideoCodecsDefer() async throws {
         guard let ffmpeg = tool("ffmpeg") else { throw XCTSkip("ffmpeg not installed") }
-        let dir = FileManager.default.temporaryDirectory
-        let src = dir.appendingPathComponent("\(UUID().uuidString).webm")
-        let dst = dir.appendingPathComponent("\(UUID().uuidString).mp4")
-        defer { try? FileManager.default.removeItem(at: src); try? FileManager.default.removeItem(at: dst) }
+        for (encoder, expectedID) in [("libvpx-vp9", "V_VP9"), ("libvpx", "V_VP8")] {
+            let dir = FileManager.default.temporaryDirectory
+            let src = dir.appendingPathComponent("\(UUID().uuidString).webm")
+            let dst = dir.appendingPathComponent("\(UUID().uuidString).mp4")
+            defer { try? FileManager.default.removeItem(at: src); try? FileManager.default.removeItem(at: dst) }
 
-        try run(ffmpeg, ["-y", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=24:duration=0.2",
-                         "-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8", src.path])
-
-        do {
-            _ = try await MediaBridge.normalizeVideoToHEVC(input: src, output: dst)
-            XCTFail("VP9 should be deferred, not normalized")
-        } catch MediaBridge.NormalizeError.deferredCodec(let id) {
-            XCTAssertEqual(id, "V_VP9")
+            try run(ffmpeg, ["-y", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=24:duration=0.2",
+                             "-c:v", encoder, "-deadline", "realtime", "-cpu-used", "8", src.path])
+            do {
+                _ = try await MediaBridge.normalizeVideoToHEVC(input: src, output: dst)
+                XCTFail("\(expectedID) should be deferred, not normalized")
+            } catch MediaBridge.NormalizeError.deferredCodec(let id) {
+                XCTAssertEqual(id, expectedID)
+            }
         }
     }
 }
