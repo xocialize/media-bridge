@@ -16,8 +16,11 @@ import CoreMedia
 import CoreVideo
 import Foundation
 import MatroskaDemux
+import OSLog
 import MediaImport
 import VideoToolbox
+
+let log = Logger(subsystem: "com.xocialize.media-bridge", category: "MediaBridge")
 
 public enum MediaBridge {
 
@@ -152,10 +155,11 @@ public enum MediaBridge {
         // caller that needs transparency wants a preserving entry point, not this one.
         let sourceHasAlpha = track.video?.hasAlpha ?? false
         if sourceHasAlpha {
-            FileHandle.standardError.write(Data(
-                ("[MediaBridge] warning: \(track.codecID) source declares an alpha channel; "
-                 + "normalizeVideoToHEVC produces opaque HEVC/mp4, so alpha is being dropped. "
-                 + "NormalizeResult.sourceHasAlpha == true.\n").utf8))
+            // Unified log, not stderr: this package's consumers are GUI apps, where stderr goes nowhere
+            // anyone will look — which would leave the warning as silent as the bug it reports.
+            log.warning("""
+                \(track.codecID, privacy: .public) source declares an alpha channel;                 normalizeVideoToHEVC produces opaque HEVC/mp4, so alpha is being dropped.                 NormalizeResult.sourceHasAlpha == true.
+                """)
         }
 
         let allPackets = try demuxer.readAllPackets()
