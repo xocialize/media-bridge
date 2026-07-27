@@ -259,8 +259,17 @@ binary encumbrance and conforms to `ExternalVideoDecoder`:
   `vpx_codec_get_frame()` → I420 `vpx_image_t` (the `examples/simple_decoder.c` surface).
 - `vImage` I420→BGRA `CVPixelBuffer` → emit `DecodedVideoFrame` per the protocol. We already demux WebM
   (matroska-swift), so **libwebm is NOT needed** — decoder only.
-- **The FFmpeg lesson:** keep it small — decode-only config, one codec family, no encoder/tools. The
-  ~100 MB FFmpeg mess came from linking everything; a VP9-decode-only libvpx is a couple MB per arch.
+- **The FFmpeg lesson:** keep it small — one codec family, no tools, no libwebm. The ~100 MB FFmpeg
+  mess came from linking everything; libvpx is a couple MB per arch.
+
+> **Superseded on the encode question (see BRIDGE-051).** This step was executed decode-only, and
+> that inverted vpx-swift's main purpose: writing **transparent WebM (VP9 + alpha)** is the only way
+> to deliver transparent video to non-Apple browsers, and it needs the encoder. vpx-swift now ships
+> libvpx with the **VP9 encoder enabled** (VP8 encode still off), measured at 2,876,728 bytes/arm64
+> vs 962,752 decode-only — a deliberate 2.99x for a capability nothing else on macOS provides.
+> `--disable-webm-io` stays: matroska-swift muxes, and libvpx's own muxer cannot write the
+> `BlockAdditional` alpha layer anyway. **media-bridge still carries no codec binary** — the write
+> side lives entirely in vpx-swift, exactly like the read side.
 
 ### Step 3 — wire into a consumer (e.g. Forge Erase)
 

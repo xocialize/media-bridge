@@ -41,7 +41,8 @@ decode; with nothing registered, a deferred codec defers exactly as before (zero
 
 ```swift
 import MediaBridge
-import VpxSwift   // github.com/xocialize/vpx-swift — decode-only libvpx (BSD-3), ~1 MB/arch
+import VpxSwift   // github.com/xocialize/vpx-swift — libvpx (BSD-3), ~2.9 MB/arch
+                 // (VP9 encode + VP9/VP8 decode; the encoder is what writes transparent WebM)
 
 // Once at startup. Now VP9/VP8 WebM/MKV normalize transparently.
 MediaBridge.register(externalDecoder: VpxVideoDecoder())
