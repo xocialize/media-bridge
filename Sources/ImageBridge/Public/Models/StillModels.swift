@@ -9,6 +9,13 @@ import Foundation
 public enum StillFormat: String, Sendable, CaseIterable {
     case png, jpeg, tiff, heic, avif, bmp, gif
     case pdf            // rasterized per page (multi-page → sequence)
+    /// Camera RAW (CR2/CR3/NEF/ARW/RAF/ORF/RW2/DNG/…), demosaiced from sensor data.
+    ///
+    /// This is the one input that is not already an image: everything else arrives downstream of a
+    /// demosaic somebody else chose. Apple's RAW decoder v9 does demosaic *and* denoise in one tiled
+    /// CoreML model on the ANE, across 784 calibrated bodies — so accepting RAW is not format support,
+    /// it is a quality tier that a pipeline sitting downstream of a baked JPEG cannot reach.
+    case raw
     case unknown
 }
 
@@ -42,10 +49,19 @@ public struct StillMetadata: Sendable {
     /// Per-frame display durations in seconds (animated GIF/APNG); nil for stills and
     /// untimed multi-page sources (PDF/TIFF). Drives animated→video frame timing (§7).
     public let frameDelays: [Double]?
+    /// Decoded from camera RAW rather than from an already-demosaiced image.
+    ///
+    /// Worth stating rather than inferring from `format`: a host may want to show it, and the pro track
+    /// (16-bit latitude, exposure/WB) keys off it. Everything downstream is deliberately unaware.
+    public let isRaw: Bool
+    /// The pixels are linear-light rather than gamma-encoded. Currently always false — P1 narrows RAW to
+    /// 8-bit display-referred BGRA at the buffer boundary. Present so the P2 flip is additive.
+    public let isLinear: Bool
 
     public init(format: StillFormat, width: Int, height: Int, bitDepth: Int,
                 alpha: AlphaMode, iccProfile: Data?, dpi: Double?,
-                exifOrientation: Int, frameCount: Int, frameDelays: [Double]? = nil) {
+                exifOrientation: Int, frameCount: Int, frameDelays: [Double]? = nil,
+                isRaw: Bool = false, isLinear: Bool = false) {
         self.format = format
         self.width = width
         self.height = height
@@ -56,6 +72,8 @@ public struct StillMetadata: Sendable {
         self.exifOrientation = exifOrientation
         self.frameCount = frameCount
         self.frameDelays = frameDelays
+        self.isRaw = isRaw
+        self.isLinear = isLinear
     }
 }
 

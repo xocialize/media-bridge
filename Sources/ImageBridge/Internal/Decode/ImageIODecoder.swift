@@ -19,10 +19,32 @@ final class ImageIODecoderImpl: StillDecoding, @unchecked Sendable {
     /// DPI to rasterize vector (PDF) input at. ImageIO raster formats ignore it.
     private let pdfDPI: Double
 
-    init(pdfDPI: Double = PDFRasterizer.defaultDPI) { self.pdfDPI = pdfDPI }
+    private let rawOptions: RawDecodeOptions
+
+    init(pdfDPI: Double = PDFRasterizer.defaultDPI, rawOptions: RawDecodeOptions = .faithful) {
+        self.pdfDPI = pdfDPI
+        self.rawOptions = rawOptions
+    }
+
+    /// RAW by UTType conformance, falling back to an extension allowlist for bodies this OS has no UTI
+    /// for. Shared by decode and probe so they cannot disagree about what a file is.
+    static func isRaw(_ url: URL) -> Bool {
+        if let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+           let ut = CGImageSourceGetType(src) as String?,
+           let t = UTType(ut), t.conforms(to: .rawImage) { return true }
+        return rawExtensions.contains(url.pathExtension.lowercased())
+    }
+
+    static let rawExtensions: Set<String> = [
+        "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2", "dng", "pef", "3fr", "iiq", "gpr",
+    ]
 
     func decode(url: URL) throws -> (frames: [CVPixelBuffer], metadata: StillMetadata) {
         if PDFRasterizer.isPDF(url) { return try PDFRasterizer.decode(url: url, dpi: pdfDPI) }
+        // RAW before CGImageSource: ImageIO *can* open many RAWs and hand back the embedded preview
+        // JPEG, which would silently substitute a baked thumbnail for the sensor data — the exact
+        // downstream-of-demosaic position accepting RAW exists to escape.
+        if Self.isRaw(url) { return try RawDecoderImpl(options: rawOptions).decode(url: url) }
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else {
             throw ImageBridgeError.decodeFailed("CGImageSourceCreateWithURL(\(url.lastPathComponent))")
         }
@@ -120,7 +142,10 @@ final class ImageIODecoderImpl: StillDecoding, @unchecked Sendable {
             case "public.avif": return .avif
             case UTType.bmp.identifier: return .bmp
             case UTType.gif.identifier: return .gif
-            default: break
+            default:
+                // Camera RAW has no single UTI — every vendor declares its own, all conforming to
+                // `public.camera-raw-image`. Ask the conformance rather than enumerate 784 bodies.
+                if let t = UTType(ut), t.conforms(to: .rawImage) { return .raw }
             }
         }
         switch url.pathExtension.lowercased() {
@@ -131,13 +156,22 @@ final class ImageIODecoderImpl: StillDecoding, @unchecked Sendable {
         case "avif": return .avif
         case "bmp": return .bmp
         case "gif": return .gif
+        // Belt-and-braces: a body whose UTI this OS does not know still routes to the RAW decoder,
+        // which then either decodes it or defers honestly — better than falling through to `.unknown`,
+        // which reads as "not an image".
+        case "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2", "dng", "pef", "3fr", "iiq", "gpr":
+            return .raw
         default: return .unknown
         }
     }
 
     // MARK: - CIImage → CVPixelBuffer (BGRA, IOSurface-backed)
 
-    static func makeBuffer(from ci: CIImage, context: CIContext) throws -> CVPixelBuffer {
+    /// `pixelFormat` is parameterized so P2 (16-bit latitude) is a call-site change rather than a
+    /// rewrite of every decode path. P1 passes 32BGRA everywhere.
+    static func makeBuffer(from ci: CIImage, context: CIContext,
+                           pixelFormat: OSType = kCVPixelFormatType_32BGRA,
+                           colorSpace: CGColorSpace? = nil) throws -> CVPixelBuffer {
         let w = Int(ci.extent.width.rounded()), h = Int(ci.extent.height.rounded())
         guard w > 0, h > 0 else { throw ImageBridgeError.decodeFailed("zero-size image") }
         var pb: CVPixelBuffer?
@@ -146,7 +180,7 @@ final class ImageIODecoderImpl: StillDecoding, @unchecked Sendable {
             kCVPixelBufferCGImageCompatibilityKey as String: true,
             kCVPixelBufferCGBitmapContextCompatibilityKey as String: true,
         ]
-        guard CVPixelBufferCreate(nil, w, h, kCVPixelFormatType_32BGRA,
+        guard CVPixelBufferCreate(nil, w, h, pixelFormat,
                                   attrs as CFDictionary, &pb) == kCVReturnSuccess,
               let buffer = pb else {
             throw ImageBridgeError.decodeFailed("CVPixelBufferCreate \(w)x\(h)")
@@ -154,7 +188,7 @@ final class ImageIODecoderImpl: StillDecoding, @unchecked Sendable {
         // Render at the image's origin (oriented images can have a non-zero extent).
         context.render(ci, to: buffer, bounds: CGRect(x: ci.extent.origin.x, y: ci.extent.origin.y,
                                                        width: CGFloat(w), height: CGFloat(h)),
-                       colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)
+                       colorSpace: colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!)
         return buffer
     }
 }
@@ -166,6 +200,11 @@ final class ImageIOProbeImpl: StillMediaProbing, @unchecked Sendable {
 
     func probe(url: URL) throws -> StillMetadata {
         if PDFRasterizer.isPDF(url) { return try PDFRasterizer.probe(url: url, dpi: pdfDPI) }
+        // Probing a RAW through CGImageSource would describe the embedded preview — wrong dimensions,
+        // `isRaw: false`. Decode it so probe and decode cannot disagree.
+        if ImageIODecoderImpl.isRaw(url) {
+            return try RawDecoderImpl().decode(url: url).metadata
+        }
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else {
             throw ImageBridgeError.decodeFailed("CGImageSourceCreateWithURL(\(url.lastPathComponent))")
         }
