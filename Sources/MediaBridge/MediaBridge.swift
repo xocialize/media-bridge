@@ -28,6 +28,19 @@ public enum MediaBridge {
         public let frameCount: Int
         /// The source audio codec muxed (passthrough), or nil if there was no mp4-muxable audio.
         public let audioCodecID: String?
+        /// Whether the SOURCE carried an alpha channel — `nil` when it was not determined.
+        ///
+        /// **`true` means alpha was dropped.** `normalizeVideoToHEVC` produces opaque HEVC mp4 by
+        /// contract, and HEVC-in-mp4 has no alpha to put it in. This flag exists so that loss is
+        /// visible: VP9-in-WebM keeps alpha as a second encoded stream inside `BlockAdditional`, so
+        /// decoding the base block yields a complete, plausible, fully opaque image and nothing else
+        /// would ever hint that transparency was there.
+        ///
+        /// `nil` from the native-container path, which does not probe for alpha yet — reporting `false`
+        /// there would be a claim this code cannot make. Callers that need transparency preserved want
+        /// `MediaMeasure.AlphaVideoWriter` (ProRes 4444) and a decode path that reads the alpha stream;
+        /// neither is wired into normalize.
+        public let sourceHasAlpha: Bool?
     }
 
     public enum NormalizeError: Error, Equatable {
@@ -99,7 +112,8 @@ public enum MediaBridge {
             sourceCodecID: codec,
             width: Int(abs(size.width).rounded()), height: Int(abs(size.height).rounded()),
             frameCount: Int((duration.seconds * Double(frameRate)).rounded()),
-            audioCodecID: hasAudio ? "native" : nil)
+            audioCodecID: hasAudio ? "native" : nil,
+            sourceHasAlpha: nil)      // not probed on this path — nil, not a false "no alpha" claim
     }
 
     static func fourCC(_ code: FourCharCode) -> String {
@@ -130,6 +144,18 @@ public enum MediaBridge {
         // (Only native codecs reach the HW probe; an externally-decoded codec is .deferred by definition.)
         if external == nil, track.codecID == "V_AV1", !VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1) {
             throw NormalizeError.deferredCodec(track.codecID)
+        }
+
+        // The track declares alpha (Matroska `AlphaMode`) but this path cannot keep it: HEVC-in-mp4 has
+        // nowhere to put an alpha channel — `AVVideoCodecType.hevcWithAlpha` writes only `.mov` — and
+        // `normalizeVideoToHEVC` is contractually mp4/HEVC. Say so instead of flattening in silence; a
+        // caller that needs transparency wants a preserving entry point, not this one.
+        let sourceHasAlpha = track.video?.hasAlpha ?? false
+        if sourceHasAlpha {
+            FileHandle.standardError.write(Data(
+                ("[MediaBridge] warning: \(track.codecID) source declares an alpha channel; "
+                 + "normalizeVideoToHEVC produces opaque HEVC/mp4, so alpha is being dropped. "
+                 + "NormalizeResult.sourceHasAlpha == true.\n").utf8))
         }
 
         let allPackets = try demuxer.readAllPackets()
@@ -221,6 +247,7 @@ public enum MediaBridge {
         try await writer.finish()   // audio was written and closed at writer creation
 
         return NormalizeResult(sourceCodecID: track.codecID, width: outW, height: outH,
-                               frameCount: frameCount, audioCodecID: muxedAudioCodec)
+                               frameCount: frameCount, audioCodecID: muxedAudioCodec,
+                               sourceHasAlpha: sourceHasAlpha)
     }
 }

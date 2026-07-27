@@ -25,7 +25,7 @@ let package = Package(
         .library(name: "MediaImport", targets: ["MediaImport"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/xocialize/matroska-swift.git", from: "0.1.0"),
+        .package(url: "https://github.com/xocialize/matroska-swift.git", from: "0.1.1"),
     ],
     targets: [
         .target(
