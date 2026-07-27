@@ -8,9 +8,38 @@ import CoreMedia
 /// Video-only (audio passthrough/mux is the V3 wiring step); per-frame scoring is GPU-accelerated.
 public enum VideoQualityTarget {
 
+    /// How a clip's per-frame scores were reduced to the one number the floor was tested against.
+    ///
+    /// A video score is **not** a stills score, and a receipt that prints a bare number cannot say which
+    /// it is. "Every frame cleared 80" and "the 10th percentile cleared 80 while the worst frame was 61"
+    /// are both defensible guarantees and they are not the same guarantee — so the aggregation travels
+    /// with the number instead of being computed and thrown away.
+    public struct Aggregation: Sendable {
+        /// The percentile the floor was gated on, as a whole number (10 = p10).
+        public let percentile: Int
+        /// The gating score — the value compared against the floor.
+        public let percentileScore: Double
+        /// Mean across scored frames. Context only; never the guarantee.
+        public let mean: Double
+        /// The single worst scored frame. This is what a mean would have hidden.
+        public let minimum: Double
+        /// How many frames were actually scored…
+        public let framesScored: Int
+        /// …out of how many the clip has. `framesScored < frameCount` means sampling.
+        public let frameCount: Int
+
+        /// One line fit for a receipt, stating the guarantee rather than implying a stronger one.
+        public var summary: String {
+            String(format: "p%d %.1f · min %.1f · mean %.1f · scored %d/%d frames",
+                   percentile, percentileScore, minimum, mean, framesScored, frameCount)
+        }
+    }
+
     public struct Result: Sendable {
         public let bitrate: Int           // AVVideoAverageBitRateKey chosen (bits/s)
         public let score: Double          // achieved p10 per-frame SSIMULACRA2
+        /// The full reduction behind `score`. Report this, not `score` alone (BRIDGE-061).
+        public let aggregation: Aggregation
         public let inputBytes: Int
         public let outputBytes: Int
         public let sourceWidth: Int       // input resolution (= width/height unless downscaled)
@@ -113,15 +142,15 @@ public enum VideoQualityTarget {
         }
 
         var lo = ceiling * 0.04, hi = ceiling
-        var best: (bitrate: Int, score: Double, url: URL)?
+        var best: (bitrate: Int, score: VideoQualityScore, url: URL)?
 
         // Score off the cooperative pool at .utility QoS (EMBED-004): the host drives encode from a
         // .userInitiated Task, so scoring inline would block a high-QoS thread on CoreGraphics's
         // Default-QoS rasterization → a priority inversion. Awaiting the hop suspends instead of blocking.
-        func scoreOf(_ url: URL) async throws -> Double {
+        func scoreOf(_ url: URL) async throws -> VideoQualityScore {
             try await ScoringExecutor.run {
                 try VideoQuality.videoScore(reference: scoreRef, distorted: url,
-                                            sampleStride: stride, maxFrames: frameCap).p10
+                                            sampleStride: stride, maxFrames: frameCap)
             }
         }
 
@@ -134,18 +163,19 @@ public enum VideoQualityTarget {
                                     outWidth: outW, outHeight: outH)
             let encMs = MediaProfile.ms(since: tEnc); profTranscodeMs += encMs
             let tSc = DispatchTime.now()
-            let p10 = try await scoreOf(tmp)
+            let scored = try await scoreOf(tmp)
+            let p10 = scored.p10
             let scMs = MediaProfile.ms(since: tSc); profScoreMs += scMs
             MediaProfile.log(String(format: "iter %d: %.2f Mbps · transcode %.0f ms · score %.0f ms · p10 %.1f",
                                     i + 1, b / 1e6, encMs, scMs, p10))
             if p10 >= targetScore {
-                best = (Int(b), p10, tmp); hi = b        // clears → try smaller (lower bitrate)
+                best = (Int(b), scored, tmp); hi = b     // clears → try smaller (lower bitrate)
             } else {
                 lo = b                                    // below floor → need more bitrate
             }
         }
 
-        let chosen: (bitrate: Int, score: Double, url: URL)
+        let chosen: (bitrate: Int, score: VideoQualityScore, url: URL)
         if let best {
             chosen = best
         } else {
@@ -181,7 +211,15 @@ public enum VideoQualityTarget {
                                     profScoreMs, 100 * profScoreMs / profTotal))
         }
 
-        return Result(bitrate: chosen.bitrate, score: chosen.score, inputBytes: inBytes,
+        // Publish the whole reduction, not just the gating number (BRIDGE-061). `frameCount` is the
+        // clip's own length, so `framesScored / frameCount` states plainly that this was a sample.
+        let aggregation = Aggregation(
+            percentile: 10, percentileScore: chosen.score.p10,
+            mean: chosen.score.mean, minimum: chosen.score.minimum,
+            framesScored: chosen.score.framesScored, frameCount: frameCount)
+
+        return Result(bitrate: chosen.bitrate, score: chosen.score.p10, aggregation: aggregation,
+                      inputBytes: inBytes,
                       outputBytes: outBytes, sourceWidth: vw, sourceHeight: vh,
                       width: outW, height: outH, metTarget: best != nil)
     }
