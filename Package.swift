@@ -25,7 +25,7 @@ let package = Package(
         .library(name: "MediaImport", targets: ["MediaImport"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/xocialize/matroska-swift.git", from: "0.1.1"),
+        .package(url: "https://github.com/xocialize/matroska-swift.git", from: "0.2.0"),
     ],
     targets: [
         .target(
@@ -33,8 +33,10 @@ let package = Package(
             dependencies: [.product(name: "MatroskaDemux", package: "matroska-swift")],
             swiftSettings: [.swiftLanguageMode(.v5)]   // CMSampleBuffer/CVPixelBuffer aren't Sendable
         ),
+        // MediaMeasure carries the alpha-capable writers (ProRes 4444 / HEVC-with-alpha) that the
+        // alpha-preserving normalize routes to. Acyclic — MediaMeasure has no dependencies of its own.
         .target(name: "MediaBridge",
-                dependencies: ["MediaImport",
+                dependencies: ["MediaImport", "MediaMeasure",
                                .product(name: "MatroskaDemux", package: "matroska-swift")],
                 swiftSettings: [.swiftLanguageMode(.v5)]),
         .target(name: "ImageBridge", swiftSettings: [.swiftLanguageMode(.v5)]),

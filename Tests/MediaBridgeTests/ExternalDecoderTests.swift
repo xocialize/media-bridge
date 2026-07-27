@@ -16,7 +16,7 @@ final class ExternalDecoderTests: XCTestCase {
         let width = 320, height = 240
         func canDecode(codecID: String) -> Bool { codecID == "V_VP9" }
         func decodeStreaming(codecID: String, codecPrivate: Data?,
-                             packets: [(data: Data, ptsNanos: Int64)],
+                             packets: [ExternalVideoPacket],
                              onFrame: (DecodedVideoFrame) async throws -> Void) async throws {
             for (i, pkt) in packets.enumerated() {
                 var pb: CVPixelBuffer?

@@ -163,9 +163,14 @@ public enum MediaBridge {
         }
 
         let allPackets = try demuxer.readAllPackets()
-        let videoPackets = allPackets
-            .filter { $0.trackNumber == track.number }
-            .map { (data: $0.data, ptsNanos: $0.ptsNanos) }
+        let trackPackets = allPackets.filter { $0.trackNumber == track.number }
+        // Carry the alpha stream (Matroska BlockAdditional) alongside each frame. The native
+        // VideoToolbox path has no use for it — no native codec stores alpha this way — so it takes
+        // the flat tuple form; only the external seam can act on it.
+        let videoPackets = trackPackets.map {
+            ExternalVideoPacket(data: $0.data, ptsNanos: $0.ptsNanos, alpha: $0.blockAdditional)
+        }
+        let nativePackets = trackPackets.map { (data: $0.data, ptsNanos: $0.ptsNanos) }
 
         // Optional audio: decode a natively-supported track (AAC/Opus) to PCM up front, then AAC-
         // re-encode into the mp4. Best-effort — a problematic audio track degrades to video-only.
@@ -245,7 +250,7 @@ public enum MediaBridge {
             } catch VideoDecodeSession.DecodeError.sessionCreate {
                 throw NormalizeError.deferredCodec(track.codecID)
             }
-            try await decodeSession.decodeStreaming(videoPackets, onFrame: onFrame)
+            try await decodeSession.decodeStreaming(nativePackets, onFrame: onFrame)
         }
         guard let writer else { throw NormalizeError.noFramesDecoded }
         try await writer.finish()   // audio was written and closed at writer creation
