@@ -30,6 +30,7 @@ public final class NativeMP4Writer {
     private let adaptor: AVAssetWriterInputPixelBufferAdaptor
     private let audioInput: AVAssetWriterInput?
     private let usingSoftwareEncoder: Bool
+    private var audioFinished = false
 
     /// `audioPCM` non-nil adds an **AAC-encoding** audio track fed Int16 PCM sample buffers — the
     /// writer emits a proper esds (passthrough of a hand-built AAC description was AVFoundation-invalid).
@@ -102,23 +103,35 @@ public final class NativeMP4Writer {
     }
 
     public func appendVideo(_ pixelBuffer: CVPixelBuffer, ptsNanos: Int64) async throws {
-        try await waitReady(videoInput)
+        try await waitReady(videoInput, named: "video")
         let t = CMTime(value: max(0, ptsNanos), timescale: 1_000_000_000)
         guard adaptor.append(pixelBuffer, withPresentationTime: t) else {
             throw WriterError.append(writer.error)
         }
     }
 
-    /// Append a (compressed, passthrough) audio sample. No-op if the writer has no audio track.
+    /// Append one PCM audio sample buffer (the writer re-encodes it to AAC). No-op without an audio track.
     public func appendAudio(_ sample: CMSampleBuffer) async throws {
-        guard let audioInput else { return }
-        try await waitReady(audioInput)
+        guard let audioInput, !audioFinished else { return }
+        try await waitReady(audioInput, named: "audio")
         guard audioInput.append(sample) else { throw WriterError.append(writer.error) }
+    }
+
+    /// Mark the audio track complete without finishing the whole writer.
+    ///
+    /// **Required when all audio is appended up front.** `AVAssetWriter` throttles an input whose media
+    /// time runs far ahead of its siblings, so with an audio input still open and receiving nothing, the
+    /// video input eventually stops becoming ready and waits for audio that is never coming. Declaring
+    /// audio finished releases that constraint and lets video drain to the end.
+    public func finishAudio() {
+        guard let audioInput, !audioFinished else { return }
+        audioInput.markAsFinished()
+        audioFinished = true
     }
 
     public func finish() async throws {
         videoInput.markAsFinished()
-        audioInput?.markAsFinished()
+        if !audioFinished { audioInput?.markAsFinished() }
         await writer.finishWriting()
         if writer.status == .failed { throw WriterError.finish(writer.error) }
     }
@@ -126,7 +139,7 @@ public final class NativeMP4Writer {
     /// Bound the readiness spin-wait: if the encoder stops draining (`isReadyForMoreMediaData` stuck
     /// false — the post-MLX hardware-VideoToolbox stall) this loop would otherwise spin at ~0% CPU
     /// forever and look like a hang. Time it out into a clear `encoderStalled` error instead.
-    private func waitReady(_ input: AVAssetWriterInput) async throws {
+    private func waitReady(_ input: AVAssetWriterInput, named which: String) async throws {
         var waited: TimeInterval = 0
         while !input.isReadyForMoreMediaData {
             try await Task.sleep(nanoseconds: 2_000_000)
@@ -134,10 +147,13 @@ public final class NativeMP4Writer {
             try Task.checkCancellation()
             if waited > Self.encoderStallTimeout {
                 throw WriterError.encoderStalled(
-                    "video/audio encoder not draining: isReadyForMoreMediaData=false for "
+                    "\(which) input not draining: isReadyForMoreMediaData=false for "
                     + "\(Int(Self.encoderStallTimeout))s (\(usingSoftwareEncoder ? "software" : "hardware") HEVC). "
                     + (usingSoftwareEncoder
-                        ? "Unexpected for the software encoder — check for a downstream deadlock."
+                        ? "Unexpected for the software encoder. Most likely an interleaving deadlock: "
+                          + "AVAssetWriter throttles an input whose media time runs ahead of its siblings, "
+                          + "so a still-open sibling that is receiving nothing will stall this one. "
+                          + "Feed every track, or call finishAudio() once audio is complete."
                         : "This is the hardware-VideoToolbox stall after heavy MLX compute; use the "
                           + "default software path (drop software:false / unset MEDIABRIDGE_ENCODE=hardware)."))
             }

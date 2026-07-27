@@ -176,9 +176,44 @@ public final class AudioDecodeSession {
 }
 
 public extension AudioDecodeSession.PCM {
+
+    /// Split into `CMSampleBuffer`s of at most `framesPerChunk` audio frames, PTS-stamped in order.
+    ///
+    /// One buffer for a whole track is fine for a 3-second clip and unreasonable for a feature — a
+    /// 2-hour stereo track is ~1.4 GB in a single allocation handed to the AAC encoder. Chunking also
+    /// lets the caller feed the writer progressively instead of in one shot.
+    ///
+    /// Default chunk is one second, which keeps buffers small without making the append loop long.
+    func makeSampleBuffers(framesPerChunk: Int? = nil) throws -> [CMSampleBuffer] {
+        let ch = max(1, channels)
+        let bytesPerFrame = 2 * ch
+        let chunkFrames = max(1, framesPerChunk ?? Int(sampleRate.rounded()))
+        guard frameCount > 0 else { return [] }
+
+        var buffers: [CMSampleBuffer] = []
+        var frameOffset = 0
+        while frameOffset < frameCount {
+            let frames = min(chunkFrames, frameCount - frameOffset)
+            let byteStart = frameOffset * bytesPerFrame
+            let slice = data.subdata(in: byteStart ..< (byteStart + frames * bytesPerFrame))
+            // PTS from the frame index so chunks stay exactly contiguous — deriving it by accumulating
+            // durations would drift on sample rates that don't divide evenly into a nanosecond.
+            let ptsNanos = Int64((Double(frameOffset) / sampleRate * 1_000_000_000).rounded())
+            buffers.append(try Self.makeBuffer(data: slice, frames: frames, channels: ch,
+                                               sampleRate: sampleRate, ptsNanos: ptsNanos))
+            frameOffset += frames
+        }
+        return buffers
+    }
+
     /// Wrap the decoded interleaved Int16 PCM as one CMSampleBuffer for an AAC-encoding writer input.
     func makeSampleBuffer(ptsNanos: Int64) throws -> CMSampleBuffer {
-        let ch = max(1, channels)
+        try Self.makeBuffer(data: data, frames: frameCount, channels: max(1, channels),
+                            sampleRate: sampleRate, ptsNanos: ptsNanos)
+    }
+
+    private static func makeBuffer(data: Data, frames: Int, channels ch: Int,
+                                   sampleRate: Double, ptsNanos: Int64) throws -> CMSampleBuffer {
         let bytesPerFrame = 2 * ch
         var asbd = AudioStreamBasicDescription(
             mSampleRate: sampleRate, mFormatID: kAudioFormatLinearPCM,
@@ -210,7 +245,7 @@ public extension AudioDecodeSession.PCM {
         var sample: CMSampleBuffer?
         st = CMSampleBufferCreateReady(
             allocator: kCFAllocatorDefault, dataBuffer: bb, formatDescription: fmt,
-            sampleCount: frameCount, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
+            sampleCount: frames, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
             sampleSizeEntryCount: 1, sampleSizeArray: &sampleSize, sampleBufferOut: &sample)
         guard st == noErr, let s = sample else { throw FormatDescriptionError.vt(st) }
         return s

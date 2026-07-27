@@ -174,9 +174,24 @@ public enum MediaBridge {
                 outW = CVPixelBufferGetWidth(frame.image)
                 outH = CVPixelBufferGetHeight(frame.image)
                 basePTS = frame.ptsNanos          // first emitted frame = lowest PTS
-                writer = try NativeMP4Writer(
+                let w = try NativeMP4Writer(
                     output: output, width: outW, height: outH,
                     audioPCM: audioPCM.map { ($0.sampleRate, $0.channels) })
+                // Write the whole audio track NOW, before any video, then close it.
+                //
+                // `AVAssetWriter` throttles an input whose media time has run ahead of its siblings. The
+                // audio is already fully decoded, so appending it after the video loop meant video raced
+                // to the end of the clip while the audio input sat empty — the writer then stopped making
+                // video ready and waited for audio that was queued behind the very loop it was blocking.
+                // A dead-on-arrival deadlock for any A/V Matroska long enough to reach the throttle
+                // threshold; it only escaped notice because the fixtures were half a second long.
+                if let pcm = audioPCM, pcm.frameCount > 0 {
+                    for chunk in try pcm.makeSampleBuffers() {
+                        try await w.appendAudio(chunk)
+                    }
+                }
+                w.finishAudio()      // no-op without an audio track; releases the throttle with one
+                writer = w
             }
             try await writer!.appendVideo(frame.image, ptsNanos: frame.ptsNanos - (basePTS ?? 0))
             frameCount += 1
@@ -203,11 +218,7 @@ public enum MediaBridge {
             try await decodeSession.decodeStreaming(videoPackets, onFrame: onFrame)
         }
         guard let writer else { throw NormalizeError.noFramesDecoded }
-
-        if let pcm = audioPCM, pcm.frameCount > 0 {
-            try await writer.appendAudio(pcm.makeSampleBuffer(ptsNanos: 0))
-        }
-        try await writer.finish()
+        try await writer.finish()   // audio was written and closed at writer creation
 
         return NormalizeResult(sourceCodecID: track.codecID, width: outW, height: outH,
                                frameCount: frameCount, audioCodecID: muxedAudioCodec)
