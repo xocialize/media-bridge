@@ -95,6 +95,40 @@ final class SceneCutDetectorTests: XCTestCase {
         XCTAssertNil(det.next(lumaGrid: flat(200)), "first frame after reset has no transition")
     }
 
+    /// **The anime hazard, as measured on Frieren.** Limited animation draws on threes: two of every
+    /// three transitions are near-zero duplicate frames and every third is a new drawing. That makes the
+    /// delta distribution zero-inflated, which collapses the MAD — under `.medianAbsoluteDeviation` every
+    /// new drawing reads as an outlier at any k. `.upperTail` tracks the motion mode instead and separates
+    /// the cut from the drawing changes. Magnitudes here are the measured ones (drawings 12–42, cut ~97).
+    func testLimitedAnimationDefeatsMADButNotUpperTail() {
+        var deltas: [Double] = []
+        for i in 0..<180 {
+            deltas.append(i % 3 == 0 ? 12 + Double((i * 7) % 30) : 0.25)   // drawings on threes
+        }
+        deltas[150] = 97                                                   // the one real cut
+
+        let mad = SceneCutDetector.causalCutTransitions(
+            deltas: deltas, options: .init(k: 12, scale: .medianAbsoluteDeviation))
+        let tail = SceneCutDetector.causalCutTransitions(
+            deltas: deltas, options: .init(k: 2, scale: .upperTail))
+
+        XCTAssertGreaterThan(mad.count, 10, "MAD degenerates: drawing changes flood the detector")
+        XCTAssertEqual(tail, [150], "upperTail finds the cut and only the cut")
+    }
+
+    /// A global lighting change within one shot (subway car entering a tunnel — measured on Joker) is a
+    /// documented false positive, not something the statistic can reject. Pinned so the behaviour is a
+    /// known limit rather than a surprise.
+    func testGlobalLightingTransitionIsAFalsePositive() {
+        let det = SceneCutDetector()
+        var grids: [[Double]] = (0..<30).map { flat(90, jitterSeed: $0) }
+        grids += (0..<10).map { flat(4, jitterSeed: $0) }        // lights out, same shot
+        grids += (0..<20).map { flat(90, jitterSeed: $0) }       // lights back, same framing
+        let out = feed(det, grids)
+        XCTAssertTrue(out.contains { $0?.isCut == true },
+                      "documented limit: a whole-frame lighting change is indistinguishable from a cut")
+    }
+
     // MARK: - Two-pass
 
     /// Two-pass on a step sequence: one cut at the step; the ramp neighbours of a single transition
