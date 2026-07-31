@@ -15,9 +15,14 @@ public enum VideoConsistencyPipeline {
 
     /// Upscale/enhance `input` → temporally-stabilized HEVC `.mp4` at `output`. Returns frames written + the
     /// temporal-stability metric (how much flicker the stabilization removed).
+    ///
+    /// `sceneCut` drives the shot reset the processor documents: at each detected hard cut the temporal
+    /// history is cleared, so a new shot never borrows from the flow-warped tail of the previous one
+    /// (hard cuts only — dissolves/fades are not detected). Pass nil to disable.
     @discardableResult
     public static func enhanceToVideo(
         input: URL, output: URL, options: VideoConsistencyOptions = .init(), quality: Float = 0.9,
+        sceneCut: SceneCutOptions? = .init(),
         enhance: @escaping (CGImage) async throws -> CGImage,
         flow: @escaping (CGImage, CGImage) async throws -> DenseFlow
     ) async throws -> VideoMatteOutcome {
@@ -30,9 +35,11 @@ public enum VideoConsistencyPipeline {
 
         let reader = try FrameStream(input)
         let proc = VideoConsistencyProcessor(options: options, enhance: enhance, flow: flow)
+        let cuts = sceneCut.map { SceneCutDetector(options: $0) }
 
         // Peek frame 0 to learn the enhanced output resolution (SR changes dimensions), then stream the rest.
         guard let first = reader.next() else { throw PipelineError.emptyClip }
+        _ = cuts?.next(first)
         let firstOut = try await proc.next(first)
         let ow = firstOut.width, oh = firstOut.height
         var pending: CGImage? = firstOut
@@ -45,6 +52,7 @@ public enum VideoConsistencyPipeline {
                 return VideoMattePipeline.bgraBuffer(p, width: ow, height: oh)
             }
             guard let src = reader.next() else { return nil }
+            if cuts?.next(src)?.isCut == true { proc.reset() }      // new shot: drop the temporal history
             let out = try await proc.next(src)
             return VideoMattePipeline.bgraBuffer(out, width: ow, height: oh)
         }
