@@ -31,6 +31,22 @@ public struct VideoStreamInfo: Sendable, Equatable {
     public let height: Int
     public let frameRate: Double         // 0 if unknown (Matroska without DefaultDuration)
     public let nativelyDecodable: Bool
+    /// Estimated video-stream data rate in bits/second; 0 when the container doesn't say
+    /// (Matroska has no per-track rate — derive a coarse bound from file size if you must, and
+    /// say so). 🔑 This is the field the enhance classifier's bits-per-pixel axis reads
+    /// (`MediaMeasure.SourceProfile`): C7 measured that RESOLUTION is the wrong degradation
+    /// axis — bits per pixel per frame is what separates "detail missing" from "detail damaged".
+    public let estimatedDataRateBPS: Double
+
+    public init(codecID: String, width: Int, height: Int, frameRate: Double,
+                nativelyDecodable: Bool, estimatedDataRateBPS: Double = 0) {
+        self.codecID = codecID
+        self.width = width
+        self.height = height
+        self.frameRate = frameRate
+        self.nativelyDecodable = nativelyDecodable
+        self.estimatedDataRateBPS = estimatedDataRateBPS
+    }
 }
 
 public struct AudioStreamInfo: Sendable, Equatable {
@@ -63,12 +79,14 @@ public extension MediaBridge {
         for t in videoTracks {
             let size = try await t.load(.naturalSize)
             let fps = try await t.load(.nominalFrameRate)
+            let dataRate = (try? await t.load(.estimatedDataRate)) ?? 0
             let codec = (try await t.load(.formatDescriptions)).first
                 .map { unifiedCodecID(fourCC: fourCC(CMFormatDescriptionGetMediaSubType($0))) } ?? "?"
             videos.append(VideoStreamInfo(
                 codecID: codec, width: Int(abs(size.width).rounded()),
                 height: Int(abs(size.height).rounded()), frameRate: Double(fps),
-                nativelyDecodable: true))   // AVFoundation read it → decodable
+                nativelyDecodable: true,    // AVFoundation read it → decodable
+                estimatedDataRateBPS: Double(dataRate)))
         }
 
         var audios: [AudioStreamInfo] = []
@@ -131,5 +149,19 @@ public extension MediaBridge {
         case "fLaC", "flac":  return "A_FLAC"
         default:              return raw.trimmingCharacters(in: .whitespaces)
         }
+    }
+}
+
+
+import MediaMeasure
+
+public extension MediaInfo {
+    /// The first video stream as an enhance-classifier profile (`MediaMeasure.SourceProfile`) —
+    /// the probe half of the T4 decision layer. `nil` when the file has no video stream.
+    /// Multi-stream files: pick the stream yourself and use `SourceProfile`'s memberwise init.
+    var sourceProfile: SourceProfile? {
+        guard let v = videoStreams.first else { return nil }
+        return SourceProfile(width: v.width, height: v.height, frameRate: v.frameRate,
+                             videoBitsPerSecond: v.estimatedDataRateBPS)
     }
 }
