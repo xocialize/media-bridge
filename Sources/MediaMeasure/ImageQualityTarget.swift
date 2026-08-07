@@ -21,6 +21,13 @@ public enum ImageQualityTarget {
         public let metTarget: Bool
     }
 
+    /// The result of the lossless web-still encode. No `quality`/`metTarget`: PNG has no lossy knob,
+    /// so there is no search and no floor to meet — only the measured round-trip score.
+    public struct PNGResult: Sendable {
+        public let data: Data           // the encoded PNG
+        public let score: Double        // measured SSIMULACRA2 of the decode round-trip vs the input
+    }
+
     public enum EncodeError: Error { case encodeFailed, decodeFailed }
 
     /// Encode `image` as HEIC at the lowest quality whose decoded result scores ≥ `targetScore`.
@@ -62,6 +69,53 @@ public enum ImageQualityTarget {
             try encodeHEIC(image, targetScore: targetScore, iterations: iterations,
                            channelScalars: channelScalars)
         }
+    }
+
+    // MARK: - PNG (lossless web still)
+
+    /// Encode `image` as PNG — the lossless, universally web-decodable still format. There is no
+    /// quality search (PNG has no lossy knob); the strongest native lever is adaptive row filtering,
+    /// which is enabled. The score is **measured on the decode round-trip, never asserted** from
+    /// "PNG is lossless": a 16-bit, CMYK, or exotic-colorspace source passes through an 8-bit RGB(A)
+    /// conversion where losslessness is not a given, and the receipt should say what actually happened.
+    public static func encodePNG(_ image: CGImage,
+                                 channelScalars: SSIMULACRA2.ChannelScalars? = nil) throws -> PNGResult {
+        let data = try encodePNGData(image)
+        let decoded = try decode(data)
+        let score: Double
+        if let channelScalars {
+            score = try SSIMULACRA2.score(reference: image, distorted: decoded, channelScalars: channelScalars)
+        } else {
+            score = try SSIMULACRA2.score(reference: image, distorted: decoded)
+        }
+        return PNGResult(data: data, score: score)
+    }
+
+    /// Async entry point: runs the encode + round-trip score off the cooperative pool at `.utility`
+    /// QoS (same EMBED-004 inversion guard as `encodeHEIC`). Prefer this from async contexts.
+    public static func encodePNG(_ image: CGImage,
+                                 channelScalars: SSIMULACRA2.ChannelScalars? = nil) async throws -> PNGResult {
+        try await ScoringExecutor.run {
+            try encodePNG(image, channelScalars: channelScalars)
+        }
+    }
+
+    static func encodePNGData(_ image: CGImage) throws -> Data {
+        let out = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(
+            out, UTType.png.identifier as CFString, 1, nil) else { throw EncodeError.encodeFailed }
+        // Adaptive (all-filters) row filtering — the one meaningful size lever ImageIO exposes for
+        // PNG (the vendored-oxipng recompression pass was dropped in the media-bridge salvage).
+        // The IMAGEIO_PNG_ALL_FILTERS compound macro doesn't import into Swift; OR the primitives.
+        let allFilters = IMAGEIO_PNG_FILTER_NONE | IMAGEIO_PNG_FILTER_SUB | IMAGEIO_PNG_FILTER_UP
+            | IMAGEIO_PNG_FILTER_AVG | IMAGEIO_PNG_FILTER_PAETH
+        CGImageDestinationAddImage(dest, image, [
+            kCGImagePropertyPNGDictionary: [
+                kCGImagePropertyPNGCompressionFilter: allFilters,
+            ],
+        ] as CFDictionary)
+        guard CGImageDestinationFinalize(dest) else { throw EncodeError.encodeFailed }
+        return out as Data
     }
 
     // MARK: - ImageIO HEIC

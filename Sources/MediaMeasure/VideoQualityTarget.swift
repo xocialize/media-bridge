@@ -2,10 +2,11 @@ import Foundation
 import AVFoundation
 import CoreMedia
 
-/// Video analog of `ImageQualityTarget`: re-encode a clip to the **lowest HEVC bitrate whose per-frame
+/// Video analog of `ImageQualityTarget`: re-encode a clip to the **lowest bitrate whose per-frame
 /// SSIMULACRA2 (p10) still clears the floor** → smaller file, perceptually equivalent, same resolution.
 /// The lever is target *bitrate* (not constant-quality, which inflates an already-compressed source).
-/// Video-only (audio passthrough/mux is the V3 wiring step); per-frame scoring is GPU-accelerated.
+/// The codec + delivery rule come from `EncodeProfile` — `.hevc` (native deliverable, the default) or
+/// `.webH264` (universal web mp4: H.264 + AAC audio). Per-frame scoring is GPU-accelerated.
 public enum VideoQualityTarget {
 
     /// How a clip's per-frame scores were reduced to the one number the floor was tested against.
@@ -35,6 +36,47 @@ public enum VideoQualityTarget {
         }
     }
 
+    /// What the search encodes toward. `.hevc` is the native Apple deliverable (the historical
+    /// behavior and the default); `.webH264` is the universal web deliverable — H.264 + AAC in mp4,
+    /// the one combination every browser decodes (HEVC-in-mp4 does not play in Chrome/Firefox).
+    public struct EncodeProfile: Sendable {
+        public let codec: AVVideoCodecType
+        /// Transcode non-AAC audio (Opus/FLAC/ALAC/PCM) to AAC-LC; AAC (and no-audio) still
+        /// passthrough-muxes — never a generation loss when the source is already web-safe.
+        public let webSafeAudio: Bool
+        /// Search-ceiling multiplier over the source bitrate. H.264 needs roughly 1.5–2× HEVC's
+        /// bitrate for the same quality, so a web encode of an efficient HEVC master must be allowed
+        /// to spend more bits than the source or the floor becomes unreachable by construction.
+        public let ceilingScale: Double
+        /// Deliver only when the output is smaller than the source. Off for a format *conversion*
+        /// (a web deliverable from a non-web source is the point even when it is larger).
+        public let requireSmaller: Bool
+
+        public init(codec: AVVideoCodecType, webSafeAudio: Bool,
+                    ceilingScale: Double, requireSmaller: Bool) {
+            self.codec = codec
+            self.webSafeAudio = webSafeAudio
+            self.ceilingScale = ceilingScale
+            self.requireSmaller = requireSmaller
+        }
+
+        /// The native deliverable — exactly the historical `encode` behavior.
+        public static let hevc = EncodeProfile(codec: .hevc, webSafeAudio: false,
+                                               ceilingScale: 1.0, requireSmaller: true)
+        /// The universal web deliverable for a source that is not already web-native.
+        public static let webH264 = EncodeProfile(codec: .h264, webSafeAudio: true,
+                                                  ceilingScale: 2.0, requireSmaller: false)
+
+        /// Receipt/log label for the codec ("HEVC" / "H.264"; falls back to the fourCC).
+        public var codecLabel: String {
+            switch codec {
+            case .hevc: return "HEVC"
+            case .h264: return "H.264"
+            default: return codec.rawValue
+            }
+        }
+    }
+
     public struct Result: Sendable {
         public let bitrate: Int           // AVVideoAverageBitRateKey chosen (bits/s)
         public let score: Double          // achieved p10 per-frame SSIMULACRA2
@@ -47,6 +89,10 @@ public enum VideoQualityTarget {
         public let width: Int             // output resolution
         public let height: Int
         public let metTarget: Bool
+        /// Whether the deliverable was actually written to `output`: the floor was met AND — when the
+        /// profile requires it — the output is smaller than the source. Read this, don't re-derive it
+        /// from `metTarget` + sizes: the delivery rule is the profile's, not the caller's.
+        public let delivered: Bool
         public var savedFraction: Double {
             inputBytes > 0 ? Double(max(0, inputBytes - outputBytes)) / Double(inputBytes) : 0
         }
@@ -81,7 +127,8 @@ public enum VideoQualityTarget {
     /// temporally-inconsistent AI video). Targeting ≥12 samples gives a stable 10th-percentile.
     public static func encode(input: URL, output: URL, targetScore: Double, maxHeight: Int? = nil,
                               iterations: Int = 6, searchStride: Int? = nil,
-                              minScoredFrames: Int = 12, maxScoredFrames: Int = 16) async throws -> Result {
+                              minScoredFrames: Int = 12, maxScoredFrames: Int = 16,
+                              profile: EncodeProfile = .hevc) async throws -> Result {
         let asset = AVURLAsset(url: input)
         let duration = try await asset.load(.duration).seconds
         guard let vtrack = try await asset.loadTracks(withMediaType: .video).first else {
@@ -102,7 +149,8 @@ public enum VideoQualityTarget {
         // Ceiling = source bitrate (file-size cap: same bitrate × same duration ⇒ ≤ source size, and at a
         // lower resolution the search converges to a much lower clearing bitrate anyway). NOT scaled by the
         // pixel ratio — an already-compressed master would then ceiling below the quality floor at HD.
-        let ceiling = sourceBitrate
+        // The profile scales it (web H.264 needs headroom over an efficient HEVC source — see EncodeProfile).
+        let ceiling = sourceBitrate * profile.ceilingScale
 
         // Adaptive sampling: pick a stride that scores ≥ minScoredFrames across the clip (capped at
         // maxScoredFrames), so p10 is a real 10th-percentile, not a noisy min-of-3 on short clips. An
@@ -114,7 +162,7 @@ public enum VideoQualityTarget {
             ?? max(1, frameCount / max(1, minScoredFrames))
         let frameCap = searchStride == nil ? maxScoredFrames : 60
 
-        MediaProfile.log("video optimize: \(vw)×\(vh)\(downscaled ? " → \(outW)×\(outH)" : "") · src "
+        MediaProfile.log("video optimize → \(profile.codecLabel): \(vw)×\(vh)\(downscaled ? " → \(outW)×\(outH)" : "") · src "
             + String(format: "%.1f Mbps · %d iters · ~%d frames (stride %d of %d)",
                      sourceBitrate / 1e6, iterations, min(frameCap, (frameCount + stride - 1) / stride),
                      stride, frameCount))
@@ -134,7 +182,7 @@ public enum VideoQualityTarget {
             temps.append(ref)
             let tRef = DispatchTime.now()
             try await reencodeVideo(input: input, output: ref, bitrate: Int(ceiling),
-                                    outWidth: outW, outHeight: outH)
+                                    outWidth: outW, outHeight: outH, codec: profile.codec)
             profTranscodeMs += MediaProfile.ms(since: tRef)
             scoreRef = ref
         } else {
@@ -160,7 +208,8 @@ public enum VideoQualityTarget {
             temps.append(tmp)
             let tEnc = DispatchTime.now()
             try await reencodeVideo(input: input, output: tmp, bitrate: Int(b),
-                                    outWidth: outW, outHeight: outH)
+                                    outWidth: outW, outHeight: outH,
+                                    codec: profile.codec, webSafeAudio: profile.webSafeAudio)
             let encMs = MediaProfile.ms(since: tEnc); profTranscodeMs += encMs
             let tSc = DispatchTime.now()
             let scored = try await scoreOf(tmp)
@@ -182,7 +231,8 @@ public enum VideoQualityTarget {
             let tmp = tmpDir.appendingPathComponent("vqt-final-\(UUID().uuidString).mp4")
             temps.append(tmp)
             try await reencodeVideo(input: input, output: tmp, bitrate: Int(hi),
-                                    outWidth: outW, outHeight: outH)
+                                    outWidth: outW, outHeight: outH,
+                                    codec: profile.codec, webSafeAudio: profile.webSafeAudio)
             chosen = (Int(hi), try await scoreOf(tmp), tmp)
         }
 
@@ -192,7 +242,9 @@ public enum VideoQualityTarget {
         // miss, leave NO file at `output` — never orphan a best-effort encode. (Fixes EMBED-003 skip-orphan
         // + EMBED-005 partial-write-on-failure.)
         let outBytes = (try? chosen.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-        let didWin = best != nil && outBytes < inBytes
+        // A format *conversion* (web profile) delivers even when larger — the size gate is the
+        // profile's call; the quality floor is never waived.
+        let didWin = best != nil && (!profile.requireSmaller || outBytes < inBytes)
         if didWin {
             let staging = output.deletingLastPathComponent()
                 .appendingPathComponent(".forge-\(UUID().uuidString).tmp")
@@ -221,7 +273,7 @@ public enum VideoQualityTarget {
         return Result(bitrate: chosen.bitrate, score: chosen.score.p10, aggregation: aggregation,
                       inputBytes: inBytes,
                       outputBytes: outBytes, sourceWidth: vw, sourceHeight: vh,
-                      width: outW, height: outH, metTarget: best != nil)
+                      width: outW, height: outH, metTarget: best != nil, delivered: didWin)
     }
 
     /// Map a video format description's colour attachments to an `AVVideoColorPropertiesKey` dict,
@@ -244,12 +296,16 @@ public enum VideoQualityTarget {
         ]
     }
 
-    /// Transcode the video track to HEVC at a target average bitrate; **passthrough-mux the audio** if
-    /// present (no re-encode → no audio quality loss). No-audio sources produce a video-only output.
+    /// Transcode the video track to `codec` (HEVC default) at a target average bitrate;
+    /// **passthrough-mux the audio** if present (no re-encode → no audio quality loss). No-audio
+    /// sources produce a video-only output. `webSafeAudio` re-encodes non-AAC audio (Opus/FLAC/
+    /// ALAC/PCM) to AAC-LC so the mp4 plays in every browser — AAC sources still passthrough.
     /// Colour primaries/transfer/matrix are preserved from the source (BT.709 default) for brand fidelity.
     /// `outWidth`/`outHeight` (when given) scale the video via VideoToolbox — the 4K→HD downscale lever.
     static func reencodeVideo(input: URL, output: URL, bitrate: Int,
-                              outWidth: Int? = nil, outHeight: Int? = nil) async throws {
+                              outWidth: Int? = nil, outHeight: Int? = nil,
+                              codec: AVVideoCodecType = .hevc,
+                              webSafeAudio: Bool = false) async throws {
         let asset = AVURLAsset(url: input)
         guard let vtrack = try await asset.loadTracks(withMediaType: .video).first else {
             throw EncodeError.noVideoTrack
@@ -261,6 +317,11 @@ public enum VideoQualityTarget {
         let atrack = try await asset.loadTracks(withMediaType: .audio).first
         // Passthrough audio needs the source format up front, else the writer can't add the input.
         let audioFormat = try await atrack?.load(.formatDescriptions).first
+        // AAC (and no audio) is already web-safe → passthrough even under `webSafeAudio`; anything
+        // else is decoded to PCM by the reader and AAC-encoded by the writer.
+        let audioSubtype = audioFormat.map { CMFormatDescriptionGetMediaSubType($0) }
+        let transcodeAudioToAAC = webSafeAudio && atrack != nil
+            && audioSubtype != kAudioFormatMPEG4AAC
         // Preserve the source's colour tags; default to BT.709 when untagged. Decoding to BGRA drops
         // the matrix, so an untagged re-encode can get misread as 601 → saturated brand colours drift
         // while white stays put (the signage-playbook colour-fidelity gate). Pin primaries/transfer/matrix.
@@ -275,26 +336,50 @@ public enum VideoQualityTarget {
         reader.add(videoOut)
         var audioOut: AVAssetReaderTrackOutput?
         if let atrack {
-            let ao = AVAssetReaderTrackOutput(track: atrack, outputSettings: nil)   // stored format → passthrough
+            // Passthrough reads the stored format (nil settings); an AAC transcode decodes to PCM here.
+            let ao = AVAssetReaderTrackOutput(
+                track: atrack,
+                outputSettings: transcodeAudioToAAC ? [AVFormatIDKey: kAudioFormatLinearPCM] : nil)
             ao.alwaysCopiesSampleData = false
             if reader.canAdd(ao) { reader.add(ao); audioOut = ao }
         }
 
         try? FileManager.default.removeItem(at: output)
         let writer = try AVAssetWriter(outputURL: output, fileType: .mp4)
+        // H.264 pins High profile / auto level — the universally-decodable web tier (Baseline is for
+        // ancient devices and costs efficiency; VideoToolbox picks the level from the geometry).
+        var compression: [String: Any] = [AVVideoAverageBitRateKey: bitrate]
+        if codec == .h264 { compression[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel }
         let videoIn = AVAssetWriterInput(mediaType: .video, outputSettings: [
-            AVVideoCodecKey: AVVideoCodecType.hevc,
+            AVVideoCodecKey: codec,
             AVVideoWidthKey: w, AVVideoHeightKey: h,
             AVVideoColorPropertiesKey: colorProperties,
-            AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: bitrate],
+            AVVideoCompressionPropertiesKey: compression,
         ])
         videoIn.transform = transform
         videoIn.expectsMediaDataInRealTime = false
         writer.add(videoIn)
         var audioIn: AVAssetWriterInput?
         if audioOut != nil {
-            let ai = AVAssetWriterInput(mediaType: .audio, outputSettings: nil,     // passthrough mux
-                                       sourceFormatHint: audioFormat)
+            let ai: AVAssetWriterInput
+            if transcodeAudioToAAC {
+                // AAC-LC at the source's rate (capped at 48 kHz) and channel count. No
+                // `sourceFormatHint` — the input receives decoded PCM, not the stored format.
+                let asbd = audioFormat.flatMap {
+                    CMAudioFormatDescriptionGetStreamBasicDescription($0)?.pointee
+                }
+                let srcRate = (asbd?.mSampleRate ?? 0) > 0 ? asbd!.mSampleRate : 48_000
+                let channels = min(8, max(1, Int(asbd?.mChannelsPerFrame ?? 2)))
+                ai = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+                    AVFormatIDKey: kAudioFormatMPEG4AAC,
+                    AVSampleRateKey: min(48_000, srcRate),
+                    AVNumberOfChannelsKey: channels,
+                    AVEncoderBitRateKey: min(96_000 * channels, 384_000),
+                ])
+            } else {
+                ai = AVAssetWriterInput(mediaType: .audio, outputSettings: nil,     // passthrough mux
+                                        sourceFormatHint: audioFormat)
+            }
             ai.expectsMediaDataInRealTime = false
             if writer.canAdd(ai) { writer.add(ai); audioIn = ai }
         }
