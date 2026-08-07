@@ -51,21 +51,30 @@ public enum VideoQualityTarget {
         /// Deliver only when the output is smaller than the source. Off for a format *conversion*
         /// (a web deliverable from a non-web source is the point even when it is larger).
         public let requireSmaller: Bool
+        /// Deliver the highest-quality candidate (the ceiling encode) even when no candidate cleared
+        /// the floor. For a *conversion* the caller asked for a playable file, not a smaller one — a
+        /// best-effort deliverable beats no deliverable. `metTarget` still tells the truth: the
+        /// receipt shows the achieved score against the floor that was asked for.
+        public let bestEffortOnFloorMiss: Bool
 
         public init(codec: AVVideoCodecType, webSafeAudio: Bool,
-                    ceilingScale: Double, requireSmaller: Bool) {
+                    ceilingScale: Double, requireSmaller: Bool,
+                    bestEffortOnFloorMiss: Bool = false) {
             self.codec = codec
             self.webSafeAudio = webSafeAudio
             self.ceilingScale = ceilingScale
             self.requireSmaller = requireSmaller
+            self.bestEffortOnFloorMiss = bestEffortOnFloorMiss
         }
 
         /// The native deliverable — exactly the historical `encode` behavior.
         public static let hevc = EncodeProfile(codec: .hevc, webSafeAudio: false,
                                                ceilingScale: 1.0, requireSmaller: true)
-        /// The universal web deliverable for a source that is not already web-native.
+        /// The universal web deliverable for a source that is not already web-native: a conversion
+        /// always delivers — larger is fine, and a floor miss falls back to the ceiling encode.
         public static let webH264 = EncodeProfile(codec: .h264, webSafeAudio: true,
-                                                  ceilingScale: 2.0, requireSmaller: false)
+                                                  ceilingScale: 2.0, requireSmaller: false,
+                                                  bestEffortOnFloorMiss: true)
 
         /// Receipt/log label for the codec ("HEVC" / "H.264"; falls back to the fourCC).
         public var codecLabel: String {
@@ -243,8 +252,10 @@ public enum VideoQualityTarget {
         // + EMBED-005 partial-write-on-failure.)
         let outBytes = (try? chosen.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         // A format *conversion* (web profile) delivers even when larger — the size gate is the
-        // profile's call; the quality floor is never waived.
-        let didWin = best != nil && (!profile.requireSmaller || outBytes < inBytes)
+        // profile's call. A floor miss delivers the ceiling encode when the profile says best-effort
+        // (`chosen` IS that encode on a miss); `metTarget` reports the miss either way.
+        let didWin = (best != nil || profile.bestEffortOnFloorMiss)
+            && (!profile.requireSmaller || outBytes < inBytes)
         if didWin {
             let staging = output.deletingLastPathComponent()
                 .appendingPathComponent(".forge-\(UUID().uuidString).tmp")

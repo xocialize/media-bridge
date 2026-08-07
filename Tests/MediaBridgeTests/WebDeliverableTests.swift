@@ -96,6 +96,33 @@ final class WebDeliverableTests: XCTestCase {
         XCTAssertEqual(srcAudio, outAudio, "AAC audio must passthrough byte-identical, never re-encode")
     }
 
+    /// A floor the content genuinely cannot reach (pure noise at a thin ceiling, floor 90) must
+    /// still deliver under the web profile — best-effort ceiling encode, `metTarget == false` told
+    /// honestly — while the native profile keeps the historical no-file miss. A conversion's caller
+    /// asked for a playable file, not a smaller one.
+    func testWebProfileDeliversBestEffortOnFloorMiss() async throws {
+        let tmp = FileManager.default.temporaryDirectory
+        let src = tmp.appendingPathComponent("noise-src-\(UUID().uuidString).mov")
+        let webOut = tmp.appendingPathComponent("noise-web-\(UUID().uuidString).mp4")
+        let nativeOut = tmp.appendingPathComponent("noise-native-\(UUID().uuidString).mp4")
+        defer { [src, webOut, nativeOut].forEach { try? FileManager.default.removeItem(at: $0) } }
+        try makeClip(at: src, w: 320, h: 240, frames: 30,
+                     videoCodec: .hevc, audioFormatID: nil, noise: true)
+
+        let web = try await VideoQualityTarget.encode(input: src, output: webOut, targetScore: 90,
+                                                      iterations: 3, profile: .webH264)
+        XCTAssertFalse(web.metTarget, "noise at a thin ceiling cannot clear 90 — precondition")
+        XCTAssertTrue(web.delivered, "best-effort must deliver the ceiling encode anyway")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: webOut.path))
+        XCTAssertLessThan(web.score, 90, "the receipt must carry the honest shortfall")
+
+        let native = try await VideoQualityTarget.encode(input: src, output: nativeOut, targetScore: 90,
+                                                         iterations: 3)
+        XCTAssertFalse(native.metTarget)
+        XCTAssertFalse(native.delivered, "the native profile keeps the no-file miss")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: nativeOut.path))
+    }
+
     /// The NATIVE profile keeps the historical delivery rule — floor met AND smaller — and a file
     /// exists exactly when `delivered` says so (the no-orphan guarantee, whichever way it falls).
     func testNativeProfileStillRequiresSmaller() async throws {
@@ -132,9 +159,11 @@ final class WebDeliverableTests: XCTestCase {
 
     /// Synthetic clip: a smooth animated gradient (compressible — the floor must be *reachable*,
     /// which pure noise, the one pathological content class, is not) + an optional 440 Hz mono
-    /// audio track in the requested codec. `.mov` container so ALAC muxes.
+    /// audio track in the requested codec. `.mov` container so ALAC muxes. `noise: true` flips the
+    /// frames to LCG noise — the deliberately floor-unreachable fixture for best-effort tests.
     private func makeClip(at url: URL, w: Int, h: Int, frames: Int,
-                          videoCodec: AVVideoCodecType, audioFormatID: AudioFormatID?) throws {
+                          videoCodec: AVVideoCodecType, audioFormatID: AudioFormatID?,
+                          noise: Bool = false) throws {
         let fps = 30
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
         // Pin a real source bitrate: a default-quality gradient lands ≈0.1 Mbps, and 2× of that is
@@ -172,13 +201,21 @@ final class WebDeliverableTests: XCTestCase {
             if let base = CVPixelBufferGetBaseAddress(pb) {
                 let rowBytes = CVPixelBufferGetBytesPerRow(pb)
                 let p = base.assumingMemoryBound(to: UInt8.self)
-                for y in 0..<h { for x in 0..<w {      // smooth drifting gradient (BGRA)
-                    let o = y * rowBytes + x * 4
-                    p[o] = UInt8((x * 255 / w + i * 6) % 256)
-                    p[o + 1] = UInt8(y * 255 / h)
-                    p[o + 2] = UInt8((x + y) * 255 / (w + h))
-                    p[o + 3] = 255
-                } }
+                if noise {
+                    var seed = UInt32(truncatingIfNeeded: i &* 2654435761 | 1)
+                    for j in 0..<(rowBytes * h) {       // incompressible LCG noise
+                        seed = seed &* 1664525 &+ 1013904223
+                        p[j] = UInt8(truncatingIfNeeded: seed >> 16)
+                    }
+                } else {
+                    for y in 0..<h { for x in 0..<w {  // smooth drifting gradient (BGRA)
+                        let o = y * rowBytes + x * 4
+                        p[o] = UInt8((x * 255 / w + i * 6) % 256)
+                        p[o + 1] = UInt8(y * 255 / h)
+                        p[o + 2] = UInt8((x + y) * 255 / (w + h))
+                        p[o + 3] = 255
+                    } }
+                }
             }
             CVPixelBufferUnlockBaseAddress(pb, [])
             adaptor.append(pb, withPresentationTime: CMTime(value: CMTimeValue(i), timescale: CMTimeScale(fps)))
