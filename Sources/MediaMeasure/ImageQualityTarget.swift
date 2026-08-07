@@ -104,8 +104,13 @@ public enum ImageQualityTarget {
         let out = NSMutableData()
         guard let dest = CGImageDestinationCreateWithData(
             out, UTType.png.identifier as CFString, 1, nil) else { throw EncodeError.encodeFailed }
-        // Adaptive (all-filters) row filtering — the one meaningful size lever ImageIO exposes for
-        // PNG (the vendored-oxipng recompression pass was dropped in the media-bridge salvage).
+        // Adaptive (all-filters) row filtering, stated explicitly. Measured 2026-08-08 (macOS 27):
+        // ImageIO's DEFAULT already produces byte-identical output — the hint is belt-and-braces
+        // for older encoders, not a size lever. ImageIO exposes no deflate-level knob; the
+        // vendored-oxipng recompression pass was dropped in the media-bridge salvage (net-clean),
+        // and the accepted gap vs an oxipng-class pass is roughly 5–15%. If that ever matters, the
+        // net-clean headroom is a pure-Swift IDAT recompression against the SYSTEM zlib (libz ships
+        // with macOS — linking it is not vendoring) with per-scanline filter search.
         // The IMAGEIO_PNG_ALL_FILTERS compound macro doesn't import into Swift; OR the primitives.
         let allFilters = IMAGEIO_PNG_FILTER_NONE | IMAGEIO_PNG_FILTER_SUB | IMAGEIO_PNG_FILTER_UP
             | IMAGEIO_PNG_FILTER_AVG | IMAGEIO_PNG_FILTER_PAETH
