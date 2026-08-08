@@ -67,6 +67,35 @@ public enum MediaBridge {
         return try await normalizeMatroska(input: input, output: output)
     }
 
+    /// Rewrap a file's streams into an mp4 container **without touching a single media byte** —
+    /// the passthrough remux. This is the optimal operation for web-safe streams (H.264 + AAC) in
+    /// the wrong wrapper (a `.mov` capture, typically): byte-identical quality, ~source size, and
+    /// ~100× faster than any re-encode. Throws when AVFoundation can't passthrough-export the
+    /// source (non-native containers, exotic track layouts) — callers fall back to a transcode.
+    public static func remuxToMP4(input: URL, output: URL) async throws {
+        let asset = AVURLAsset(url: input)
+        guard let export = AVAssetExportSession(asset: asset,
+                                                presetName: AVAssetExportPresetPassthrough) else {
+            throw NormalizeError.exportFailed("no passthrough export session")
+        }
+        try? FileManager.default.removeItem(at: output)
+        export.outputURL = output
+        export.outputFileType = .mp4
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            export.exportAsynchronously {
+                switch export.status {
+                case .completed: cont.resume()
+                default: cont.resume(throwing: NormalizeError.exportFailed(
+                    export.error?.localizedDescription ?? "status \(export.status.rawValue)"))
+                }
+            }
+        }
+        // A passthrough export that "completes" but writes nothing (or a stub) must not masquerade
+        // as a deliverable.
+        let bytes = (try? output.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        guard bytes > 0 else { throw NormalizeError.exportFailed("passthrough produced no bytes") }
+    }
+
     // MARK: - Native-container fast path (AVFoundation)
 
     /// Native containers AVFoundation both demuxes AND reliably transcodes via AVAssetExportSession.
