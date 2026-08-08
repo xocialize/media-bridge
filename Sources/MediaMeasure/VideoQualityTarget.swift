@@ -199,6 +199,7 @@ public enum VideoQualityTarget {
         }
 
         var lo = ceiling * 0.04, hi = ceiling
+        let initialLo = lo
         var best: (bitrate: Int, score: VideoQualityScore, url: URL)?
 
         // Score off the cooperative pool at .utility QoS (EMBED-004): the host drives encode from a
@@ -211,8 +212,7 @@ public enum VideoQualityTarget {
             }
         }
 
-        for i in 0..<iterations {
-            let b = (lo + hi) / 2
+        func searchStep(_ b: Double, _ label: String) async throws -> Bool {
             let tmp = tmpDir.appendingPathComponent("vqt-\(UUID().uuidString).mp4")
             temps.append(tmp)
             let tEnc = DispatchTime.now()
@@ -222,14 +222,38 @@ public enum VideoQualityTarget {
             let encMs = MediaProfile.ms(since: tEnc); profTranscodeMs += encMs
             let tSc = DispatchTime.now()
             let scored = try await scoreOf(tmp)
-            let p10 = scored.p10
             let scMs = MediaProfile.ms(since: tSc); profScoreMs += scMs
-            MediaProfile.log(String(format: "iter %d: %.2f Mbps · transcode %.0f ms · score %.0f ms · p10 %.1f",
-                                    i + 1, b / 1e6, encMs, scMs, p10))
-            if p10 >= targetScore {
-                best = (Int(b), scored, tmp); hi = b     // clears → try smaller (lower bitrate)
+            MediaProfile.log(String(format: "%@: %.2f Mbps · transcode %.0f ms · score %.0f ms · p10 %.1f",
+                                    label, b / 1e6, encMs, scMs, scored.p10))
+            if scored.p10 >= targetScore { best = (Int(b), scored, tmp); return true }
+            return false
+        }
+
+        for i in 0..<iterations {
+            let b = (lo + hi) / 2
+            if try await searchStep(b, "iter \(i + 1)") {
+                hi = b                                    // clears → try smaller (lower bitrate)
             } else {
                 lo = b                                    // below floor → need more bitrate
+            }
+        }
+
+        // Descent extension: `lo` never moved — no candidate ever failed the floor, so the true
+        // clearing point sits somewhere BELOW everything tested (very compressible content, or an
+        // over-provisioned master), and stopping here would ship bits the perceptual floor never
+        // asked for. One extension pass reaches 50× further down; it only runs when the floor never
+        // pushed back, so typical content pays nothing.
+        if lo == initialLo, let current = best {
+            MediaProfile.log("descent: no candidate failed the floor — extending the search down")
+            var lo2 = Double(current.bitrate) * 0.02
+            var hi2 = Double(current.bitrate)
+            for i in 0..<iterations {
+                let b = (lo2 + hi2) / 2
+                if try await searchStep(b, "descent \(i + 1)") {
+                    hi2 = b
+                } else {
+                    lo2 = b
+                }
             }
         }
 
@@ -358,9 +382,17 @@ public enum VideoQualityTarget {
         try? FileManager.default.removeItem(at: output)
         let writer = try AVAssetWriter(outputURL: output, fileType: .mp4)
         // H.264 pins High profile / auto level — the universally-decodable web tier (Baseline is for
-        // ancient devices and costs efficiency; VideoToolbox picks the level from the geometry).
+        // ancient devices and costs efficiency; VideoToolbox picks the level from the geometry) —
+        // and a 4-second keyframe cadence, the web-streaming standard. Measured 2026-08-08 at a
+        // fixed 900 kbps: GOP4s = +4.5 p10 SSIMULACRA2 AND −3.2% bytes vs the default cadence (the
+        // default spends bits on needlessly frequent I-frames), so the floor search lands smaller
+        // files at the same floor. CABAC was probed the same day: byte-identical — VideoToolbox
+        // already uses it for High profile; don't add the key expecting a win.
         var compression: [String: Any] = [AVVideoAverageBitRateKey: bitrate]
-        if codec == .h264 { compression[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel }
+        if codec == .h264 {
+            compression[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel
+            compression[AVVideoMaxKeyFrameIntervalDurationKey] = 4
+        }
         let videoIn = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: codec,
             AVVideoWidthKey: w, AVVideoHeightKey: h,

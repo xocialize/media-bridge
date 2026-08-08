@@ -123,6 +123,34 @@ final class WebDeliverableTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: nativeOut.path))
     }
 
+    /// The descent extension: when every candidate clears the floor (the search bottoms out at its
+    /// own 4%-of-ceiling lower bound — the over-provisioned-master case, modeled here with a large
+    /// `ceilingScale`), the search must extend downward instead of shipping bits the floor never
+    /// asked for. The chosen bitrate must land well below the initial lower bound.
+    func testSearchDescendsBelowItsInitialLowerBound() async throws {
+        let tmp = FileManager.default.temporaryDirectory
+        let src = tmp.appendingPathComponent("descent-src-\(UUID().uuidString).mov")
+        let out = tmp.appendingPathComponent("descent-out-\(UUID().uuidString).mp4")
+        defer { [src, out].forEach { try? FileManager.default.removeItem(at: $0) } }
+        try makeClip(at: src, w: 320, h: 240, frames: 30,
+                     videoCodec: .hevc, audioFormatID: nil)
+
+        let srcBytes = (try? src.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        let sourceBitrate = Double(srcBytes) * 8            // 1-second clip → bits/s
+        let profile = VideoQualityTarget.EncodeProfile(
+            codec: .h264, webSafeAudio: false, ceilingScale: 30, requireSmaller: false)
+        let initialLo = sourceBitrate * 30 * 0.04           // where the old search would stop
+
+        let r = try await VideoQualityTarget.encode(input: src, output: out, targetScore: 70,
+                                                    iterations: 4, profile: profile)
+        XCTAssertTrue(r.metTarget)
+        XCTAssertTrue(r.delivered)
+        XCTAssertLessThan(Double(r.bitrate), initialLo * 0.5,
+                          "descent must land well below the initial lower bound "
+                          + "(chose \(r.bitrate) b/s, old floor ≈ \(Int(initialLo)) b/s)")
+        XCTAssertGreaterThanOrEqual(r.score, 70, "the perceptual floor is never traded for size")
+    }
+
     /// The NATIVE profile keeps the historical delivery rule — floor met AND smaller — and a file
     /// exists exactly when `delivered` says so (the no-orphan guarantee, whichever way it falls).
     func testNativeProfileStillRequiresSmaller() async throws {
