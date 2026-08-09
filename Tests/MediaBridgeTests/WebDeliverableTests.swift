@@ -46,17 +46,87 @@ final class WebDeliverableTests: XCTestCase {
         XCTAssertEqual(decoded.height, img.height)
     }
 
-    /// The lossy web-still rung: on noisy/photographic content a JPEG floor search must meet its
-    /// floor AND land well under lossless PNG (PNG cannot compress noise at all — that gap is the
-    /// entire reason the rung exists). The Kit races the two and ships the smaller guarantee-keeper.
-    func testEncodeJPEGMeetsFloorAndUndercutsPNGOnNoisyContent() throws {
-        let img = makeImage(256)
+    /// TRUE random noise — the photographic proxy PNG cannot compress (each pixel independent).
+    /// NOT `makeImage`, whose "noise" is a PERIODIC function of (x, y): PNG's filters compress that
+    /// pattern to a fraction of what JPEG@floor spends on it — asserted the wrong way around in the
+    /// first version of this test, which shipped red because the run chain dropped the exit status.
+    private func makeNoiseImage(_ n: Int) -> CGImage {
+        var bytes = [UInt8](repeating: 0, count: n * n * 4)
+        var seed: UInt32 = 0x2F6E2B1
+        for i in stride(from: 0, to: bytes.count, by: 4) {
+            seed = seed &* 1664525 &+ 1013904223
+            bytes[i] = UInt8(truncatingIfNeeded: seed >> 8)
+            seed = seed &* 1664525 &+ 1013904223
+            bytes[i + 1] = UInt8(truncatingIfNeeded: seed >> 8)
+            seed = seed &* 1664525 &+ 1013904223
+            bytes[i + 2] = UInt8(truncatingIfNeeded: seed >> 8)
+            bytes[i + 3] = 255
+        }
+        let cs = CGColorSpace(name: CGColorSpace.sRGB)!
+        let ctx = CGContext(data: &bytes, width: n, height: n, bitsPerComponent: 8,
+                            bytesPerRow: n * 4, space: cs,
+                            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+        return ctx.makeImage()!
+    }
+
+    /// Photo-LIKE content: smooth low-frequency structure + mild grain. The two failed proxies
+    /// each taught a boundary: periodic patterns are PNG-friendly, and PURE entropy is
+    /// floor-hostile (a fidelity floor against a noise reference forces near-lossless JPEG —
+    /// SSIMULACRA2 treats noise as signal; grain economics, stills edition). A photo is neither.
+    private func makePhotoImage(_ n: Int) -> CGImage {
+        var bytes = [UInt8](repeating: 0, count: n * n * 4)
+        var seed: UInt32 = 0x9E3779B9
+        func grain() -> Double {
+            seed = seed &* 1664525 &+ 1013904223
+            return Double(Int32(truncatingIfNeeded: seed >> 8) % 13) - 6    // ±6, mild
+        }
+        for y in 0..<n { for x in 0..<n {
+            let fx = Double(x) / Double(n), fy = Double(y) / Double(n)
+            let l1 = 110 + 70 * sin(fx * 4.1 + 0.6) * cos(fy * 2.9 + 1.1)
+            let l2 = 40 * sin((fx + fy) * 6.3)
+            let i = (y * n + x) * 4
+            bytes[i]     = UInt8(clamping: Int(l1 + l2 * 0.7 + grain()))
+            bytes[i + 1] = UInt8(clamping: Int(l1 * 0.9 + l2 + grain()))
+            bytes[i + 2] = UInt8(clamping: Int(l1 * 1.1 + l2 * 0.4 + grain()))
+            bytes[i + 3] = 255
+        } }
+        let cs = CGColorSpace(name: CGColorSpace.sRGB)!
+        let ctx = CGContext(data: &bytes, width: n, height: n, bitsPerComponent: 8,
+                            bytesPerRow: n * 4, space: cs,
+                            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+        return ctx.makeImage()!
+    }
+
+    /// The lossy web-still rung is a RACE; these three tests pin all three measured outcomes.
+    /// Photo-like content: JPEG@floor undercuts PNG decisively — the rung's reason to exist.
+    func testJPEGWinsTheRaceOnPhotoLikeContent() throws {
+        let img = makePhotoImage(256)
         let jpeg = try ImageQualityTarget.encodeJPEG(img, targetScore: 80)
         XCTAssertTrue(jpeg.metTarget, "floor 80 must be reachable (got \(jpeg.score))")
-        XCTAssertGreaterThanOrEqual(jpeg.score, 80)
         let png = try ImageQualityTarget.encodePNG(img)
-        XCTAssertLessThan(jpeg.data.count, png.data.count,
-                          "JPEG@floor (\(jpeg.data.count) B) must undercut PNG (\(png.data.count) B) on noise")
+        XCTAssertLessThan(jpeg.data.count, png.data.count / 2,
+                          "photo-like: JPEG@floor (\(jpeg.data.count) B) must land well under PNG (\(png.data.count) B)")
+    }
+
+    /// Pure entropy: the floor forces near-lossless JPEG (noise IS signal to the metric), PNG wins,
+    /// and the race correctly ships PNG. Pinned so nobody "fixes" the race into a classifier that
+    /// calls noise photographic.
+    func testPNGWinsTheRaceOnPureNoise() throws {
+        let img = makeNoiseImage(256)
+        let jpeg = try ImageQualityTarget.encodeJPEG(img, targetScore: 70)
+        let png = try ImageQualityTarget.encodePNG(img)
+        XCTAssertLessThan(png.data.count, jpeg.data.count,
+                          "entropy content: PNG (\(png.data.count) B) must beat JPEG@floor (\(jpeg.data.count) B)")
+    }
+
+    /// Graphic-class content (the periodic-pattern fixture): PNG's filters win and the race must
+    /// ship PNG — measured 14.8 KB PNG vs 31.6 KB JPEG@80 on this very fixture.
+    func testPNGWinsTheRaceOnPatternedGraphics() throws {
+        let img = makeImage(256)
+        let jpeg = try ImageQualityTarget.encodeJPEG(img, targetScore: 80)
+        let png = try ImageQualityTarget.encodePNG(img)
+        XCTAssertLessThan(png.data.count, jpeg.data.count,
+                          "patterned graphics: PNG (\(png.data.count) B) must beat JPEG@floor (\(jpeg.data.count) B)")
     }
 
     // MARK: - webH264 video profile
