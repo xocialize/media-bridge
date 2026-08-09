@@ -75,6 +75,14 @@ public enum VideoQualityTarget {
         /// rides only on the post-search **corridor squeeze**: one candidate below the winner's rate,
         /// adopted only if it still clears the floor and is strictly smaller. nil = no squeeze.
         public let minAllowedQP: Int?
+        /// Deliver SDR BT.709 from HDR sources (HLG/PQ BT.2020 — every recent iPhone capture):
+        /// the tone-map runs once in the mezzanine (VTPixelTransferSession, colour only — the
+        /// measured-good vImage scaler still owns any resizing) and the search runs SDR-vs-SDR
+        /// against it. Without this, web outputs carry HDR tags on 8-bit H.264 — inconsistent
+        /// across browsers — and the search compares HDR-decoded reference frames against
+        /// SDR-ish candidates (the img3140 cross-gamut failure, inside our own gate). False on
+        /// the native profile: HDR HEVC is a legitimate Apple-native deliverable.
+        public let deliverSDR: Bool
         /// Re-encode AAC audio whose per-channel rate EXCEEDS this (bits/s/channel) down to
         /// AAC-LC ~96k/ch — the audio half of the Vimeo parity rung (they normalize 317k stereo
         /// masters to ~189k; we passthrough-muxed them whole, ~8% of the file on small graphic
@@ -96,7 +104,8 @@ public enum VideoQualityTarget {
                     bestEffortOnFloorMiss: Bool = false,
                     maxAllowedQP: Int? = nil, minAllowedQP: Int? = nil,
                     lookAheadFrames: Int? = nil,
-                    normalizeAudioAbovePerChannelBPS: Int? = nil) {
+                    normalizeAudioAbovePerChannelBPS: Int? = nil,
+                    deliverSDR: Bool = false) {
             self.codec = codec
             self.webSafeAudio = webSafeAudio
             self.ceilingScale = ceilingScale
@@ -106,6 +115,7 @@ public enum VideoQualityTarget {
             self.minAllowedQP = minAllowedQP
             self.lookAheadFrames = lookAheadFrames
             self.normalizeAudioAbovePerChannelBPS = normalizeAudioAbovePerChannelBPS
+            self.deliverSDR = deliverSDR
         }
 
         /// The native deliverable — exactly the historical `encode` behavior.
@@ -121,7 +131,8 @@ public enum VideoQualityTarget {
                                                   bestEffortOnFloorMiss: true,
                                                   maxAllowedQP: 34, minAllowedQP: 20,
                                                   lookAheadFrames: 16,
-                                                  normalizeAudioAbovePerChannelBPS: 112_000)
+                                                  normalizeAudioAbovePerChannelBPS: 112_000,
+                                                  deliverSDR: true)
         /// `webH264`'s shrink-only sibling for sources that are ALREADY web-native (or have a
         /// lossless remux as the baseline deliverable): source-bitrate ceiling, strictly smaller,
         /// no best-effort — but the SAME encoder knobs. Hosts hand-rolling this profile is how the
@@ -131,7 +142,8 @@ public enum VideoQualityTarget {
                                                         ceilingScale: 1.0, requireSmaller: true,
                                                         maxAllowedQP: 34, minAllowedQP: 20,
                                                         lookAheadFrames: 16,
-                                                        normalizeAudioAbovePerChannelBPS: 112_000)
+                                                        normalizeAudioAbovePerChannelBPS: 112_000,
+                                                        deliverSDR: true)
 
         /// Receipt/log label for the codec ("HEVC" / "H.264"; falls back to the fourCC).
         public var codecLabel: String {
@@ -204,6 +216,10 @@ public enum VideoQualityTarget {
         let vw = Int(abs(vsize.width).rounded()), vh = Int(abs(vsize.height).rounded())
         let inBytes = (try? input.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         let sourceBitrate = duration > 0 ? Double(inBytes) * 8 / duration : 8_000_000
+        // HDR source (HLG/PQ) + an SDR-delivering profile → the mezzanine tone-maps once and the
+        // whole search runs SDR-vs-SDR. Detection is by transfer tag; untagged sources are SDR.
+        let sourceFormat = try await vtrack.load(.formatDescriptions).first
+        let toneMapSDR = profile.deliverSDR && Self.isHDRTransfer(sourceFormat)
 
         // Resolve the output resolution; downscale only (never upscale here — that's the SR path).
         var outW = vw, outH = vh
@@ -246,27 +262,29 @@ public enum VideoQualityTarget {
         // where a Lanczos downscale of the same frames scored 61.7 (+23 — texture frames alias
         // and no bitrate buys them back; Vimeo's COMPRESSED 1080 rung scores 63.9 on that leg).
         // Scaling once here also removes per-candidate scaling from the search entirely.
+        let needsMezzanine = downscaled || toneMapSDR
         let scoreRef: URL
-        if downscaled {
+        if needsMezzanine {
             let ref = tmpDir.appendingPathComponent("vqt-mezz-\(UUID().uuidString).mp4")
             temps.append(ref)
             let tRef = DispatchTime.now()
             try await renderDownscaleMezzanine(input: input, output: ref, bitrate: Int(ceiling),
                                                outWidth: outW, outHeight: outH,
                                                codec: profile.codec,
-                                               lookAhead: profile.lookAheadFrames)
+                                               lookAhead: profile.lookAheadFrames,
+                                               toneMapSDR: toneMapSDR)
             let ms = MediaProfile.ms(since: tRef)
             profTranscodeMs += ms
-            MediaProfile.log(String(format: "lanczos mezzanine: %d×%d → %d×%d · %.0f ms",
-                                    vw, vh, outW, outH, ms))
+            MediaProfile.log(String(format: "mezzanine: %d×%d → %d×%d%@ · %.0f ms",
+                                    vw, vh, outW, outH, toneMapSDR ? " · HDR→SDR tone-map" : "", ms))
             scoreRef = ref
         } else {
             scoreRef = input
         }
         // Candidates re-encode the mezzanine at its own resolution — never the writer's scaler.
-        let searchInput = downscaled ? scoreRef : input
-        let candW: Int? = downscaled ? nil : outW
-        let candH: Int? = downscaled ? nil : outH
+        let searchInput = needsMezzanine ? scoreRef : input
+        let candW: Int? = needsMezzanine ? nil : outW
+        let candH: Int? = needsMezzanine ? nil : outH
 
         var lo = ceiling * 0.04, hi = ceiling
         let initialLo = lo
@@ -469,10 +487,21 @@ public enum VideoQualityTarget {
     /// scoring reference AND the search input for a downscale — the writer's own scaler aliases
     /// texture (measured p10 38.6 vs 61.7 on the upscale-to-source leg at equal near-lossless
     /// bitrate; see `encode`) and must never touch quality-gated pixels.
+    /// True when the format's transfer function is HDR (HLG or PQ) — the tone-map trigger.
+    static func isHDRTransfer(_ format: CMFormatDescription?) -> Bool {
+        guard let format,
+              let v = CMFormatDescriptionGetExtension(
+                format, extensionKey: kCMFormatDescriptionExtension_TransferFunction) as? String
+        else { return false }
+        return v == (kCVImageBufferTransferFunction_ITU_R_2100_HLG as String)
+            || v == (kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String)
+    }
+
     public static func renderDownscaleMezzanine(input: URL, output: URL, bitrate: Int,
                                                 outWidth: Int, outHeight: Int,
                                                 codec: AVVideoCodecType,
-                                                lookAhead: Int? = nil) async throws {
+                                                lookAhead: Int? = nil,
+                                                toneMapSDR: Bool = false) async throws {
         let asset = AVURLAsset(url: input)
         guard let vtrack = try await asset.loadTracks(withMediaType: .video).first else {
             throw EncodeError.noVideoTrack
@@ -482,17 +511,26 @@ public enum VideoQualityTarget {
         let atrack = try await asset.loadTracks(withMediaType: .audio).first
         let audioFormat = try await atrack?.load(.formatDescriptions).first
         let videoFormat = try await vtrack.load(.formatDescriptions).first
-        let colorProperties = Self.colorProperties(from: videoFormat,
-                                                   width: Int(abs(size.width).rounded()),
-                                                   height: Int(abs(size.height).rounded()))
+        // Tone-mapped output IS BT.709 — forcing the tags is the point; preserving the source's
+        // HDR tags onto tone-mapped pixels would be the mislabel trap in reverse.
+        let colorProperties: [String: Any] = toneMapSDR
+            ? [AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+               AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+               AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2]
+            : Self.colorProperties(from: videoFormat,
+                                   width: Int(abs(size.width).rounded()),
+                                   height: Int(abs(size.height).rounded()))
 
         let reader = try AVAssetReader(asset: asset)
-        // BGRA decode here — the mezzanine is rendered ONCE at a near-lossless bitrate, so the RGB
-        // trip's encoder-facing cost is negligible, and the CG gamma-space path is the measured
-        // best scaler (leg p10 61.7 vs 56-58 for the CI variants tried; see git history).
+        // BGRA decode for SDR sources (the mezzanine renders ONCE at near-lossless bitrate, so the
+        // RGB trip's encoder-facing cost is negligible). HDR sources decode 10-bit biplanar so the
+        // VTPixelTransferSession tone-map gets full depth + the HDR attachments.
+        let decodeFormat: OSType = toneMapSDR
+            ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            : kCVPixelFormatType_32BGRA
         let videoOut = AVAssetReaderTrackOutput(
             track: vtrack,
-            outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
+            outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: decodeFormat])
         videoOut.alwaysCopiesSampleData = false
         reader.add(videoOut)
         var audioOut: AVAssetReaderTrackOutput?
@@ -568,6 +606,28 @@ public enum VideoQualityTarget {
             _ = vImageScale_ARGB8888(&sBuf, &dBuf, nil, vImage_Flags(kvImageNoFlags))
         }
 
+        // HDR → SDR: VTPixelTransferSession does the COLOUR work only (tone-map + matrix + depth
+        // → BGRA 709 at SOURCE resolution — validated visually against Vimeo's own tone-map);
+        // the measured-good vImage scaler still owns any resizing. Never let the transfer
+        // session scale — its scaler is the writer-scale class that aliased texture.
+        var transferSession: VTPixelTransferSession?
+        var hdrScratch: CVPixelBuffer?
+        if toneMapSDR {
+            VTPixelTransferSessionCreate(allocator: nil, pixelTransferSessionOut: &transferSession)
+            if let session = transferSession {
+                VTSessionSetProperty(session, key: kVTPixelTransferPropertyKey_DestinationColorPrimaries,
+                                     value: kCVImageBufferColorPrimaries_ITU_R_709_2)
+                VTSessionSetProperty(session, key: kVTPixelTransferPropertyKey_DestinationTransferFunction,
+                                     value: kCVImageBufferTransferFunction_ITU_R_709_2)
+                VTSessionSetProperty(session, key: kVTPixelTransferPropertyKey_DestinationYCbCrMatrix,
+                                     value: kCVImageBufferYCbCrMatrix_ITU_R_709_2)
+            }
+            let sw = Int(abs(size.width).rounded()), sh = Int(abs(size.height).rounded())
+            if sw != outWidth || sh != outHeight {
+                CVPixelBufferCreate(nil, sw, sh, kCVPixelFormatType_32BGRA, nil, &hdrScratch)
+            }
+        }
+
         let group = DispatchGroup()
         group.enter()
         videoIn.requestMediaDataWhenReady(on: DispatchQueue(label: "vqt.mezz.video")) {
@@ -583,7 +643,20 @@ public enum VideoQualityTarget {
                     CVPixelBufferCreate(nil, outWidth, outHeight, kCVPixelFormatType_32BGRA, nil, &pb)
                 }
                 guard let pb else { continue }
-                scaleFrame(src, into: pb)
+                if let session = transferSession {
+                    if let scratch = hdrScratch {
+                        // tone-map at source res, then vImage-scale to target
+                        guard VTPixelTransferSessionTransferImage(session, from: src, to: scratch) == noErr
+                        else { continue }
+                        scaleFrame(scratch, into: pb)
+                    } else {
+                        // same-res: tone-map straight into the output buffer
+                        guard VTPixelTransferSessionTransferImage(session, from: src, to: pb) == noErr
+                        else { continue }
+                    }
+                } else {
+                    scaleFrame(src, into: pb)
+                }
                 if !adaptor.append(pb, withPresentationTime: CMSampleBufferGetPresentationTimeStamp(s)) {
                     FileHandle.standardError.write(Data("vqt: mezzanine append failed: \(String(describing: writer.error))\n".utf8))
                     videoIn.markAsFinished(); group.leave(); return
