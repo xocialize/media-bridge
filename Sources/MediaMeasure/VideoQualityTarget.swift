@@ -1,6 +1,6 @@
+import Accelerate
 import Foundation
 import AVFoundation
-import CoreImage
 import CoreMedia
 import VideoToolbox
 
@@ -75,6 +75,13 @@ public enum VideoQualityTarget {
         /// rides only on the post-search **corridor squeeze**: one candidate below the winner's rate,
         /// adopted only if it still clears the floor and is strictly smaller. nil = no squeeze.
         public let minAllowedQP: Int?
+        /// Re-encode AAC audio whose per-channel rate EXCEEDS this (bits/s/channel) down to
+        /// AAC-LC ~96k/ch — the audio half of the Vimeo parity rung (they normalize 317k stereo
+        /// masters to ~189k; we passthrough-muxed them whole, ~8% of the file on small graphic
+        /// clips). Threshold-gated so at-or-below-web-rate audio still passthroughs — a
+        /// generation loss is taken only when the byte win is real. nil = passthrough always
+        /// (the native/HEVC profile keeps the historical behavior).
+        public let normalizeAudioAbovePerChannelBPS: Int?
         /// `kVTCompressionPropertyKey_SuggestedLookAheadFrameCount` (macOS 15+; skipped on 14 —
         /// the key predates our floor). The hw encoder's DEFAULT IS ZERO lookahead: no
         /// scene-adaptive keyframes, no statistics-driven allocation. 16 frames measured on Sevilla
@@ -88,7 +95,8 @@ public enum VideoQualityTarget {
                     ceilingScale: Double, requireSmaller: Bool,
                     bestEffortOnFloorMiss: Bool = false,
                     maxAllowedQP: Int? = nil, minAllowedQP: Int? = nil,
-                    lookAheadFrames: Int? = nil) {
+                    lookAheadFrames: Int? = nil,
+                    normalizeAudioAbovePerChannelBPS: Int? = nil) {
             self.codec = codec
             self.webSafeAudio = webSafeAudio
             self.ceilingScale = ceilingScale
@@ -97,6 +105,7 @@ public enum VideoQualityTarget {
             self.maxAllowedQP = maxAllowedQP
             self.minAllowedQP = minAllowedQP
             self.lookAheadFrames = lookAheadFrames
+            self.normalizeAudioAbovePerChannelBPS = normalizeAudioAbovePerChannelBPS
         }
 
         /// The native deliverable — exactly the historical `encode` behavior.
@@ -111,7 +120,8 @@ public enum VideoQualityTarget {
                                                   ceilingScale: 2.0, requireSmaller: false,
                                                   bestEffortOnFloorMiss: true,
                                                   maxAllowedQP: 34, minAllowedQP: 20,
-                                                  lookAheadFrames: 16)
+                                                  lookAheadFrames: 16,
+                                                  normalizeAudioAbovePerChannelBPS: 112_000)
         /// `webH264`'s shrink-only sibling for sources that are ALREADY web-native (or have a
         /// lossless remux as the baseline deliverable): source-bitrate ceiling, strictly smaller,
         /// no best-effort — but the SAME encoder knobs. Hosts hand-rolling this profile is how the
@@ -120,7 +130,8 @@ public enum VideoQualityTarget {
         public static let webH264Shrink = EncodeProfile(codec: .h264, webSafeAudio: true,
                                                         ceilingScale: 1.0, requireSmaller: true,
                                                         maxAllowedQP: 34, minAllowedQP: 20,
-                                                        lookAheadFrames: 16)
+                                                        lookAheadFrames: 16,
+                                                        normalizeAudioAbovePerChannelBPS: 112_000)
 
         /// Receipt/log label for the codec ("HEVC" / "H.264"; falls back to the fourCC).
         public var codecLabel: String {
@@ -283,7 +294,8 @@ public enum VideoQualityTarget {
                                     outWidth: candW, outHeight: candH,
                                     codec: profile.codec, webSafeAudio: profile.webSafeAudio,
                                     maxQP: profile.maxAllowedQP, minQP: minQP,
-                                    lookAhead: profile.lookAheadFrames)
+                                    lookAhead: profile.lookAheadFrames,
+                                    normalizeAudioAboveBPS: profile.normalizeAudioAbovePerChannelBPS)
             let encMs = MediaProfile.ms(since: tEnc); profTranscodeMs += encMs
             let tSc = DispatchTime.now()
             let scored = try await scoreOf(tmp)
@@ -359,7 +371,8 @@ public enum VideoQualityTarget {
                                     outWidth: candW, outHeight: candH,
                                     codec: profile.codec, webSafeAudio: profile.webSafeAudio,
                                     maxQP: profile.maxAllowedQP,
-                                    lookAhead: profile.lookAheadFrames)
+                                    lookAhead: profile.lookAheadFrames,
+                                    normalizeAudioAboveBPS: profile.normalizeAudioAbovePerChannelBPS)
             chosen = (Int(hi), try await scoreOf(tmp), tmp)
         }
 
@@ -513,12 +526,32 @@ public enum VideoQualityTarget {
         guard writer.startWriting() else { throw EncodeError.encodeFailed }
         writer.startSession(atSourceTime: .zero)
 
-        // Gamma-space CG resample per frame (interpolation .high — Lanczos-class). Measured on the
-        // upscale-to-source leg at near-lossless bitrate: CG-high p10 61.7 vs the writer's own
-        // scaler 38.6 (+23 — texture frames alias under the writer scale and no bitrate buys them
-        // back) and vs CoreImage-Lanczos variants 56-58 (linear-light and colourspace hand-offs
-        // each cost points against the gamma-space reference decode the scorer uses).
-        let sRGB = CGColorSpace(name: CGColorSpace.sRGB)!
+        // vImage Lanczos (default kernel) per frame, gamma-space, straight on the BGRA buffers.
+        // Measured on the upscale-to-source leg at near-lossless bitrate (Sevilla 4K→1080):
+        // writer's own scaler p10 38.6 (texture aliases; no bitrate buys it back) · CG .high 61.7 ·
+        // CoreImage-Lanczos variants 56-58 (linear-light + colourspace hand-offs each cost points)
+        // · **vImage default 67.8 — and ~6× faster than CG** (Lanczos5 flag measured equal-minus,
+        // slower, ringier: 67.6). Vimeo's own COMPRESSED 1080 rung scores 63.9 on this leg — the
+        // mezzanine now out-resolves the reference ladder it was chasing.
+        func scaleFrame(_ src: CVPixelBuffer, into dst: CVPixelBuffer) {
+            CVPixelBufferLockBaseAddress(src, .readOnly)
+            CVPixelBufferLockBaseAddress(dst, [])
+            defer {
+                CVPixelBufferUnlockBaseAddress(src, .readOnly)
+                CVPixelBufferUnlockBaseAddress(dst, [])
+            }
+            guard let sBase = CVPixelBufferGetBaseAddress(src),
+                  let dBase = CVPixelBufferGetBaseAddress(dst) else { return }
+            var sBuf = vImage_Buffer(data: sBase,
+                                     height: vImagePixelCount(CVPixelBufferGetHeight(src)),
+                                     width: vImagePixelCount(CVPixelBufferGetWidth(src)),
+                                     rowBytes: CVPixelBufferGetBytesPerRow(src))
+            var dBuf = vImage_Buffer(data: dBase,
+                                     height: vImagePixelCount(CVPixelBufferGetHeight(dst)),
+                                     width: vImagePixelCount(CVPixelBufferGetWidth(dst)),
+                                     rowBytes: CVPixelBufferGetBytesPerRow(dst))
+            _ = vImageScale_ARGB8888(&sBuf, &dBuf, nil, vImage_Flags(kvImageNoFlags))
+        }
 
         let group = DispatchGroup()
         group.enter()
@@ -528,9 +561,6 @@ public enum VideoQualityTarget {
                     videoIn.markAsFinished(); group.leave(); return
                 }
                 guard let src = CMSampleBufferGetImageBuffer(s) else { continue }
-                var cgFull: CGImage?
-                VTCreateCGImageFromCVPixelBuffer(src, options: nil, imageOut: &cgFull)
-                guard let cgFull else { continue }
                 var pb: CVPixelBuffer?
                 if let pool = adaptor.pixelBufferPool {
                     CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pb)
@@ -538,18 +568,7 @@ public enum VideoQualityTarget {
                     CVPixelBufferCreate(nil, outWidth, outHeight, kCVPixelFormatType_32BGRA, nil, &pb)
                 }
                 guard let pb else { continue }
-                CVPixelBufferLockBaseAddress(pb, [])
-                if let base = CVPixelBufferGetBaseAddress(pb) {
-                    let ctx = CGContext(data: base, width: outWidth, height: outHeight,
-                                        bitsPerComponent: 8,
-                                        bytesPerRow: CVPixelBufferGetBytesPerRow(pb),
-                                        space: sRGB,
-                                        bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
-                                            | CGBitmapInfo.byteOrder32Little.rawValue)
-                    ctx?.interpolationQuality = .high
-                    ctx?.draw(cgFull, in: CGRect(x: 0, y: 0, width: outWidth, height: outHeight))
-                }
-                CVPixelBufferUnlockBaseAddress(pb, [])
+                scaleFrame(src, into: pb)
                 if !adaptor.append(pb, withPresentationTime: CMSampleBufferGetPresentationTimeStamp(s)) {
                     FileHandle.standardError.write(Data("vqt: mezzanine append failed: \(String(describing: writer.error))\n".utf8))
                     videoIn.markAsFinished(); group.leave(); return
@@ -592,7 +611,8 @@ public enum VideoQualityTarget {
                               codec: AVVideoCodecType = .hevc,
                               webSafeAudio: Bool = false,
                               maxQP: Int? = nil, minQP: Int? = nil,
-                              lookAhead: Int? = nil) async throws {
+                              lookAhead: Int? = nil,
+                              normalizeAudioAboveBPS: Int? = nil) async throws {
         let asset = AVURLAsset(url: input)
         guard let vtrack = try await asset.loadTracks(withMediaType: .video).first else {
             throw EncodeError.noVideoTrack
@@ -604,11 +624,25 @@ public enum VideoQualityTarget {
         let atrack = try await asset.loadTracks(withMediaType: .audio).first
         // Passthrough audio needs the source format up front, else the writer can't add the input.
         let audioFormat = try await atrack?.load(.formatDescriptions).first
-        // AAC (and no audio) is already web-safe → passthrough even under `webSafeAudio`; anything
-        // else is decoded to PCM by the reader and AAC-encoded by the writer.
+        // AAC (and no audio) is already web-safe → passthrough under `webSafeAudio`; anything else
+        // is decoded to PCM by the reader and AAC-encoded by the writer. `normalizeAudioAboveBPS`
+        // adds the Vimeo-parity audio rung: AAC whose measured rate exceeds the per-channel
+        // threshold is re-encoded down to ~96k/ch too — a deliberate generation loss taken only
+        // when the byte win is real (a 317k master → ~190k; at-or-below-web-rate AAC still
+        // passthroughs untouched).
         let audioSubtype = audioFormat.map { CMFormatDescriptionGetMediaSubType($0) }
+        var normalizeAAC = false
+        if let normalizeAudioAboveBPS, webSafeAudio, let atrack,
+           audioSubtype == kAudioFormatMPEG4AAC {
+            let rate = Double((try? await atrack.load(.estimatedDataRate)) ?? 0)
+            let asbd = audioFormat.flatMap {
+                CMAudioFormatDescriptionGetStreamBasicDescription($0)?.pointee
+            }
+            let channels = max(1, Int(asbd?.mChannelsPerFrame ?? 2))
+            normalizeAAC = rate > Double(normalizeAudioAboveBPS * channels)
+        }
         let transcodeAudioToAAC = webSafeAudio && atrack != nil
-            && audioSubtype != kAudioFormatMPEG4AAC
+            && (audioSubtype != kAudioFormatMPEG4AAC || normalizeAAC)
         // Preserve the source's colour tags; default to BT.709 when untagged. Decoding to BGRA drops
         // the matrix, so an untagged re-encode can get misread as 601 → saturated brand colours drift
         // while white stays put (the signage-playbook colour-fidelity gate). Pin primaries/transfer/matrix.

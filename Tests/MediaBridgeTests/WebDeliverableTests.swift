@@ -96,6 +96,67 @@ final class WebDeliverableTests: XCTestCase {
         XCTAssertEqual(srcAudio, outAudio, "AAC audio must passthrough byte-identical, never re-encode")
     }
 
+    /// The audio-normalize rung: AAC ABOVE the profile's per-channel threshold (mono fixture at
+    /// 256 kbps vs the 112 kbps/ch gate) must be re-encoded down — output audio meaningfully
+    /// smaller, still AAC — while the companion passthrough test above pins that at-or-below-rate
+    /// AAC stays byte-identical. Threshold-gated generation loss: taken only when the win is real.
+    func testWebProfileNormalizesHighBitrateAAC() async throws {
+        let tmp = FileManager.default.temporaryDirectory
+        let src = tmp.appendingPathComponent("web-hiaac-src-\(UUID().uuidString).mp4")
+        let out = tmp.appendingPathComponent("web-hiaac-out-\(UUID().uuidString).mp4")
+        defer { [src, out].forEach { try? FileManager.default.removeItem(at: $0) } }
+        try makeClip(at: src, w: 320, h: 240, frames: 30,
+                     videoCodec: .hevc, audioFormatID: kAudioFormatMPEG4AAC,
+                     audioBitRate: 256_000)
+
+        let r = try await VideoQualityTarget.encode(input: src, output: out, targetScore: 70,
+                                                    iterations: 3, profile: .webH264)
+        XCTAssertTrue(r.delivered)
+        let srcAudio = try await audioSampleBytes(src)
+        let outAudio = try await audioSampleBytes(out)
+        XCTAssertGreaterThan(srcAudio, 0)
+        XCTAssertLessThan(outAudio, Int(Double(srcAudio) * 0.6),
+                          "256k mono AAC must normalize to ~96k (got \(outAudio) of \(srcAudio))")
+        let atracks = try await AVURLAsset(url: out).loadTracks(withMediaType: .audio)
+        let afmts = try await XCTUnwrap(atracks.first).load(.formatDescriptions)
+        XCTAssertEqual(CMFormatDescriptionGetMediaSubType(try XCTUnwrap(afmts.first)),
+                       kAudioFormatMPEG4AAC, "normalized audio stays AAC")
+        // Content survives the re-encode: the fixture's sine must still be audible in the output.
+        // "Smaller and still AAC" alone would pass a path that silences everything — a real IBM
+        // master's silent 317k track normalizing to ~2k looked exactly like that failure until the
+        // source itself measured silent (2026-08-09); this pins the distinction forever.
+        let amp = try await audioMeanAbsAmplitude(out)
+        XCTAssertGreaterThan(amp, 0.05, "normalized audio must still carry the tone (got \(amp))")
+    }
+
+    /// Mean |sample| of the first audio track decoded to 16-bit PCM, normalized to [0, 1].
+    /// A pure sine of amplitude a measures ≈ 0.64a; silence ≈ 0.
+    private func audioMeanAbsAmplitude(_ url: URL) async throws -> Double {
+        let asset = AVURLAsset(url: url)
+        guard let track = try await asset.loadTracks(withMediaType: .audio).first else { return 0 }
+        let reader = try AVAssetReader(asset: asset)
+        let out = AVAssetReaderTrackOutput(track: track, outputSettings: [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsNonInterleaved: false,
+        ])
+        reader.add(out)
+        guard reader.startReading() else { return 0 }
+        var sum = 0.0, count = 0
+        while let s = out.copyNextSampleBuffer() {
+            guard let block = CMSampleBufferGetDataBuffer(s) else { continue }
+            var length = 0
+            var pointer: UnsafeMutablePointer<CChar>?
+            CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil,
+                                        totalLengthOut: &length, dataPointerOut: &pointer)
+            guard let pointer else { continue }
+            pointer.withMemoryRebound(to: Int16.self, capacity: length / 2) { p in
+                for i in 0..<(length / 2) { sum += Double(abs(Int32(p[i]))); count += 1 }
+            }
+        }
+        return count > 0 ? sum / (Double(count) * 32768.0) : 0
+    }
+
     /// A floor the content genuinely cannot reach (pure noise at a thin ceiling, floor 90) must
     /// still deliver under the web profile — best-effort ceiling encode, `metTarget == false` told
     /// honestly — while the native profile keeps the historical no-file miss. A conversion's caller
@@ -191,7 +252,7 @@ final class WebDeliverableTests: XCTestCase {
     /// frames to LCG noise — the deliberately floor-unreachable fixture for best-effort tests.
     private func makeClip(at url: URL, w: Int, h: Int, frames: Int,
                           videoCodec: AVVideoCodecType, audioFormatID: AudioFormatID?,
-                          noise: Bool = false) throws {
+                          noise: Bool = false, audioBitRate: Int? = nil) throws {
         let fps = 30
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
         // Pin a real source bitrate: a default-quality gradient lands ≈0.1 Mbps, and 2× of that is
@@ -212,6 +273,7 @@ final class WebDeliverableTests: XCTestCase {
             if audioFormatID == kAudioFormatAppleLossless {
                 settings[AVEncoderBitDepthHintKey] = 16     // required for ALAC writer inputs
             }
+            if let audioBitRate { settings[AVEncoderBitRateKey] = audioBitRate }
             let a = AVAssetWriterInput(mediaType: .audio, outputSettings: settings)
             a.expectsMediaDataInRealTime = false
             writer.add(a)
