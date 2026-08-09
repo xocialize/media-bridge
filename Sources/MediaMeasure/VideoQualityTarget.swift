@@ -74,11 +74,20 @@ public enum VideoQualityTarget {
         /// rides only on the post-search **corridor squeeze**: one candidate below the winner's rate,
         /// adopted only if it still clears the floor and is strictly smaller. nil = no squeeze.
         public let minAllowedQP: Int?
+        /// `kVTCompressionPropertyKey_SuggestedLookAheadFrameCount` (macOS 15+; skipped on 14 —
+        /// the key predates our floor). The hw encoder's DEFAULT IS ZERO lookahead: no
+        /// scene-adaptive keyframes, no statistics-driven allocation. 16 frames measured on Sevilla
+        /// 3240×1920 @ 4.2 Mbps: mean 87.2 → 89.0, p10 80.2 → 81.8 at a slightly SMALLER file; on
+        /// flat text it collapsed the size-at-quality gap ~3.5× (2026-08-09) — the biggest
+        /// quality-per-byte knob after the 4:2:0 decode fix. Encode wall-time ~doubles; the right
+        /// trade for an offline optimizer. Incompatible with VT multipass and Quality-mode CQP.
+        public let lookAheadFrames: Int?
 
         public init(codec: AVVideoCodecType, webSafeAudio: Bool,
                     ceilingScale: Double, requireSmaller: Bool,
                     bestEffortOnFloorMiss: Bool = false,
-                    maxAllowedQP: Int? = nil, minAllowedQP: Int? = nil) {
+                    maxAllowedQP: Int? = nil, minAllowedQP: Int? = nil,
+                    lookAheadFrames: Int? = nil) {
             self.codec = codec
             self.webSafeAudio = webSafeAudio
             self.ceilingScale = ceilingScale
@@ -86,6 +95,7 @@ public enum VideoQualityTarget {
             self.bestEffortOnFloorMiss = bestEffortOnFloorMiss
             self.maxAllowedQP = maxAllowedQP
             self.minAllowedQP = minAllowedQP
+            self.lookAheadFrames = lookAheadFrames
         }
 
         /// The native deliverable — exactly the historical `encode` behavior.
@@ -93,12 +103,14 @@ public enum VideoQualityTarget {
                                                ceilingScale: 1.0, requireSmaller: true)
         /// The universal web deliverable for a source that is not already web-native: a conversion
         /// always delivers — larger is fine, and a floor miss falls back to the ceiling encode.
-        /// QP corridor (20,34) is H.264-tuned (Vimeo-parity work, 2026-08-09); HEVC's QP scale maps
-        /// differently and keeps encoder defaults until measured on its own.
+        /// QP clamp 34 + squeeze min 20 + lookahead 16 are H.264-tuned (Vimeo-parity work,
+        /// 2026-08-09); HEVC's QP scale maps differently and keeps encoder defaults until measured
+        /// on its own.
         public static let webH264 = EncodeProfile(codec: .h264, webSafeAudio: true,
                                                   ceilingScale: 2.0, requireSmaller: false,
                                                   bestEffortOnFloorMiss: true,
-                                                  maxAllowedQP: 34, minAllowedQP: 20)
+                                                  maxAllowedQP: 34, minAllowedQP: 20,
+                                                  lookAheadFrames: 16)
 
         /// Receipt/log label for the codec ("HEVC" / "H.264"; falls back to the fourCC).
         public var codecLabel: String {
@@ -215,7 +227,8 @@ public enum VideoQualityTarget {
             temps.append(ref)
             let tRef = DispatchTime.now()
             try await reencodeVideo(input: input, output: ref, bitrate: Int(ceiling),
-                                    outWidth: outW, outHeight: outH, codec: profile.codec)
+                                    outWidth: outW, outHeight: outH, codec: profile.codec,
+                                    lookAhead: profile.lookAheadFrames)
             profTranscodeMs += MediaProfile.ms(since: tRef)
             scoreRef = ref
         } else {
@@ -247,7 +260,8 @@ public enum VideoQualityTarget {
             try await reencodeVideo(input: input, output: tmp, bitrate: Int(b),
                                     outWidth: outW, outHeight: outH,
                                     codec: profile.codec, webSafeAudio: profile.webSafeAudio,
-                                    maxQP: profile.maxAllowedQP, minQP: minQP)
+                                    maxQP: profile.maxAllowedQP, minQP: minQP,
+                                    lookAhead: profile.lookAheadFrames)
             let encMs = MediaProfile.ms(since: tEnc); profTranscodeMs += encMs
             let tSc = DispatchTime.now()
             let scored = try await scoreOf(tmp)
@@ -293,17 +307,23 @@ public enum VideoQualityTarget {
         // search itself. Adopt only a candidate that still clears the floor AND is strictly smaller;
         // any other outcome keeps the incumbent. (Nominal targets overshoot what ABR actually
         // emits, so the probe anchors on emitted bytes, not the nominal search bitrate.)
-        if let squeezeMinQP = profile.minAllowedQP, let current = best {
-            let curBytes = (try? current.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-            let actualRate = duration > 0 ? Double(curBytes) * 8 / duration : 0
-            if actualRate > 0 {
+        // Up to 3 steps: the binary search's landing is jittery (p10 over ~13 sampled frames flips
+        // near the gate, pinning `lo` above the true clearing point — Ferrari landed 15.8 Mbps
+        // where ~11.5 clears), and each adopted step re-anchors on the new winner's emitted rate,
+        // so the walk-down follows actual bytes, not nominal fiction. Stops the first time a
+        // candidate fails the floor or fails to shrink.
+        if let squeezeMinQP = profile.minAllowedQP {
+            for _ in 0..<3 {
+                guard let current = best else { break }
+                let curBytes = (try? current.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                let actualRate = duration > 0 ? Double(curBytes) * 8 / duration : 0
+                guard actualRate > 0 else { break }
                 MediaProfile.log(String(format: "corridor squeeze: winner emitted %.2f Mbps — probing %.2f with QP ≥ %d",
                                         actualRate / 1e6, actualRate * 0.92 / 1e6, squeezeMinQP))
-                if try await searchStep(actualRate * 0.92, "squeeze", minQP: squeezeMinQP),
-                   let nb = best, nb.url != current.url {
-                    let nbBytes = (try? nb.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-                    if nbBytes >= curBytes { best = current }   // not smaller → keep the incumbent
-                }
+                guard try await searchStep(actualRate * 0.92, "squeeze", minQP: squeezeMinQP),
+                      let nb = best, nb.url != current.url else { break }
+                let nbBytes = (try? nb.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                if nbBytes >= curBytes { best = current; break }   // not smaller → keep the incumbent
             }
         }
 
@@ -316,7 +336,8 @@ public enum VideoQualityTarget {
             try await reencodeVideo(input: input, output: tmp, bitrate: Int(hi),
                                     outWidth: outW, outHeight: outH,
                                     codec: profile.codec, webSafeAudio: profile.webSafeAudio,
-                                    maxQP: profile.maxAllowedQP)
+                                    maxQP: profile.maxAllowedQP,
+                                    lookAhead: profile.lookAheadFrames)
             chosen = (Int(hi), try await scoreOf(tmp), tmp)
         }
 
@@ -399,12 +420,14 @@ public enum VideoQualityTarget {
     /// ALAC/PCM) to AAC-LC so the mp4 plays in every browser — AAC sources still passthrough.
     /// Colour primaries/transfer/matrix are preserved from the source (BT.709 default) for brand fidelity.
     /// `outWidth`/`outHeight` (when given) scale the video via VideoToolbox — the 4K→HD downscale lever.
-    /// `maxQP`/`minQP` clamp the encoder's per-frame QP (see `EncodeProfile.maxAllowedQP`).
+    /// `maxQP`/`minQP` clamp the encoder's per-frame QP (see `EncodeProfile.maxAllowedQP`);
+    /// `lookAhead` requests encoder lookahead frames (macOS 15+, skipped on 14).
     static func reencodeVideo(input: URL, output: URL, bitrate: Int,
                               outWidth: Int? = nil, outHeight: Int? = nil,
                               codec: AVVideoCodecType = .hevc,
                               webSafeAudio: Bool = false,
-                              maxQP: Int? = nil, minQP: Int? = nil) async throws {
+                              maxQP: Int? = nil, minQP: Int? = nil,
+                              lookAhead: Int? = nil) async throws {
         let asset = AVURLAsset(url: input)
         guard let vtrack = try await asset.loadTracks(withMediaType: .video).first else {
             throw EncodeError.noVideoTrack
@@ -477,6 +500,9 @@ public enum VideoQualityTarget {
         }
         if let minQP {
             compression[kVTCompressionPropertyKey_MinAllowedFrameQP as String] = minQP
+        }
+        if let lookAhead, #available(macOS 15.0, *) {
+            compression[kVTCompressionPropertyKey_SuggestedLookAheadFrameCount as String] = lookAhead
         }
         let videoIn = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: codec,
