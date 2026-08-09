@@ -275,12 +275,21 @@ public enum VideoQualityTarget {
         // Score off the cooperative pool at .utility QoS (EMBED-004): the host drives encode from a
         // .userInitiated Task, so scoring inline would block a high-QoS thread on CoreGraphics's
         // Default-QoS rasterization → a priority inversion. Awaiting the hop suspends instead of blocking.
-        func scoreOf(_ url: URL) async throws -> VideoQualityScore {
-            try await ScoringExecutor.run {
+        func scoreOf(_ url: URL, refined: Bool = false) async throws -> VideoQualityScore {
+            let s = refined ? max(1, stride / 2) : stride
+            let cap = refined ? frameCap * 2 : frameCap
+            return try await ScoringExecutor.run {
                 try VideoQuality.videoScore(reference: scoreRef, distorted: url,
-                                            sampleStride: stride, maxFrames: frameCap)
+                                            sampleStride: s, maxFrames: cap)
             }
         }
+        // A p10 over ~13 sampled frames jitters ±1 near the gate — enough to pin the binary
+        // search's lower bound above the true clearing point (Ferrari: landed 15.8 Mbps where
+        // ~11.5 clears, +15% bytes) and to stall the squeeze walk-down. Candidates landing within
+        // this band of the floor get re-scored at 2× sampling before the verdict; only borderline
+        // iterations pay (one extra scoring pass, no extra encode). Skipped when the stride is
+        // already 1 — every frame is scored and there is nothing to refine.
+        let nearGateBand = 1.5
 
         // Max QP rides on every search candidate (it only ever lifts the tail — floor-safe, keeps
         // the search monotone). Min QP NEVER does: it caps achievable quality with a content-
@@ -298,7 +307,13 @@ public enum VideoQualityTarget {
                                     normalizeAudioAboveBPS: profile.normalizeAudioAbovePerChannelBPS)
             let encMs = MediaProfile.ms(since: tEnc); profTranscodeMs += encMs
             let tSc = DispatchTime.now()
-            let scored = try await scoreOf(tmp)
+            var scored = try await scoreOf(tmp)
+            if abs(scored.p10 - targetScore) < nearGateBand, stride > 1 {
+                let refined = try await scoreOf(tmp, refined: true)
+                MediaProfile.log(String(format: "%@: near-gate %.1f → re-scored %.1f (%d frames)",
+                                        label, scored.p10, refined.p10, refined.framesScored))
+                scored = refined
+            }
             let scMs = MediaProfile.ms(since: tSc); profScoreMs += scMs
             MediaProfile.log(String(format: "%@: %.2f Mbps · transcode %.0f ms · score %.0f ms · p10 %.1f",
                                     label, b / 1e6, encMs, scMs, scored.p10))
