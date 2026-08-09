@@ -111,6 +111,15 @@ public enum VideoQualityTarget {
                                                   bestEffortOnFloorMiss: true,
                                                   maxAllowedQP: 34, minAllowedQP: 20,
                                                   lookAheadFrames: 16)
+        /// `webH264`'s shrink-only sibling for sources that are ALREADY web-native (or have a
+        /// lossless remux as the baseline deliverable): source-bitrate ceiling, strictly smaller,
+        /// no best-effort — but the SAME encoder knobs. Hosts hand-rolling this profile is how the
+        /// web-native path silently missed the corridor + lookahead (the Vimeo-parity wiring gap,
+        /// 2026-08-09): the knobs live on the preset so they can't be forgotten at a call site.
+        public static let webH264Shrink = EncodeProfile(codec: .h264, webSafeAudio: true,
+                                                        ceilingScale: 1.0, requireSmaller: true,
+                                                        maxAllowedQP: 34, minAllowedQP: 20,
+                                                        lookAheadFrames: 16)
 
         /// Receipt/log label for the codec ("HEVC" / "H.264"; falls back to the fourCC).
         public var codecLabel: String {
