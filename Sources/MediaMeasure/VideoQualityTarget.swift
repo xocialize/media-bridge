@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import CoreMedia
+import VideoToolbox
 
 /// Video analog of `ImageQualityTarget`: re-encode a clip to the **lowest bitrate whose per-frame
 /// SSIMULACRA2 (p10) still clears the floor** → smaller file, perceptually equivalent, same resolution.
@@ -56,15 +57,35 @@ public enum VideoQualityTarget {
         /// best-effort deliverable beats no deliverable. `metTarget` still tells the truth: the
         /// receipt shows the achieved score against the floor that was asked for.
         public let bestEffortOnFloorMiss: Bool
+        /// Per-frame QP ceiling passed to VideoToolbox (`kVTCompressionPropertyKey_MaxAllowedFrameQP`).
+        /// Under ABR the encoder's own rate model sways with content — hard scenes crater while easy
+        /// scenes get polished — and a p10 gate is dominated by exactly those craters. Clamping max QP
+        /// forces bits into the hard frames at (measured) negligible size cost, so the floor search
+        /// converges to a lower bitrate. Sevilla 3240×1920 @ 6 Mbps H.264: min frame 71.9 → 81.2
+        /// SSIMULACRA2 for +1.5% bytes (2026-08-09). nil = encoder default.
+        public let maxAllowedQP: Int?
+        /// Per-frame QP floor (`kVTCompressionPropertyKey_MinAllowedFrameQP`) — the other half of the
+        /// corridor: stops ABR over-polishing easy scenes past what the perceptual floor asked for,
+        /// freeing budget the max-QP clamp redirects into the hard band. Measured at Vimeo-matched
+        /// size (33 MB) on Sevilla: corridor (20,34) beat plain maxQP at equal size (2026-08-09).
+        /// ⚠️ A min QP CAPS achievable quality, and the floor↔QP mapping is content-dependent (a
+        /// 320×240 synthetic-noise clip needs QP < 20 for floor *70*), so this is NEVER applied to
+        /// the search itself — the search stays monotone and floor-safe on max QP alone, and the min
+        /// rides only on the post-search **corridor squeeze**: one candidate below the winner's rate,
+        /// adopted only if it still clears the floor and is strictly smaller. nil = no squeeze.
+        public let minAllowedQP: Int?
 
         public init(codec: AVVideoCodecType, webSafeAudio: Bool,
                     ceilingScale: Double, requireSmaller: Bool,
-                    bestEffortOnFloorMiss: Bool = false) {
+                    bestEffortOnFloorMiss: Bool = false,
+                    maxAllowedQP: Int? = nil, minAllowedQP: Int? = nil) {
             self.codec = codec
             self.webSafeAudio = webSafeAudio
             self.ceilingScale = ceilingScale
             self.requireSmaller = requireSmaller
             self.bestEffortOnFloorMiss = bestEffortOnFloorMiss
+            self.maxAllowedQP = maxAllowedQP
+            self.minAllowedQP = minAllowedQP
         }
 
         /// The native deliverable — exactly the historical `encode` behavior.
@@ -72,9 +93,12 @@ public enum VideoQualityTarget {
                                                ceilingScale: 1.0, requireSmaller: true)
         /// The universal web deliverable for a source that is not already web-native: a conversion
         /// always delivers — larger is fine, and a floor miss falls back to the ceiling encode.
+        /// QP corridor (20,34) is H.264-tuned (Vimeo-parity work, 2026-08-09); HEVC's QP scale maps
+        /// differently and keeps encoder defaults until measured on its own.
         public static let webH264 = EncodeProfile(codec: .h264, webSafeAudio: true,
                                                   ceilingScale: 2.0, requireSmaller: false,
-                                                  bestEffortOnFloorMiss: true)
+                                                  bestEffortOnFloorMiss: true,
+                                                  maxAllowedQP: 34, minAllowedQP: 20)
 
         /// Receipt/log label for the codec ("HEVC" / "H.264"; falls back to the fourCC).
         public var codecLabel: String {
@@ -212,13 +236,18 @@ public enum VideoQualityTarget {
             }
         }
 
-        func searchStep(_ b: Double, _ label: String) async throws -> Bool {
+        // Max QP rides on every search candidate (it only ever lifts the tail — floor-safe, keeps
+        // the search monotone). Min QP NEVER does: it caps achievable quality with a content-
+        // dependent mapping, which can make a floor unreachable by construction (the BGRA-ceiling
+        // failure mode, reintroduced by policy). It applies only in the corridor squeeze below.
+        func searchStep(_ b: Double, _ label: String, minQP: Int? = nil) async throws -> Bool {
             let tmp = tmpDir.appendingPathComponent("vqt-\(UUID().uuidString).mp4")
             temps.append(tmp)
             let tEnc = DispatchTime.now()
             try await reencodeVideo(input: input, output: tmp, bitrate: Int(b),
                                     outWidth: outW, outHeight: outH,
-                                    codec: profile.codec, webSafeAudio: profile.webSafeAudio)
+                                    codec: profile.codec, webSafeAudio: profile.webSafeAudio,
+                                    maxQP: profile.maxAllowedQP, minQP: minQP)
             let encMs = MediaProfile.ms(since: tEnc); profTranscodeMs += encMs
             let tSc = DispatchTime.now()
             let scored = try await scoreOf(tmp)
@@ -257,6 +286,27 @@ public enum VideoQualityTarget {
             }
         }
 
+        // Corridor squeeze: one post-search candidate below the winner's *emitted* rate with the
+        // min-QP corridor engaged. The corridor redistributes easy-frame overspend into the hard
+        // band, clearing the same floor at a lower rate on real content (Sevilla: −10–15% bytes at
+        // equal p10) — but its floor↔QP mapping is content-dependent, so it must never gate the
+        // search itself. Adopt only a candidate that still clears the floor AND is strictly smaller;
+        // any other outcome keeps the incumbent. (Nominal targets overshoot what ABR actually
+        // emits, so the probe anchors on emitted bytes, not the nominal search bitrate.)
+        if let squeezeMinQP = profile.minAllowedQP, let current = best {
+            let curBytes = (try? current.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            let actualRate = duration > 0 ? Double(curBytes) * 8 / duration : 0
+            if actualRate > 0 {
+                MediaProfile.log(String(format: "corridor squeeze: winner emitted %.2f Mbps — probing %.2f with QP ≥ %d",
+                                        actualRate / 1e6, actualRate * 0.92 / 1e6, squeezeMinQP))
+                if try await searchStep(actualRate * 0.92, "squeeze", minQP: squeezeMinQP),
+                   let nb = best, nb.url != current.url {
+                    let nbBytes = (try? nb.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                    if nbBytes >= curBytes { best = current }   // not smaller → keep the incumbent
+                }
+            }
+        }
+
         let chosen: (bitrate: Int, score: VideoQualityScore, url: URL)
         if let best {
             chosen = best
@@ -265,7 +315,8 @@ public enum VideoQualityTarget {
             temps.append(tmp)
             try await reencodeVideo(input: input, output: tmp, bitrate: Int(hi),
                                     outWidth: outW, outHeight: outH,
-                                    codec: profile.codec, webSafeAudio: profile.webSafeAudio)
+                                    codec: profile.codec, webSafeAudio: profile.webSafeAudio,
+                                    maxQP: profile.maxAllowedQP)
             chosen = (Int(hi), try await scoreOf(tmp), tmp)
         }
 
@@ -312,22 +363,33 @@ public enum VideoQualityTarget {
     }
 
     /// Map a video format description's colour attachments to an `AVVideoColorPropertiesKey` dict,
-    /// defaulting each missing axis to BT.709 — the safe signage default (an untagged stream otherwise
-    /// gets misread as 601, drifting saturated brand colours). Preserves HDR/BT.2020 tags when present.
-    static func colorProperties(from format: CMFormatDescription?) -> [String: Any] {
+    /// defaulting missing axes by the SOURCE's geometry. Preserves HDR/BT.2020 tags when present.
+    ///
+    /// The untagged default must describe the VALUES the 4:2:0-passthrough decode hands the writer
+    /// untouched — and AVFoundation's implicit matrix is dimension-based: SD → 601/SMPTE-C, HD+ →
+    /// BT.709. A fixed 709 default therefore MISLABELS untagged SD content (measured: an untagged
+    /// 320×240 fixture through the passthrough path scored mean 46 SSIMULACRA2 vs 81 via the old
+    /// BGRA path — saturated drift with white intact, the signage playbook's matrix trap, this time
+    /// self-inflicted). Untagged HD+ still lands 709 — the brand-colour gate the playbook demands.
+    /// `width`/`height` are the SOURCE dims: a downscale doesn't change the matrix of the values.
+    static func colorProperties(from format: CMFormatDescription?,
+                                width: Int, height: Int) -> [String: Any] {
         func ext(_ key: CFString, _ fallback: String) -> String {
             guard let format,
                   let v = CMFormatDescriptionGetExtension(format, extensionKey: key) as? String
             else { return fallback }
             return v
         }
+        let sd = height < 720 && width < 1280
         return [
             AVVideoColorPrimariesKey: ext(kCMFormatDescriptionExtension_ColorPrimaries,
-                                          AVVideoColorPrimaries_ITU_R_709_2),
+                                          sd ? AVVideoColorPrimaries_SMPTE_C
+                                             : AVVideoColorPrimaries_ITU_R_709_2),
             AVVideoTransferFunctionKey: ext(kCMFormatDescriptionExtension_TransferFunction,
                                             AVVideoTransferFunction_ITU_R_709_2),
             AVVideoYCbCrMatrixKey: ext(kCMFormatDescriptionExtension_YCbCrMatrix,
-                                       AVVideoYCbCrMatrix_ITU_R_709_2),
+                                       sd ? AVVideoYCbCrMatrix_ITU_R_601_4
+                                          : AVVideoYCbCrMatrix_ITU_R_709_2),
         ]
     }
 
@@ -337,10 +399,12 @@ public enum VideoQualityTarget {
     /// ALAC/PCM) to AAC-LC so the mp4 plays in every browser — AAC sources still passthrough.
     /// Colour primaries/transfer/matrix are preserved from the source (BT.709 default) for brand fidelity.
     /// `outWidth`/`outHeight` (when given) scale the video via VideoToolbox — the 4K→HD downscale lever.
+    /// `maxQP`/`minQP` clamp the encoder's per-frame QP (see `EncodeProfile.maxAllowedQP`).
     static func reencodeVideo(input: URL, output: URL, bitrate: Int,
                               outWidth: Int? = nil, outHeight: Int? = nil,
                               codec: AVVideoCodecType = .hevc,
-                              webSafeAudio: Bool = false) async throws {
+                              webSafeAudio: Bool = false,
+                              maxQP: Int? = nil, minQP: Int? = nil) async throws {
         let asset = AVURLAsset(url: input)
         guard let vtrack = try await asset.loadTracks(withMediaType: .video).first else {
             throw EncodeError.noVideoTrack
@@ -361,12 +425,25 @@ public enum VideoQualityTarget {
         // the matrix, so an untagged re-encode can get misread as 601 → saturated brand colours drift
         // while white stays put (the signage-playbook colour-fidelity gate). Pin primaries/transfer/matrix.
         let videoFormat = try await vtrack.load(.formatDescriptions).first
-        let colorProperties = Self.colorProperties(from: videoFormat)
+        let colorProperties = Self.colorProperties(from: videoFormat,
+                                                   width: Int(abs(size.width).rounded()),
+                                                   height: Int(abs(size.height).rounded()))
 
         let reader = try AVAssetReader(asset: asset)
+        // Decode to 4:2:0 biplanar VIDEO-RANGE, NOT BGRA. The BGRA round trip — 4:2:0 → RGB chroma
+        // upsample → re-encode chroma downsample — measurably caps encode quality: Sevilla
+        // 3240×1920 H.264 @ 17.8 Mbps scored p10 76.6 SSIMULACRA2 via BGRA vs 88.2 via biplanar,
+        // and the ceiling is bitrate-independent (the search saturated at 76.8 at *source* bitrate,
+        // honest-skipping floors the encoder could actually clear — 2026-08-09, the Vimeo-parity
+        // investigation). Video-range unconditionally: the writer emits standard video-range
+        // streams, and the reader range-converts a full-range source correctly during decode —
+        // requesting the source's own full-range variant would instead hand the writer buffers
+        // whose range handling is its (unverified) problem. 10-bit sources truncate to 8 here
+        // exactly as BGRA did.
         let videoOut = AVAssetReaderTrackOutput(
             track: vtrack,
-            outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
+            outputSettings: [kCVPixelBufferPixelFormatTypeKey as String:
+                                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange])
         videoOut.alwaysCopiesSampleData = false
         reader.add(videoOut)
         var audioOut: AVAssetReaderTrackOutput?
@@ -392,6 +469,14 @@ public enum VideoQualityTarget {
         if codec == .h264 {
             compression[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel
             compression[AVVideoMaxKeyFrameIntervalDurationKey] = 4
+        }
+        // QP corridor (see EncodeProfile.maxAllowedQP/minAllowedQP). AVVideoCompressionPropertiesKey
+        // contents pass through to the VTCompressionSession, so the VT keys ride alongside the AV ones.
+        if let maxQP {
+            compression[kVTCompressionPropertyKey_MaxAllowedFrameQP as String] = maxQP
+        }
+        if let minQP {
+            compression[kVTCompressionPropertyKey_MinAllowedFrameQP as String] = minQP
         }
         let videoIn = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: codec,
