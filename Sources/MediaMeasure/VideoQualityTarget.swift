@@ -194,10 +194,11 @@ public enum VideoQualityTarget {
     /// Binary-search the target bitrate (down from the source bitrate); gate on the p10 frame so one bad
     /// frame can't pass. Smallest output whose p10 ≥ `targetScore` wins.
     ///
-    /// `maxHeight` steps the resolution down (e.g. 1080 = 4K→HD): the output is resampled to ≤ that height
-    /// (aspect preserved, even dims) and the quality floor is measured *at the target resolution* (the
-    /// reference is downscaled to match — the encode quality of the HD version, not HD-vs-4K). nil = keep
-    /// the source resolution (the same-res optimize path).
+    /// `maxHeight` steps the resolution down by CLASS (e.g. 1080 = 4K→HD): it caps the SHORT side —
+    /// a 1080×1920 portrait IS 1080p-class and stays untouched; a 2160×3840 portrait becomes
+    /// 1080×1920 (aspect preserved, even dims). The quality floor is measured *at the target
+    /// resolution* (the reference mezzanine is downscaled to match — the encode quality of the HD
+    /// version, not HD-vs-4K). nil = keep the source resolution (the same-res optimize path).
     /// `searchStride` overrides the sampling stride directly (legacy/explicit). Left nil (the default), the
     /// stride is **adaptive**: it targets `[minScoredFrames, maxScoredFrames]` frames spread across the clip,
     /// so a short clip can't collapse p10 to a noisy min-of-3. A fixed stride on a 49-frame clip scored ~3
@@ -222,10 +223,20 @@ public enum VideoQualityTarget {
         let toneMapSDR = profile.deliverSDR && Self.isHDRTransfer(sourceFormat)
 
         // Resolve the output resolution; downscale only (never upscale here — that's the SR path).
+        // `maxHeight` means the RESOLUTION CLASS — it caps the SHORT side. A 1080×1920 portrait
+        // phone clip IS 1080p-class (untouched at maxHeight 1080); a 2160×3840 portrait downscales
+        // to 1080×1920, not to a 608×1080 thumbnail (the literal-height reading, which no consumer
+        // means). Landscape behaves exactly as before (height is the short side).
         var outW = vw, outH = vh
-        if let maxHeight, vh > maxHeight {
-            outH = maxHeight - (maxHeight % 2)
-            outW = Int((Double(vw) * Double(outH) / Double(vh)).rounded()); outW -= outW % 2
+        if let maxHeight, min(vw, vh) > maxHeight {
+            let cap = maxHeight - (maxHeight % 2)
+            if vh <= vw {
+                outH = cap
+                outW = Int((Double(vw) * Double(outH) / Double(vh)).rounded()); outW -= outW % 2
+            } else {
+                outW = cap
+                outH = Int((Double(vh) * Double(outW) / Double(vw)).rounded()); outH -= outH % 2
+            }
         }
         let downscaled = (outW != vw || outH != vh)
         // Ceiling = source bitrate (file-size cap: same bitrate × same duration ⇒ ≤ source size, and at a
