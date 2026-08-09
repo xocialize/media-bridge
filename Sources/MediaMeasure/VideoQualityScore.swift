@@ -69,6 +69,66 @@ public enum VideoQuality {
         return VideoQualityScore(mean: mean, minimum: sorted[0], p10: p10, framesScored: scores.count)
     }
 
+    /// Per-frame SSIMULACRA2 with **presentation-time pairing** — for scoring across ENCODERS,
+    /// where frame-index pairing silently lies: a VFR capture against its CFR transcode drifts
+    /// progressively (an iPhone master vs its Vimeo output measured p10 −14 by index — absurd
+    /// scores from comparing different moments — while the pair is visually fine). Each sampled
+    /// reference frame pairs with the distorted frame whose PTS is nearest, single sequential
+    /// pass over both streams; samples with no distorted frame within `tolerance` seconds are
+    /// SKIPPED and counted, never scored against the wrong moment.
+    ///
+    /// Index pairing (`videoScore`) remains correct — and cheaper — for same-chain comparisons:
+    /// our own encodes preserve the source's frame sequence 1:1. Use THIS only when the two
+    /// files may disagree about time. `matchSize` as in `videoScore`.
+    public static func videoScorePTS(reference: URL, distorted: URL, sampleStride: Int = 1,
+                                     maxFrames: Int = 60, matchSize: CGSize? = nil,
+                                     tolerance: Double = 0.021) throws -> VideoQualityScore {
+        let ref = try FrameStream(reference)
+        let dist = try FrameStream(distorted)
+        let gpu = SSIMULACRA2Metal.shared
+        func score(_ r: CGImage, _ d: CGImage) throws -> Double {
+            if let gpu {
+                return try SSIMULACRA2.score(reference: r, distorted: d,
+                                             channelScalars: gpu.channelScalarsFunction)
+            }
+            return try SSIMULACRA2.score(reference: r, distorted: d)
+        }
+
+        var scores: [Double] = []
+        var skipped = 0
+        var idx = 0
+        // The distorted side advances lazily: hold the current frame and peek the next, moving
+        // forward while the next one is closer to the reference PTS (both PTS runs are monotone).
+        var dCurrent = dist.nextTimed()
+        var dNext = dist.nextTimed()
+        while scores.count < maxFrames {
+            guard let r = ref.nextTimed() else { break }
+            defer { idx += 1 }
+            guard idx % max(1, sampleStride) == 0 else { continue }
+            while let nxt = dNext, let cur = dCurrent,
+                  abs(nxt.pts - r.pts) <= abs(cur.pts - r.pts) {
+                dCurrent = nxt
+                dNext = dist.nextTimed()
+            }
+            guard let cur = dCurrent, abs(cur.pts - r.pts) <= tolerance else {
+                skipped += 1
+                continue
+            }
+            let ri = resample(r.image, to: matchSize)
+            let di = resample(cur.image, to: matchSize)
+            guard ri.width == di.width, ri.height == di.height else { throw ScoreError.dimensionMismatch }
+            scores.append(try score(ri, di))
+        }
+        guard !scores.isEmpty else { throw ScoreError.noFramesScored }
+        if skipped > 0 {
+            MediaProfile.log("  videoScorePTS: \(skipped) sample(s) had no partner within \(tolerance)s — skipped")
+        }
+        let sorted = scores.sorted()
+        let mean = scores.reduce(0, +) / Double(scores.count)
+        let p10 = sorted[Int(Double(sorted.count - 1) * 0.1)]
+        return VideoQualityScore(mean: mean, minimum: sorted[0], p10: p10, framesScored: scores.count)
+    }
+
     /// High-quality CoreGraphics resample to `size` (no-op if `size` is nil or already matches).
     static func resample(_ image: CGImage, to size: CGSize?) -> CGImage {
         guard let size else { return image }
@@ -102,6 +162,17 @@ final class FrameStream {
         output.alwaysCopiesSampleData = false
         reader.add(output)
         reader.startReading()
+    }
+
+    /// `next()` plus the frame's presentation time — the PTS-pairing scorer's currency.
+    func nextTimed() -> (image: CGImage, pts: Double)? {
+        guard let sample = output.copyNextSampleBuffer(),
+              let buffer = CMSampleBufferGetImageBuffer(sample) else { return nil }
+        let pts = CMSampleBufferGetPresentationTimeStamp(sample).seconds
+        var cg: CGImage?
+        VTCreateCGImageFromCVPixelBuffer(buffer, options: nil, imageOut: &cg)
+        guard let cg else { return nil }
+        return (cg, pts)
     }
 
     func next() -> CGImage? {
