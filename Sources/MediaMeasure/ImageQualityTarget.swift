@@ -71,6 +71,42 @@ public enum ImageQualityTarget {
         }
     }
 
+    // MARK: - JPEG (lossy web still — the photo rung)
+
+    /// Encode `image` as JPEG at the lowest quality whose decoded result scores ≥ `targetScore` —
+    /// the same floor search as `encodeHEIC`, aimed at the one lossy still format every browser
+    /// decodes. For photographic content this lands 5–10× under lossless PNG; for flat graphics
+    /// JPEG rings and inflates, which is why the caller races it against PNG and ships the smaller
+    /// deliverable that keeps its guarantee, rather than classifying up front. ⚠️ JPEG has no
+    /// alpha — callers gate transparency to PNG before reaching for this.
+    public static func encodeJPEG(_ image: CGImage, targetScore: Double,
+                                  iterations: Int = 8,
+                                  channelScalars: SSIMULACRA2.ChannelScalars? = nil) throws -> Result {
+        let search = try QualityTargetSearch.search(target: targetScore, lo: 0.1, hi: 1.0,
+                                                    iterations: iterations) { q in
+            let data = try encode(image, quality: q, type: .jpeg)
+            let decoded = try decode(data)
+            if let channelScalars {
+                return try SSIMULACRA2.score(reference: image, distorted: decoded,
+                                             channelScalars: channelScalars)
+            }
+            return try SSIMULACRA2.score(reference: image, distorted: decoded)
+        }
+        let data = try encode(image, quality: search.quality, type: .jpeg)
+        return Result(data: data, quality: search.quality, score: search.score,
+                      metTarget: search.metTarget)
+    }
+
+    /// Async entry point — off the cooperative pool at `.utility` QoS (EMBED-004), like `encodeHEIC`.
+    public static func encodeJPEG(_ image: CGImage, targetScore: Double,
+                                  iterations: Int = 8,
+                                  channelScalars: SSIMULACRA2.ChannelScalars? = nil) async throws -> Result {
+        try await ScoringExecutor.run {
+            try encodeJPEG(image, targetScore: targetScore, iterations: iterations,
+                           channelScalars: channelScalars)
+        }
+    }
+
     // MARK: - PNG (lossless web still)
 
     /// Encode `image` as PNG — the lossless, universally web-decodable still format. There is no
@@ -125,10 +161,10 @@ public enum ImageQualityTarget {
 
     // MARK: - ImageIO HEIC
 
-    static func encode(_ image: CGImage, quality: Double) throws -> Data {
+    static func encode(_ image: CGImage, quality: Double, type: UTType = .heic) throws -> Data {
         let out = NSMutableData()
         guard let dest = CGImageDestinationCreateWithData(
-            out, UTType.heic.identifier as CFString, 1, nil) else { throw EncodeError.encodeFailed }
+            out, type.identifier as CFString, 1, nil) else { throw EncodeError.encodeFailed }
         CGImageDestinationAddImage(dest, image, [
             kCGImageDestinationLossyCompressionQuality: quality,
         ] as CFDictionary)

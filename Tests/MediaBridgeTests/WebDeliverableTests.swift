@@ -46,6 +46,19 @@ final class WebDeliverableTests: XCTestCase {
         XCTAssertEqual(decoded.height, img.height)
     }
 
+    /// The lossy web-still rung: on noisy/photographic content a JPEG floor search must meet its
+    /// floor AND land well under lossless PNG (PNG cannot compress noise at all — that gap is the
+    /// entire reason the rung exists). The Kit races the two and ships the smaller guarantee-keeper.
+    func testEncodeJPEGMeetsFloorAndUndercutsPNGOnNoisyContent() throws {
+        let img = makeImage(256)
+        let jpeg = try ImageQualityTarget.encodeJPEG(img, targetScore: 80)
+        XCTAssertTrue(jpeg.metTarget, "floor 80 must be reachable (got \(jpeg.score))")
+        XCTAssertGreaterThanOrEqual(jpeg.score, 80)
+        let png = try ImageQualityTarget.encodePNG(img)
+        XCTAssertLessThan(jpeg.data.count, png.data.count,
+                          "JPEG@floor (\(jpeg.data.count) B) must undercut PNG (\(png.data.count) B) on noise")
+    }
+
     // MARK: - webH264 video profile
 
     /// HEVC + ALAC source → web profile must deliver an H.264 + AAC mp4 (both tracks re-coded).
