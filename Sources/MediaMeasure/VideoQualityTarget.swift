@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import CoreImage
 import CoreMedia
 import VideoToolbox
 
@@ -226,23 +227,35 @@ public enum VideoQualityTarget {
         let tmpDir = FileManager.default.temporaryDirectory
         var temps: [URL] = []
 
-        // Scoring reference. Same-res: the source itself. Downscale: a HIGH-quality HD render via OUR OWN
-        // pipeline — so candidates are scored at the target resolution against the same downscaler, gating
-        // the *added compression* (not HD-vs-4K, and free of the CG↔VideoToolbox resampler-delta artifact
-        // that otherwise caps the achievable score a couple points below the floor).
+        // Scoring reference AND (for a downscale) the search input. Same-res: the source itself.
+        // Downscale: a near-lossless Lanczos MEZZANINE at the target resolution — candidates encode
+        // it 1:1 and are scored against it, gating the *added compression*. The mezzanine exists
+        // because the writer's own scaler is not usable for quality work: at a NEAR-LOSSLESS
+        // 30 Mbps, writer-scaled 4K→1080 scored p10 38.6 SSIMULACRA2 on the upscale-to-source leg
+        // where a Lanczos downscale of the same frames scored 61.7 (+23 — texture frames alias
+        // and no bitrate buys them back; Vimeo's COMPRESSED 1080 rung scores 63.9 on that leg).
+        // Scaling once here also removes per-candidate scaling from the search entirely.
         let scoreRef: URL
         if downscaled {
-            let ref = tmpDir.appendingPathComponent("vqt-ref-\(UUID().uuidString).mp4")
+            let ref = tmpDir.appendingPathComponent("vqt-mezz-\(UUID().uuidString).mp4")
             temps.append(ref)
             let tRef = DispatchTime.now()
-            try await reencodeVideo(input: input, output: ref, bitrate: Int(ceiling),
-                                    outWidth: outW, outHeight: outH, codec: profile.codec,
-                                    lookAhead: profile.lookAheadFrames)
-            profTranscodeMs += MediaProfile.ms(since: tRef)
+            try await renderDownscaleMezzanine(input: input, output: ref, bitrate: Int(ceiling),
+                                               outWidth: outW, outHeight: outH,
+                                               codec: profile.codec,
+                                               lookAhead: profile.lookAheadFrames)
+            let ms = MediaProfile.ms(since: tRef)
+            profTranscodeMs += ms
+            MediaProfile.log(String(format: "lanczos mezzanine: %d×%d → %d×%d · %.0f ms",
+                                    vw, vh, outW, outH, ms))
             scoreRef = ref
         } else {
             scoreRef = input
         }
+        // Candidates re-encode the mezzanine at its own resolution — never the writer's scaler.
+        let searchInput = downscaled ? scoreRef : input
+        let candW: Int? = downscaled ? nil : outW
+        let candH: Int? = downscaled ? nil : outH
 
         var lo = ceiling * 0.04, hi = ceiling
         let initialLo = lo
@@ -266,8 +279,8 @@ public enum VideoQualityTarget {
             let tmp = tmpDir.appendingPathComponent("vqt-\(UUID().uuidString).mp4")
             temps.append(tmp)
             let tEnc = DispatchTime.now()
-            try await reencodeVideo(input: input, output: tmp, bitrate: Int(b),
-                                    outWidth: outW, outHeight: outH,
+            try await reencodeVideo(input: searchInput, output: tmp, bitrate: Int(b),
+                                    outWidth: candW, outHeight: candH,
                                     codec: profile.codec, webSafeAudio: profile.webSafeAudio,
                                     maxQP: profile.maxAllowedQP, minQP: minQP,
                                     lookAhead: profile.lookAheadFrames)
@@ -342,8 +355,8 @@ public enum VideoQualityTarget {
         } else {
             let tmp = tmpDir.appendingPathComponent("vqt-final-\(UUID().uuidString).mp4")
             temps.append(tmp)
-            try await reencodeVideo(input: input, output: tmp, bitrate: Int(hi),
-                                    outWidth: outW, outHeight: outH,
+            try await reencodeVideo(input: searchInput, output: tmp, bitrate: Int(hi),
+                                    outWidth: candW, outHeight: candH,
                                     codec: profile.codec, webSafeAudio: profile.webSafeAudio,
                                     maxQP: profile.maxAllowedQP,
                                     lookAhead: profile.lookAheadFrames)
@@ -421,6 +434,149 @@ public enum VideoQualityTarget {
                                        sd ? AVVideoYCbCrMatrix_ITU_R_601_4
                                           : AVVideoYCbCrMatrix_ITU_R_709_2),
         ]
+    }
+
+    /// Render the near-lossless downscale MEZZANINE: per-frame Lanczos (CoreImage) to the target
+    /// resolution, encoded at the (generous) ceiling bitrate, audio passthrough-muxed. This is the
+    /// scoring reference AND the search input for a downscale — the writer's own scaler aliases
+    /// texture (measured p10 38.6 vs 61.7 on the upscale-to-source leg at equal near-lossless
+    /// bitrate; see `encode`) and must never touch quality-gated pixels.
+    public static func renderDownscaleMezzanine(input: URL, output: URL, bitrate: Int,
+                                                outWidth: Int, outHeight: Int,
+                                                codec: AVVideoCodecType,
+                                                lookAhead: Int? = nil) async throws {
+        let asset = AVURLAsset(url: input)
+        guard let vtrack = try await asset.loadTracks(withMediaType: .video).first else {
+            throw EncodeError.noVideoTrack
+        }
+        let size = try await vtrack.load(.naturalSize)
+        let transform = try await vtrack.load(.preferredTransform)
+        let atrack = try await asset.loadTracks(withMediaType: .audio).first
+        let audioFormat = try await atrack?.load(.formatDescriptions).first
+        let videoFormat = try await vtrack.load(.formatDescriptions).first
+        let colorProperties = Self.colorProperties(from: videoFormat,
+                                                   width: Int(abs(size.width).rounded()),
+                                                   height: Int(abs(size.height).rounded()))
+
+        let reader = try AVAssetReader(asset: asset)
+        // BGRA decode here — the mezzanine is rendered ONCE at a near-lossless bitrate, so the RGB
+        // trip's encoder-facing cost is negligible, and the CG gamma-space path is the measured
+        // best scaler (leg p10 61.7 vs 56-58 for the CI variants tried; see git history).
+        let videoOut = AVAssetReaderTrackOutput(
+            track: vtrack,
+            outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
+        videoOut.alwaysCopiesSampleData = false
+        reader.add(videoOut)
+        var audioOut: AVAssetReaderTrackOutput?
+        if let atrack {
+            let ao = AVAssetReaderTrackOutput(track: atrack, outputSettings: nil)   // passthrough
+            ao.alwaysCopiesSampleData = false
+            if reader.canAdd(ao) { reader.add(ao); audioOut = ao }
+        }
+
+        try? FileManager.default.removeItem(at: output)
+        let writer = try AVAssetWriter(outputURL: output, fileType: .mp4)
+        var compression: [String: Any] = [AVVideoAverageBitRateKey: bitrate]
+        if codec == .h264 {
+            compression[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel
+            compression[AVVideoMaxKeyFrameIntervalDurationKey] = 4
+        }
+        if let lookAhead, #available(macOS 15.0, *) {
+            compression[kVTCompressionPropertyKey_SuggestedLookAheadFrameCount as String] = lookAhead
+        }
+        let videoIn = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: codec,
+            AVVideoWidthKey: outWidth, AVVideoHeightKey: outHeight,
+            AVVideoColorPropertiesKey: colorProperties,
+            AVVideoCompressionPropertiesKey: compression,
+        ])
+        videoIn.transform = transform
+        videoIn.expectsMediaDataInRealTime = false
+        // The adaptor must be created before startWriting.
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: videoIn,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: outWidth,
+                kCVPixelBufferHeightKey as String: outHeight,
+            ])
+        writer.add(videoIn)
+        var audioIn: AVAssetWriterInput?
+        if audioOut != nil {
+            let ai = AVAssetWriterInput(mediaType: .audio, outputSettings: nil,
+                                        sourceFormatHint: audioFormat)
+            ai.expectsMediaDataInRealTime = false
+            if writer.canAdd(ai) { writer.add(ai); audioIn = ai }
+        }
+
+        guard reader.startReading() else { throw EncodeError.readFailed }
+        guard writer.startWriting() else { throw EncodeError.encodeFailed }
+        writer.startSession(atSourceTime: .zero)
+
+        // Gamma-space CG resample per frame (interpolation .high — Lanczos-class). Measured on the
+        // upscale-to-source leg at near-lossless bitrate: CG-high p10 61.7 vs the writer's own
+        // scaler 38.6 (+23 — texture frames alias under the writer scale and no bitrate buys them
+        // back) and vs CoreImage-Lanczos variants 56-58 (linear-light and colourspace hand-offs
+        // each cost points against the gamma-space reference decode the scorer uses).
+        let sRGB = CGColorSpace(name: CGColorSpace.sRGB)!
+
+        let group = DispatchGroup()
+        group.enter()
+        videoIn.requestMediaDataWhenReady(on: DispatchQueue(label: "vqt.mezz.video")) {
+            while videoIn.isReadyForMoreMediaData {
+                guard let s = videoOut.copyNextSampleBuffer() else {
+                    videoIn.markAsFinished(); group.leave(); return
+                }
+                guard let src = CMSampleBufferGetImageBuffer(s) else { continue }
+                var cgFull: CGImage?
+                VTCreateCGImageFromCVPixelBuffer(src, options: nil, imageOut: &cgFull)
+                guard let cgFull else { continue }
+                var pb: CVPixelBuffer?
+                if let pool = adaptor.pixelBufferPool {
+                    CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pb)
+                } else {
+                    CVPixelBufferCreate(nil, outWidth, outHeight, kCVPixelFormatType_32BGRA, nil, &pb)
+                }
+                guard let pb else { continue }
+                CVPixelBufferLockBaseAddress(pb, [])
+                if let base = CVPixelBufferGetBaseAddress(pb) {
+                    let ctx = CGContext(data: base, width: outWidth, height: outHeight,
+                                        bitsPerComponent: 8,
+                                        bytesPerRow: CVPixelBufferGetBytesPerRow(pb),
+                                        space: sRGB,
+                                        bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                                            | CGBitmapInfo.byteOrder32Little.rawValue)
+                    ctx?.interpolationQuality = .high
+                    ctx?.draw(cgFull, in: CGRect(x: 0, y: 0, width: outWidth, height: outHeight))
+                }
+                CVPixelBufferUnlockBaseAddress(pb, [])
+                if !adaptor.append(pb, withPresentationTime: CMSampleBufferGetPresentationTimeStamp(s)) {
+                    FileHandle.standardError.write(Data("vqt: mezzanine append failed: \(String(describing: writer.error))\n".utf8))
+                    videoIn.markAsFinished(); group.leave(); return
+                }
+            }
+        }
+        if let audioIn, let audioOut {
+            group.enter()
+            audioIn.requestMediaDataWhenReady(on: DispatchQueue(label: "vqt.mezz.audio")) {
+                while audioIn.isReadyForMoreMediaData {
+                    if let s = audioOut.copyNextSampleBuffer() {
+                        if !audioIn.append(s) { audioIn.markAsFinished(); group.leave(); return }
+                    } else { audioIn.markAsFinished(); group.leave(); return }
+                }
+            }
+        }
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            group.notify(queue: DispatchQueue(label: "vqt.mezz.done")) { cont.resume() }
+        }
+        if reader.status == .failed {
+            writer.cancelWriting()
+            throw EncodeError.sourceAborted(reader.error)
+        }
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            writer.finishWriting { cont.resume() }
+        }
+        if writer.status == .failed { throw EncodeError.sourceAborted(writer.error) }
     }
 
     /// Transcode the video track to `codec` (HEVC default) at a target average bitrate;
