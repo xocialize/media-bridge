@@ -14,7 +14,11 @@ final class TemporalDenoiseTests: XCTestCase {
         try? FileManager.default.removeItem(at: url)
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
         let vin = AVAssetWriterInput(mediaType: .video, outputSettings: [
-            AVVideoCodecKey: AVVideoCodecType.hevc, AVVideoWidthKey: w, AVVideoHeightKey: h,
+            // H.264, deliberately NOT HEVC: the fixture codec must be ORTHOGONAL to the subject
+            // under test. Both 26A5388g "TNF stalls" and the 26A5406e one died right here — in an
+            // HEVC fixture encode (EncodeFrame hang, FB114259303) — while TNF itself was clean at
+            // every geometry probed. TNF decodes fixtures to BGRA; the codec is incidental.
+            AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: w, AVVideoHeightKey: h,
             AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: 20_000_000]])
         vin.expectsMediaDataInRealTime = false
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(
