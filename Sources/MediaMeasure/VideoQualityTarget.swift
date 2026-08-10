@@ -64,6 +64,38 @@ public enum VideoQualityTarget {
         }
     }
 
+    /// Live progress from inside the search — the structure a host needs to show more than a
+    /// spinner during a multi-minute 4K run. The search is bounded and staged, so progress is
+    /// *narratable*: a reference mezzanine (when downscaling / tone-mapping), then N candidate
+    /// passes (each an encode + a scoring pass), then optional refinement (descent extension,
+    /// corridor squeeze — `planned` grows when they engage), then the deliver/mux tail.
+    ///
+    /// `fraction` is the search's own 0…1 estimate (pass-granular, capped below 1.0 until the
+    /// tail) so every consumer agrees on the bar. The callback fires on the search's task —
+    /// hop to your actor/main thread before touching UI. Pass-level cadence (a handful of
+    /// events per pass), never per-frame — no throttling needed.
+    public struct SearchProgress: Sendable {
+        public enum Stage: Sendable {
+            /// Probe + sampling plan (fast).
+            case preparing
+            /// Rendering the near-lossless reference (downscale and/or HDR→SDR tone-map).
+            case mezzanine(toneMapSDR: Bool, downscale: Bool)
+            /// Candidate encode `index` of `planned` started at `bitrate` (bits/s).
+            /// `label` names the phase ("iter 3", "descent 1", "squeeze", "ceiling").
+            case pass(label: String, index: Int, planned: Int, bitrate: Int)
+            /// Scoring the candidate that pass `index` just encoded.
+            case scoring(label: String, index: Int, planned: Int)
+            /// Pass verdict: the candidate's p10, whether it cleared the floor, and the best
+            /// clearing candidate so far (nil until one clears) — the "best so far" UI line.
+            case passResult(label: String, p10: Double, cleared: Bool,
+                            bestBitrate: Int?, bestP10: Double?)
+            /// Deliver/mux tail (atomic rename, audio handling).
+            case finalizing
+        }
+        public let stage: Stage
+        public let fraction: Double   // 0…1 overall estimate
+    }
+
     /// What the search encodes toward. `.hevc` is the native Apple deliverable (the historical
     /// behavior and the default); `.webH264` is the universal web deliverable — H.264 + AAC in mp4,
     /// the one combination every browser decodes (HEVC-in-mp4 does not play in Chrome/Firefox).
@@ -247,7 +279,9 @@ public enum VideoQualityTarget {
     public static func encode(input: URL, output: URL, targetScore: Double, maxHeight: Int? = nil,
                               iterations: Int = 6, searchStride: Int? = nil,
                               minScoredFrames: Int = 12, maxScoredFrames: Int = 16,
-                              profile: EncodeProfile = .hevc) async throws -> Result {
+                              profile: EncodeProfile = .hevc,
+                              onProgress: (@Sendable (SearchProgress) -> Void)? = nil)
+        async throws -> Result {
         let asset = AVURLAsset(url: input)
         let duration = try await asset.load(.duration).seconds
         guard let vtrack = try await asset.loadTracks(withMediaType: .video).first else {
@@ -257,6 +291,10 @@ public enum VideoQualityTarget {
         let vw = Int(abs(vsize.width).rounded()), vh = Int(abs(vsize.height).rounded())
         let inBytes = (try? input.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         let sourceBitrate = duration > 0 ? Double(inBytes) * 8 / duration : 8_000_000
+        func emit(_ stage: SearchProgress.Stage, _ fraction: Double) {
+            onProgress?(SearchProgress(stage: stage, fraction: fraction))
+        }
+        emit(.preparing, 0.02)
         // HDR source (HLG/PQ) + an SDR-delivering profile → the mezzanine tone-maps once and the
         // whole search runs SDR-vs-SDR. Detection is by transfer tag; untagged sources are SDR.
         let sourceFormat = try await vtrack.load(.formatDescriptions).first
@@ -319,6 +357,7 @@ public enum VideoQualityTarget {
             let ref = tmpDir.appendingPathComponent("vqt-mezz-\(UUID().uuidString).mp4")
             temps.append(ref)
             let tRef = DispatchTime.now()
+            emit(.mezzanine(toneMapSDR: toneMapSDR, downscale: downscaled), 0.05)
             try await renderDownscaleMezzanine(input: input, output: ref, bitrate: Int(ceiling),
                                                outWidth: outW, outHeight: outH,
                                                codec: profile.codec,
@@ -340,6 +379,16 @@ public enum VideoQualityTarget {
         var lo = ceiling * 0.04, hi = ceiling
         let initialLo = lo
         var best: (bitrate: Int, score: VideoQualityScore, url: URL)?
+
+        // Pass accounting for `SearchProgress.fraction`: the base plan is the binary-search
+        // iterations; descent/squeeze/ceiling passes grow `plannedPasses` as they engage, so the
+        // bar re-paces instead of pinning at the cap. Passes span 0.10…0.92 of the fraction.
+        var passesDone = 0
+        var plannedPasses = iterations
+        func passFraction(_ sub: Double) -> Double {
+            let denom = Double(max(plannedPasses, passesDone + 1))
+            return min(0.92, 0.10 + 0.82 * (Double(passesDone) + sub) / denom)
+        }
 
         // Score off the cooperative pool at .utility QoS (EMBED-004): the host drives encode from a
         // .userInitiated Task, so scoring inline would block a high-QoS thread on CoreGraphics's
@@ -367,6 +416,10 @@ public enum VideoQualityTarget {
         func searchStep(_ b: Double, _ label: String, minQP: Int? = nil) async throws -> Bool {
             let tmp = tmpDir.appendingPathComponent("vqt-\(UUID().uuidString).mp4")
             temps.append(tmp)
+            let passIndex = passesDone + 1
+            if passIndex > plannedPasses { plannedPasses = passIndex }
+            emit(.pass(label: label, index: passIndex, planned: plannedPasses, bitrate: Int(b)),
+                 passFraction(0.05))
             let tEnc = DispatchTime.now()
             try await reencodeVideo(input: searchInput, output: tmp, bitrate: Int(b),
                                     outWidth: candW, outHeight: candH,
@@ -375,6 +428,8 @@ public enum VideoQualityTarget {
                                     lookAhead: profile.lookAheadFrames,
                                     normalizeAudioAboveBPS: profile.normalizeAudioAbovePerChannelBPS)
             let encMs = MediaProfile.ms(since: tEnc); profTranscodeMs += encMs
+            emit(.scoring(label: label, index: passIndex, planned: plannedPasses),
+                 passFraction(0.6))
             let tSc = DispatchTime.now()
             var scored = try await scoreOf(tmp)
             if abs(scored.p10 - targetScore) < nearGateBand, stride > 1 {
@@ -386,8 +441,13 @@ public enum VideoQualityTarget {
             let scMs = MediaProfile.ms(since: tSc); profScoreMs += scMs
             MediaProfile.log(String(format: "%@: %.2f Mbps · transcode %.0f ms · score %.0f ms · p10 %.1f",
                                     label, b / 1e6, encMs, scMs, scored.p10))
-            if scored.p10 >= targetScore { best = (Int(b), scored, tmp); return true }
-            return false
+            let cleared = scored.p10 >= targetScore
+            if cleared { best = (Int(b), scored, tmp) }
+            emit(.passResult(label: label, p10: scored.p10, cleared: cleared,
+                             bestBitrate: best?.bitrate, bestP10: best?.score.p10),
+                 passFraction(1.0))
+            passesDone += 1
+            return cleared
         }
 
         for i in 0..<iterations {
@@ -406,6 +466,7 @@ public enum VideoQualityTarget {
         // pushed back, so typical content pays nothing.
         if lo == initialLo, let current = best {
             MediaProfile.log("descent: no candidate failed the floor — extending the search down")
+            plannedPasses += iterations   // re-pace the progress bar for the extension
             var lo2 = Double(current.bitrate) * 0.02
             var hi2 = Double(current.bitrate)
             for i in 0..<iterations {
@@ -451,6 +512,9 @@ public enum VideoQualityTarget {
         } else {
             let tmp = tmpDir.appendingPathComponent("vqt-final-\(UUID().uuidString).mp4")
             temps.append(tmp)
+            plannedPasses += 1
+            emit(.pass(label: "ceiling", index: passesDone + 1, planned: plannedPasses,
+                       bitrate: Int(hi)), passFraction(0.05))
             try await reencodeVideo(input: searchInput, output: tmp, bitrate: Int(hi),
                                     outWidth: candW, outHeight: candH,
                                     codec: profile.codec, webSafeAudio: profile.webSafeAudio,
@@ -465,6 +529,7 @@ public enum VideoQualityTarget {
         // at all; a non-atomic copy could leave a partial file if the source invalidates mid-copy). On a
         // miss, leave NO file at `output` — never orphan a best-effort encode. (Fixes EMBED-003 skip-orphan
         // + EMBED-005 partial-write-on-failure.)
+        emit(.finalizing, 0.95)
         let outBytes = (try? chosen.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         // A format *conversion* (web profile) delivers even when larger — the size gate is the
         // profile's call. A floor miss delivers the ceiling encode when the profile says best-effort
