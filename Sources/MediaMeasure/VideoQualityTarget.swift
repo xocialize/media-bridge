@@ -9,6 +9,32 @@ import VideoToolbox
 /// The lever is target *bitrate* (not constant-quality, which inflates an already-compressed source).
 /// The codec + delivery rule come from `EncodeProfile` — `.hevc` (native deliverable, the default) or
 /// `.webH264` (universal web mp4: H.264 + AAC audio). Per-frame scoring is GPU-accelerated.
+/// Durable VideoToolbox breadcrumbs, env-gated (`MEDIABRIDGE_VT_LOG=/path`). One fsync'd line
+/// BEFORE each hardware encode starts and one on completion — after a machine-level wedge (the
+/// 2026-08-09 HEVC-lookahead freezes took the whole UI down and left NO in-memory evidence), the
+/// last START without a matching END names the operation that was in flight. Open-write-sync-close
+/// per event: raceless, and the fsync survives a hard lock. Off (zero cost) unless the env var is
+/// set — a library shouldn't write files as a silent side effect.
+enum VTBreadcrumb {
+    static let path: String? = ProcessInfo.processInfo.environment["MEDIABRIDGE_VT_LOG"]
+
+    static func log(_ line: String) {
+        guard let path else { return }
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        let data = Data("\(stamp) [\(ProcessInfo.processInfo.processIdentifier)] \(line)\n".utf8)
+        if !FileManager.default.fileExists(atPath: path) {
+            FileManager.default.createFile(atPath: path, contents: nil)
+        }
+        guard let fh = FileHandle(forWritingAtPath: path) else { return }
+        defer { try? fh.close() }
+        do {
+            try fh.seekToEnd()
+            try fh.write(contentsOf: data)
+            try fh.synchronize()          // the durability guarantee — survive a hard lock
+        } catch {}
+    }
+}
+
 public enum VideoQualityTarget {
 
     /// How a clip's per-frame scores were reduced to the one number the floor was tested against.
@@ -118,9 +144,23 @@ public enum VideoQualityTarget {
             self.deliverSDR = deliverSDR
         }
 
-        /// The native deliverable — exactly the historical `encode` behavior.
+        /// The native deliverable. Encoder knobs measured on their own HEVC probe (2026-08-09,
+        /// Sevilla 3240×1920 @ 3 Mbps, per-frame p10 SSIMULACRA2): a 4 s keyframe cadence the
+        /// HEVC path never set = **+1.8 p10 / +6.7 min-frame free** over the encoder default;
+        /// max-QP 38 flat across 34–38 (+1.4 p10 tail insurance); squeeze min 18 (min 22
+        /// measured HARMFUL on HEVC — its QP scale is not H.264's).
+        ///
+        /// ⚠️ **No `lookAheadFrames` on HEVC — deliberately.** It measured +1.6 p10, but the two
+        /// suite runs gating it were the only two runs (of ~10 that day) that WEDGED the machine's
+        /// media engine — VT XPC services in uninterruptible kernel sleep, then a system-wide UI
+        /// hard lock (macOS 27.0 beta; this machine also has documented hw-VT stall prior art in
+        /// NativeMP4Writer). HEVC+lookahead was never validated by the VT capability probes (they
+        /// ran on the H.264 session). Re-admit only behind a stability probe on a machine someone
+        /// is prepared to reboot; the H.264 profiles keep lookahead — no freeze was ever observed
+        /// on the H.264 session.
         public static let hevc = EncodeProfile(codec: .hevc, webSafeAudio: false,
-                                               ceilingScale: 1.0, requireSmaller: true)
+                                               ceilingScale: 1.0, requireSmaller: true,
+                                               maxAllowedQP: 38, minAllowedQP: 18)
         /// The universal web deliverable for a source that is not already web-native: a conversion
         /// always delivers — larger is fine, and a floor miss falls back to the ceiling encode.
         /// QP clamp 34 + squeeze min 20 + lookahead 16 are H.264-tuned (Vimeo-parity work,
@@ -532,6 +572,10 @@ public enum VideoQualityTarget {
                                    width: Int(abs(size.width).rounded()),
                                    height: Int(abs(size.height).rounded()))
 
+        VTBreadcrumb.log("MEZZ-START codec=\(codec == .hevc ? "hevc" : "h264") \(outWidth)×\(outHeight) "
+            + "br=\(bitrate) la=\(lookAhead.map(String.init) ?? "-") sdr=\(toneMapSDR) src=\(input.lastPathComponent)")
+        defer { VTBreadcrumb.log("MEZZ-END src=\(input.lastPathComponent)") }
+
         let reader = try AVAssetReader(asset: asset)
         // BGRA decode for SDR sources (the mezzanine renders ONCE at near-lossless bitrate, so the
         // RGB trip's encoder-facing cost is negligible). HDR sources decode 10-bit biplanar so the
@@ -556,8 +600,11 @@ public enum VideoQualityTarget {
         var compression: [String: Any] = [AVVideoAverageBitRateKey: bitrate]
         if codec == .h264 {
             compression[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel
-            compression[AVVideoMaxKeyFrameIntervalDurationKey] = 4
         }
+        // 4 s keyframe cadence for BOTH codecs. H.264 measured 2026-08-08 (+4.5 p10, −3.2% bytes
+        // vs default); HEVC measured 2026-08-09 (+1.8 p10, +6.7 min-frame — the key had simply
+        // never been set on the HEVC path, an accidental gap the probe converted into a free win).
+        compression[AVVideoMaxKeyFrameIntervalDurationKey] = 4
         if let lookAhead, #available(macOS 15.0, *) {
             compression[kVTCompressionPropertyKey_SuggestedLookAheadFrameCount as String] = lookAhead
         }
@@ -750,6 +797,11 @@ public enum VideoQualityTarget {
                                                    width: Int(abs(size.width).rounded()),
                                                    height: Int(abs(size.height).rounded()))
 
+        VTBreadcrumb.log("ENCODE-START codec=\(codec == .hevc ? "hevc" : "h264") \(w)×\(h) "
+            + "br=\(bitrate) maxQP=\(maxQP.map(String.init) ?? "-") minQP=\(minQP.map(String.init) ?? "-") "
+            + "la=\(lookAhead.map(String.init) ?? "-") src=\(input.lastPathComponent)")
+        defer { VTBreadcrumb.log("ENCODE-END codec=\(codec == .hevc ? "hevc" : "h264") src=\(input.lastPathComponent)") }
+
         let reader = try AVAssetReader(asset: asset)
         // Decode to 4:2:0 biplanar VIDEO-RANGE, NOT BGRA. The BGRA round trip — 4:2:0 → RGB chroma
         // upsample → re-encode chroma downsample — measurably caps encode quality: Sevilla
@@ -789,8 +841,11 @@ public enum VideoQualityTarget {
         var compression: [String: Any] = [AVVideoAverageBitRateKey: bitrate]
         if codec == .h264 {
             compression[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel
-            compression[AVVideoMaxKeyFrameIntervalDurationKey] = 4
         }
+        // 4 s keyframe cadence for BOTH codecs. H.264 measured 2026-08-08 (+4.5 p10, −3.2% bytes
+        // vs default); HEVC measured 2026-08-09 (+1.8 p10, +6.7 min-frame — the key had simply
+        // never been set on the HEVC path, an accidental gap the probe converted into a free win).
+        compression[AVVideoMaxKeyFrameIntervalDurationKey] = 4
         // QP corridor (see EncodeProfile.maxAllowedQP/minAllowedQP). AVVideoCompressionPropertiesKey
         // contents pass through to the VTCompressionSession, so the VT keys ride alongside the AV ones.
         if let maxQP {
