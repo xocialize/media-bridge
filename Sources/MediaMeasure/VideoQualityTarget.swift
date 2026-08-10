@@ -280,6 +280,7 @@ public enum VideoQualityTarget {
                               iterations: Int = 6, searchStride: Int? = nil,
                               minScoredFrames: Int = 12, maxScoredFrames: Int = 16,
                               profile: EncodeProfile = .hevc,
+                              denoiseStrength: Float? = nil,
                               onProgress: (@Sendable (SearchProgress) -> Void)? = nil)
         async throws -> Result {
         let asset = AVURLAsset(url: input)
@@ -351,7 +352,7 @@ public enum VideoQualityTarget {
         // where a Lanczos downscale of the same frames scored 61.7 (+23 — texture frames alias
         // and no bitrate buys them back; Vimeo's COMPRESSED 1080 rung scores 63.9 on that leg).
         // Scaling once here also removes per-candidate scaling from the search entirely.
-        let needsMezzanine = downscaled || toneMapSDR
+        let needsMezzanine = downscaled || toneMapSDR || denoiseStrength != nil
         let scoreRef: URL
         if needsMezzanine {
             let ref = tmpDir.appendingPathComponent("vqt-mezz-\(UUID().uuidString).mp4")
@@ -362,11 +363,13 @@ public enum VideoQualityTarget {
                                                outWidth: outW, outHeight: outH,
                                                codec: profile.codec,
                                                lookAhead: profile.lookAheadFrames,
-                                               toneMapSDR: toneMapSDR)
+                                               toneMapSDR: toneMapSDR,
+                                               denoiseStrength: denoiseStrength)
             let ms = MediaProfile.ms(since: tRef)
             profTranscodeMs += ms
-            MediaProfile.log(String(format: "mezzanine: %d×%d → %d×%d%@ · %.0f ms",
-                                    vw, vh, outW, outH, toneMapSDR ? " · HDR→SDR tone-map" : "", ms))
+            MediaProfile.log(String(format: "mezzanine: %d×%d → %d×%d%@%@ · %.0f ms",
+                                    vw, vh, outW, outH, toneMapSDR ? " · HDR→SDR tone-map" : "",
+                                    denoiseStrength != nil ? " · temporal denoise" : "", ms))
             scoreRef = ref
         } else {
             scoreRef = input
@@ -603,6 +606,18 @@ public enum VideoQualityTarget {
     /// scoring reference AND the search input for a downscale — the writer's own scaler aliases
     /// texture (measured p10 38.6 vs 61.7 on the upscale-to-source leg at equal near-lossless
     /// bitrate; see `encode`) and must never touch quality-gated pixels.
+    /// Measure how much a conservative temporal denoise (VTTemporalNoiseFilter @ 0.1) would change
+    /// this clip: the NOISE PROBE behind the camera-class self-gate. Returns the mean per-frame
+    /// SSIMULACRA2 of denoised-vs-undenoised over a small sample (both sides run through the
+    /// filter's compressed-format round trip, so conversion deltas cancel), or nil when the filter
+    /// is unavailable (pre-macOS-26) or the clip can't be read. Calibration (2026-08-10, corpus):
+    /// clean production footage measures 95.9–99.5 (the filter no-ops); genuine handheld grain
+    /// measures ~65 — a ~30-point chasm. Callers gate at < 90 → camera-noisy.
+    public static func noiseProbe(input: URL, sampleFrames: Int = 30) async -> Double? {
+        guard #available(macOS 26.0, *) else { return nil }
+        return await TemporalDenoise.probe(input: input, sampleFrames: sampleFrames)
+    }
+
     /// True when the format's transfer function is HDR (HLG or PQ) — the tone-map trigger.
     static func isHDRTransfer(_ format: CMFormatDescription?) -> Bool {
         guard let format,
@@ -617,7 +632,8 @@ public enum VideoQualityTarget {
                                                 outWidth: Int, outHeight: Int,
                                                 codec: AVVideoCodecType,
                                                 lookAhead: Int? = nil,
-                                                toneMapSDR: Bool = false) async throws {
+                                                toneMapSDR: Bool = false,
+                                                denoiseStrength: Float? = nil) async throws {
         let asset = AVURLAsset(url: input)
         guard let vtrack = try await asset.loadTracks(withMediaType: .video).first else {
             throw EncodeError.noVideoTrack
@@ -638,7 +654,8 @@ public enum VideoQualityTarget {
                                    height: Int(abs(size.height).rounded()))
 
         VTBreadcrumb.log("MEZZ-START codec=\(codec == .hevc ? "hevc" : "h264") \(outWidth)×\(outHeight) "
-            + "br=\(bitrate) la=\(lookAhead.map(String.init) ?? "-") sdr=\(toneMapSDR) src=\(input.lastPathComponent)")
+            + "br=\(bitrate) la=\(lookAhead.map(String.init) ?? "-") sdr=\(toneMapSDR) "
+            + "denoise=\(denoiseStrength.map { String(format: "%.2f", $0) } ?? "-") src=\(input.lastPathComponent)")
         defer { VTBreadcrumb.log("MEZZ-END src=\(input.lastPathComponent)") }
 
         let reader = try AVAssetReader(asset: asset)
@@ -751,7 +768,76 @@ public enum VideoQualityTarget {
             }
         }
 
+        // Denoise variant: an async manual pump (the callback pump cannot await the filter).
+        // Stage order per frame: decode/tone-map → BGRA → compressed → TNF(window) → BGRA →
+        // vImage scale (if downscaling) → append. The window carries ≤1 previous + ≤2 next.
+        if let denoiseStrength, #available(macOS 26.0, *) {
+            guard let dn = TemporalDenoise.Session(width: Int(abs(size.width).rounded()),
+                                                   height: Int(abs(size.height).rounded()))
+            else { throw EncodeError.encodeFailed }
+            let srcW = Int(abs(size.width).rounded()), srcH = Int(abs(size.height).rounded())
+            let scalingNeeded = srcW != outWidth || srcH != outHeight
+            var scratch: CVPixelBuffer?
+            if scalingNeeded {
+                CVPixelBufferCreate(nil, srcW, srcH, kCVPixelFormatType_32BGRA, nil, &scratch)
+            }
+            // The HDR tone-map needs a source-res BGRA landing zone regardless of scaling.
+            var hdrIntermediate: CVPixelBuffer?
+            if transferSession != nil {
+                CVPixelBufferCreate(nil, srcW, srcH, kCVPixelFormatType_32BGRA, nil, &hdrIntermediate)
+            }
+
+            func readCompressed() -> (pts: CMTime, buf: CVPixelBuffer)? {
+                guard let s = videoOut.copyNextSampleBuffer(),
+                      let raw = CMSampleBufferGetImageBuffer(s) else { return nil }
+                let pts = CMSampleBufferGetPresentationTimeStamp(s)
+                if let session = transferSession {
+                    // HDR: tone-map to BGRA first, then into the filter's format.
+                    guard let landing = hdrIntermediate,
+                          VTPixelTransferSessionTransferImage(session, from: raw, to: landing) == noErr,
+                          let comp = dn.compressed(from: landing) else { return nil }
+                    return (pts, comp)
+                }
+                guard let comp = dn.compressed(from: raw) else { return nil }
+                return (pts, comp)
+            }
+
+            var window: [(pts: CMTime, buf: CVPixelBuffer)] = []
+            for _ in 0..<4 { if let f = readCompressed() { window.append(f) } }
+            var cursor = 0
+            while cursor < window.count {
+                let current = window[cursor]
+                let prev = cursor > 0 ? [window[cursor - 1]] : []
+                let next = Array(window.suffix(from: min(cursor + 1, window.count)).prefix(2))
+                guard let filtered = await dn.filter(current: current, previous: prev, next: next,
+                                                     strength: denoiseStrength)
+                else { throw EncodeError.encodeFailed }
+                var pb: CVPixelBuffer?
+                if let pool = adaptor.pixelBufferPool {
+                    CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pb)
+                } else {
+                    CVPixelBufferCreate(nil, outWidth, outHeight, kCVPixelFormatType_32BGRA, nil, &pb)
+                }
+                guard let pb else { throw EncodeError.encodeFailed }
+                if scalingNeeded, let scratch {
+                    guard dn.bgra(from: filtered, into: scratch) else { throw EncodeError.encodeFailed }
+                    scaleFrame(scratch, into: pb)
+                } else {
+                    guard dn.bgra(from: filtered, into: pb) else { throw EncodeError.encodeFailed }
+                }
+                while !videoIn.isReadyForMoreMediaData {
+                    try await Task.sleep(nanoseconds: 2_000_000)
+                }
+                adaptor.append(pb, withPresentationTime: current.pts)
+                if cursor >= 1 { window.removeFirst() } else { cursor += 1 }
+                if let f = readCompressed() { window.append(f) }
+            }
+            videoIn.markAsFinished()
+            // Audio still pumps below via the callback path; fall through to the shared wait.
+        }
+
         let group = DispatchGroup()
+        if denoiseStrength == nil {
         group.enter()
         videoIn.requestMediaDataWhenReady(on: DispatchQueue(label: "vqt.mezz.video")) {
             while videoIn.isReadyForMoreMediaData {
@@ -786,6 +872,7 @@ public enum VideoQualityTarget {
                 }
             }
         }
+        }   // end denoiseStrength == nil (callback video pump)
         if let audioIn, let audioOut {
             group.enter()
             audioIn.requestMediaDataWhenReady(on: DispatchQueue(label: "vqt.mezz.audio")) {
