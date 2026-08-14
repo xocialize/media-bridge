@@ -434,29 +434,129 @@ public enum VideoQualityTarget {
         // ≤1 frame (same density, equivalent estimator). Skipped when the stride is already 1.
         let nearGateBand = 1.5
 
+        // ── Speculative encode lane ──────────────────────────────────────────────────────
+        // The baseline search is perfectly serial — encode∥score overlap measured 0.000 s across
+        // every scenario (PERFORMANCE-BASELINE §4.1) — while bisection has only TWO possible next
+        // bitrates. So while a candidate scores, both possible next candidates encode ahead on
+        // the otherwise-idle hardware encoder, strictly ONE AT A TIME: a serial FIFO chain, never
+        // a second concurrent VT encode session (single-session is the pattern this OS beta has
+        // validated; the new concurrency is encode-during-decode, the ordinary AV pattern). The
+        // verdict claims the branch it needs; the other is revoked if unstarted, or drains and
+        // its temp dies with the rest. Scheduling is the ONLY thing that changes — identical
+        // `reencodeVideo` inputs produce identical bytes, so trajectories and deliverables must
+        // match the serial arm byte-for-byte (bench-gated). Kill switch for A/B and emergencies:
+        // MEDIABRIDGE_NO_SPECULATE=1 restores inline serial encodes.
+        let speculate = ProcessInfo.processInfo.environment["MEDIABRIDGE_NO_SPECULATE"] == nil
+
+        final class EncodeLane: @unchecked Sendable {
+            private let lock = NSLock()
+            private var pending: [UInt64: Task<URL?, Error>] = [:]
+            private var revoked: Set<UInt64> = []
+            private var tail: Task<Void, Never>?
+
+            /// Enqueue behind everything already queued. A `key` makes the job claimable
+            /// (speculation); `nil` is a plain serialized encode. Re-submitting a pending key
+            /// returns the existing job; a fresh submit clears any stale revocation of its key.
+            func submit(key: UInt64?, _ run: @escaping @Sendable () async throws -> URL) -> Task<URL?, Error> {
+                lock.lock(); defer { lock.unlock() }
+                if let key, let existing = pending[key] { return existing }
+                if let key { revoked.remove(key) }
+                let prev = tail
+                let job = Task<URL?, Error> {
+                    await prev?.value
+                    if let key, self.isRevoked(key) { return nil }
+                    return try await run()
+                }
+                if let key { pending[key] = job }
+                tail = Task { _ = try? await job.value }
+                return job
+            }
+            func claim(_ key: UInt64) -> Task<URL?, Error>? {
+                lock.lock(); defer { lock.unlock() }
+                return pending.removeValue(forKey: key)
+            }
+            func revoke(_ key: UInt64) {
+                lock.lock(); defer { lock.unlock() }
+                revoked.insert(key)
+                pending.removeValue(forKey: key)
+            }
+            private func isRevoked(_ key: UInt64) -> Bool {
+                lock.lock(); defer { lock.unlock() }
+                return revoked.contains(key)
+            }
+            /// Await every queued/running job (revoked ones self-skip) — no writer outlives the
+            /// search, and temp cleanup never races an in-flight encode.
+            func drain() async {
+                let t: Task<Void, Never>? = { lock.lock(); defer { lock.unlock() }; return tail }()
+                await t?.value
+            }
+        }
+        let lane = EncodeLane()
+
+        // The encode work itself, as a lane job. Captures are Sendable value types only.
+        func encodeRun(_ b: Double, minQP: Int?, to tmp: URL) -> @Sendable () async throws -> URL {
+            {
+                try await MediaMetrics.time("vqt.spec.encode", lane: "encode",
+                                            attrs: ["mbps": String(format: "%.2f", b / 1e6),
+                                                    "minQP": minQP.map(String.init) ?? ""]) {
+                    try await reencodeVideo(input: searchInput, output: tmp, bitrate: Int(b),
+                                            outWidth: candW, outHeight: candH,
+                                            codec: profile.codec, webSafeAudio: profile.webSafeAudio,
+                                            maxQP: profile.maxAllowedQP, minQP: minQP,
+                                            lookAhead: profile.lookAheadFrames,
+                                            normalizeAudioAboveBPS: profile.normalizeAudioAbovePerChannelBPS)
+                }
+                return tmp
+            }
+        }
+        /// Queue `b` for encoding if it isn't already (temps are registered here, on the search
+        /// task — never from inside a lane job, so the temps array stays single-writer).
+        func ensureQueued(_ b: Double) {
+            guard speculate else { return }
+            let tmp = tmpDir.appendingPathComponent("vqt-\(UUID().uuidString).mp4")
+            temps.append(tmp)
+            _ = lane.submit(key: b.bitPattern, encodeRun(b, minQP: nil, to: tmp))
+        }
+
         // Max QP rides on every search candidate (it only ever lifts the tail — floor-safe, keeps
         // the search monotone). Min QP NEVER does: it caps achievable quality with a content-
         // dependent mapping, which can make a floor unreachable by construction (the BGRA-ceiling
         // failure mode, reintroduced by policy). It applies only in the corridor squeeze below.
         func searchStep(_ b: Double, _ label: String, minQP: Int? = nil) async throws -> Bool {
-            let tmp = tmpDir.appendingPathComponent("vqt-\(UUID().uuidString).mp4")
-            temps.append(tmp)
             let passIndex = passesDone + 1
             if passIndex > plannedPasses { plannedPasses = passIndex }
             emit(.pass(label: label, index: passIndex, planned: plannedPasses, bitrate: Int(b)),
                  passFraction(0.05))
+            // Claim a speculative encode when one is queued for this exact bitrate; otherwise
+            // submit inline (still through the lane, serialized behind any draining job). The
+            // span's duration is the RESIDUAL wait — the pipelining win, visible per pass — and
+            // `profTranscodeMs` keeps critical-path accounting (what the wall actually paid);
+            // the true encode work rides in the lane's `vqt.spec.encode` spans.
             let tEnc = DispatchTime.now()
-            try await MediaMetrics.time("vqt.pass.encode", lane: "encode",
-                                        attrs: ["label": label,
-                                                "mbps": String(format: "%.2f", b / 1e6),
-                                                "minQP": minQP.map(String.init) ?? ""]) {
-                try await reencodeVideo(input: searchInput, output: tmp, bitrate: Int(b),
-                                        outWidth: candW, outHeight: candH,
-                                        codec: profile.codec, webSafeAudio: profile.webSafeAudio,
-                                        maxQP: profile.maxAllowedQP, minQP: minQP,
-                                        lookAhead: profile.lookAheadFrames,
-                                        normalizeAudioAboveBPS: profile.normalizeAudioAbovePerChannelBPS)
+            let claimed = minQP == nil ? lane.claim(b.bitPattern) : nil
+            let job: Task<URL?, Error>
+            if let claimed {
+                job = claimed
+            } else {
+                let fresh = tmpDir.appendingPathComponent("vqt-\(UUID().uuidString).mp4")
+                temps.append(fresh)
+                job = lane.submit(key: nil, encodeRun(b, minQP: minQP, to: fresh))
             }
+            var encoded = try await MediaMetrics.time("vqt.pass.encode", lane: "encode",
+                                                      attrs: ["label": label,
+                                                              "mbps": String(format: "%.2f", b / 1e6),
+                                                              "minQP": minQP.map(String.init) ?? "",
+                                                              "spec": claimed != nil ? "hit" : "miss"]) {
+                try await job.value
+            }
+            if encoded == nil {
+                // Unreachable by construction (a claimed job is never revoked) — but if it ever
+                // happens, pay the inline encode rather than fail the pass.
+                let fresh = tmpDir.appendingPathComponent("vqt-\(UUID().uuidString).mp4")
+                temps.append(fresh)
+                encoded = try await lane.submit(key: nil, encodeRun(b, minQP: minQP, to: fresh)).value
+            }
+            guard let tmp = encoded else { throw EncodeError.noVideoTrack }
             let encMs = MediaProfile.ms(since: tEnc); profTranscodeMs += encMs
             emit(.scoring(label: label, index: passIndex, planned: plannedPasses),
                  passFraction(0.6))
@@ -495,12 +595,25 @@ public enum VideoQualityTarget {
             return cleared
         }
 
+        // Momentum for speculation ORDER only (which branch encodes first): the search's purpose
+        // is walking down, so start assuming clears. A wrong guess costs nothing but queue order.
+        var lastCleared = true
         for i in 0..<iterations {
             let b = (lo + hi) / 2
+            let bClear = (lo + b) / 2                     // next candidate if this one clears
+            let bMiss = (b + hi) / 2                      // next candidate if this one misses
+            ensureQueued(b)                               // this pass's own encode leads the queue
+            if speculate, i + 1 < iterations {
+                for nb in (lastCleared ? [bClear, bMiss] : [bMiss, bClear]) { ensureQueued(nb) }
+            }
             if try await searchStep(b, "iter \(i + 1)") {
                 hi = b                                    // clears → try smaller (lower bitrate)
+                lastCleared = true
+                lane.revoke(bMiss.bitPattern)
             } else {
                 lo = b                                    // below floor → need more bitrate
+                lastCleared = false
+                lane.revoke(bClear.bitPattern)
             }
         }
 
@@ -516,10 +629,20 @@ public enum VideoQualityTarget {
             var hi2 = Double(current.bitrate)
             for i in 0..<iterations {
                 let b = (lo2 + hi2) / 2
+                let bClear = (lo2 + b) / 2
+                let bMiss = (b + hi2) / 2
+                ensureQueued(b)
+                if speculate, i + 1 < iterations {
+                    for nb in (lastCleared ? [bClear, bMiss] : [bMiss, bClear]) { ensureQueued(nb) }
+                }
                 if try await searchStep(b, "descent \(i + 1)") {
                     hi2 = b
+                    lastCleared = true
+                    lane.revoke(bMiss.bitPattern)
                 } else {
                     lo2 = b
+                    lastCleared = false
+                    lane.revoke(bClear.bitPattern)
                 }
             }
         }
@@ -560,15 +683,22 @@ public enum VideoQualityTarget {
             plannedPasses += 1
             emit(.pass(label: "ceiling", index: passesDone + 1, planned: plannedPasses,
                        bitrate: Int(hi)), passFraction(0.05))
-            try await MediaMetrics.time("vqt.pass.encode", lane: "encode",
-                                        attrs: ["label": "ceiling",
-                                                "mbps": String(format: "%.2f", hi / 1e6)]) {
-                try await reencodeVideo(input: searchInput, output: tmp, bitrate: Int(hi),
-                                        outWidth: candW, outHeight: candH,
-                                        codec: profile.codec, webSafeAudio: profile.webSafeAudio,
-                                        maxQP: profile.maxAllowedQP,
-                                        lookAhead: profile.lookAheadFrames,
-                                        normalizeAudioAboveBPS: profile.normalizeAudioAbovePerChannelBPS)
+            // Through the lane like every other encode — never concurrent with a draining loser.
+            _ = try await MediaMetrics.time("vqt.pass.encode", lane: "encode",
+                                            attrs: ["label": "ceiling",
+                                                    "mbps": String(format: "%.2f", hi / 1e6)]) {
+                try await lane.submit(key: nil) {
+                    try await MediaMetrics.time("vqt.spec.encode", lane: "encode",
+                                                attrs: ["mbps": String(format: "%.2f", hi / 1e6)]) {
+                        try await reencodeVideo(input: searchInput, output: tmp, bitrate: Int(hi),
+                                                outWidth: candW, outHeight: candH,
+                                                codec: profile.codec, webSafeAudio: profile.webSafeAudio,
+                                                maxQP: profile.maxAllowedQP,
+                                                lookAhead: profile.lookAheadFrames,
+                                                normalizeAudioAboveBPS: profile.normalizeAudioAbovePerChannelBPS)
+                    }
+                    return tmp
+                }.value
             }
             chosen = (Int(hi),
                       try await MediaMetrics.time("vqt.pass.score", lane: "score",
@@ -581,6 +711,8 @@ public enum VideoQualityTarget {
         // at all; a non-atomic copy could leave a partial file if the source invalidates mid-copy). On a
         // miss, leave NO file at `output` — never orphan a best-effort encode. (Fixes EMBED-003 skip-orphan
         // + EMBED-005 partial-write-on-failure.)
+        // Drain revoked/loser lane jobs before touching temps — no writer may outlive the search.
+        await lane.drain()
         emit(.finalizing, 0.95)
         let mmFinalize = MediaMetrics.begin("vqt.finalize", lane: "io")
         let outBytes = (try? chosen.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
