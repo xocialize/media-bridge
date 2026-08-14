@@ -15,6 +15,7 @@
 
 import CoreGraphics
 import Foundation
+import MediaMetrics
 
 public enum SSIMULACRA2 {
 
@@ -61,8 +62,11 @@ public enum SSIMULACRA2 {
             throw ScoreError.dimensionMismatch
         }
         guard reference.width >= 8, reference.height >= 8 else { throw ScoreError.tooSmall }
-        return try multiScale(reference: reference, distorted: distorted,
-                              kernel: gaussianKernel(sigma: 1.5), channelScalars: channelScalars)
+        return try MediaMetrics.time("ssimu2", lane: "score", detail: 1,
+                                     attrs: ["w": "\(reference.width)", "h": "\(reference.height)"]) {
+            try multiScale(reference: reference, distorted: distorted,
+                           kernel: gaussianKernel(sigma: 1.5), channelScalars: channelScalars)
+        }
     }
 
     /// Default per-channel computation: σ=1.5 blur (injectable) + SSIM/edge maps + L1/L4 reductions, on CPU.
@@ -110,8 +114,10 @@ public enum SSIMULACRA2 {
 
     private static func multiScale(reference: CGImage, distorted: CGImage,
                                    kernel: [Float], channelScalars: ChannelScalars) throws -> Double {
+        let hIngest = MediaMetrics.begin("ssimu2.ingest", lane: "cpu", detail: 2)
         var p1 = try linearRGB(from: reference)
         var p2 = try linearRGB(from: distorted)
+        MediaMetrics.end(hIngest)
         var w = reference.width, h = reference.height
         var scales: [Scale] = []
 
@@ -130,7 +136,10 @@ public enum SSIMULACRA2 {
 
             var s = Scale()
             for c in 0..<3 {
-                let r = channelScalars(x1[c], x2[c], w, h, kernel)
+                let r = MediaMetrics.time("ssimu2.channel", lane: "score", detail: 2,
+                                          attrs: ["scale": "\(scale)", "c": "\(c)"]) {
+                    channelScalars(x1[c], x2[c], w, h, kernel)
+                }
                 s.avgSsim[c * 2 + 0] = r.ssimL1
                 s.avgSsim[c * 2 + 1] = r.ssimL4
                 s.avgEdge[c * 4 + 0] = r.artifactL1

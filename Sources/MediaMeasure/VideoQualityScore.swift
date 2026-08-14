@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import VideoToolbox
 import CoreGraphics
+import MediaMetrics
 
 /// Aggregated per-frame SSIMULACRA2 of a video pair. For "perceptually equivalent" the **worst frames**
 /// matter most (a single bad frame is visible), so `minimum`/`p10` gate the quality target, not just the
@@ -28,6 +29,10 @@ public enum VideoQuality {
     /// score slightly conservative vs a same-pipeline reference (fine for a floor; calibrate on real content).
     public static func videoScore(reference: URL, distorted: URL, sampleStride: Int = 1,
                                   maxFrames: Int = 60, matchSize: CGSize? = nil) throws -> VideoQualityScore {
+        let mm = MediaMetrics.begin("videoScore", lane: "score",
+                                    attrs: ["ref": reference.lastPathComponent,
+                                            "dist": distorted.lastPathComponent,
+                                            "stride": "\(sampleStride)", "cap": "\(maxFrames)"])
         let ref = try FrameStream(reference)
         let dist = try FrameStream(distorted)
         // Use the **full-GPU per-channel path** (products + blur + map/reduce on device), the same one the
@@ -45,16 +50,23 @@ public enum VideoQuality {
         var scores: [Double] = []
         var idx = 0, decoded = 0
         var decodeMs = 0.0, ssimMs = 0.0      // frame plumbing (decode+CGImage convert) vs the SSIMULACRA2 math
+        defer {
+            MediaMetrics.end(mm, extra: ["decoded": "\(decoded)", "scored": "\(scores.count)",
+                                         "backend": gpu != nil ? "gpu" : "cpu"])
+        }
         while scores.count < maxFrames {
             let tN = DispatchTime.now()
-            guard let r0 = ref.next(), let d0 = dist.next() else { break }
+            let hD = MediaMetrics.begin("vs.decodePair", lane: "decode", detail: 1)
+            guard let r0 = ref.next(), let d0 = dist.next() else { MediaMetrics.end(hD); break }
+            MediaMetrics.end(hD)
             decodeMs += MediaProfile.ms(since: tN); decoded += 1
             if idx % max(1, sampleStride) == 0 {
-                let r = resample(r0, to: matchSize)
-                let d = resample(d0, to: matchSize)
+                let r = MediaMetrics.time("vs.resample", lane: "cpu", detail: 2) { resample(r0, to: matchSize) }
+                let d = MediaMetrics.time("vs.resample", lane: "cpu", detail: 2) { resample(d0, to: matchSize) }
                 guard r.width == d.width, r.height == d.height else { throw ScoreError.dimensionMismatch }
                 let tS = DispatchTime.now()
-                scores.append(try score(r, d))
+                scores.append(try MediaMetrics.time("vs.ssimu2", lane: "score", detail: 1,
+                                                    attrs: ["frame": "\(idx)"]) { try score(r, d) })
                 ssimMs += MediaProfile.ms(since: tS)
             }
             idx += 1

@@ -1,6 +1,7 @@
 import Foundation
 import Metal
 import CoreGraphics
+import MediaMetrics
 
 /// GPU backend for SSIMULACRA2's hot path. **V1 mirrors the pure-Swift `SSIMULACRA2` pipeline exactly**
 /// (FIR σ=1.5 Gaussian, same constants) — a drop-in faster backend that *agrees with the CPU scores*, so
@@ -22,6 +23,8 @@ public final class SSIMULACRA2Metal {
     private static let tgSize = 256   // map-reduce threadgroup (power of 2)
 
     public init?() {
+        let hCompile = MediaMetrics.begin("metal.compile", lane: "gpu")
+        defer { MediaMetrics.end(hCompile) }
         guard let device = MTLCreateSystemDefaultDevice(),
               let queue = device.makeCommandQueue(),
               let lib = try? device.makeLibrary(source: Self.kernelSource, options: nil),
@@ -42,8 +45,11 @@ public final class SSIMULACRA2Metal {
         self.mapReducePipe = pmr
     }
 
-    /// Shared instance — kernels compile once. `nil` when no Metal device is available (→ CPU fallback).
-    public static let shared = SSIMULACRA2Metal()
+    /// Shared instance — kernels compile once. `nil` when no Metal device is available (→ CPU
+    /// fallback), or when **`MEDIAMEASURE_NO_METAL`** is set — the measurement kill switch that
+    /// forces the pure-Swift path so CPU-vs-GPU scoring can be A/B'd on identical inputs.
+    public static let shared: SSIMULACRA2Metal? =
+        ProcessInfo.processInfo.environment["MEDIAMEASURE_NO_METAL"] != nil ? nil : SSIMULACRA2Metal()
 
     /// Pinpoints WHERE GPU setup fails (device vs command-queue vs runtime shader compile vs pipeline) — so a
     /// host can tell a missing device (fixable by injecting one) from a `makeLibrary(source:)` failure (needs
@@ -52,6 +58,9 @@ public final class SSIMULACRA2Metal {
 
     /// Computed once (each run recompiles the Metal library — don't pay that per call).
     private static let cachedDiagnostics: String = {
+        if ProcessInfo.processInfo.environment["MEDIAMEASURE_NO_METAL"] != nil {
+            return "OFF: MEDIAMEASURE_NO_METAL set — CPU path forced"
+        }
         guard let device = MTLCreateSystemDefaultDevice() else {
             return "FAIL: no Metal device (MTLCreateSystemDefaultDevice == nil)"
         }
@@ -114,6 +123,9 @@ public final class SSIMULACRA2Metal {
 
     public func channelScalars(_ i1: [Float], _ i2: [Float], width w: Int, height h: Int,
                                kernel: [Float]) -> SSIMULACRA2.ChannelResult {
+        let hGPU = MediaMetrics.begin("ssimu2.gpu", lane: "gpu", detail: 2,
+                                      attrs: ["w": "\(w)", "h": "\(h)"])
+        defer { MediaMetrics.end(hGPU) }
         let n = w * h
         let fs = MemoryLayout<Float>.stride
         func buf(_ count: Int) -> MTLBuffer { device.makeBuffer(length: count * fs, options: .storageModeShared)! }
@@ -155,8 +167,10 @@ public final class SSIMULACRA2Metal {
                                 threadsPerThreadgroup: MTLSize(width: Self.tgSize, height: 1, depth: 1))
         me.endEncoding()
 
+        let hWait = MediaMetrics.begin("ssimu2.gpu.wait", lane: "gpu", detail: 2)
         cb.commit()
         cb.waitUntilCompleted()
+        MediaMetrics.end(hWait)
 
         let pp = partials.contents().bindMemory(to: Float.self, capacity: numTG * 6)
         var sumD = 0.0, sumD4 = 0.0, aSum = 0.0, a4 = 0.0, dSum = 0.0, d4 = 0.0

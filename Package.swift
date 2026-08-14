@@ -19,6 +19,10 @@ let package = Package(
         .library(name: "MediaBridge", targets: ["MediaBridge"]),
         .library(name: "ImageBridge", targets: ["ImageBridge"]),
         .library(name: "MediaMeasure", targets: ["MediaMeasure"]),
+        // The performance-measurement harness (span timeline + aggregation + Chrome-trace export).
+        // Dependency-free; exposed so downstream layers (ForgeOptimizerKit, bench tools) record onto
+        // the SAME process timeline as the bridge's own decode/encode/score spans.
+        .library(name: "MediaMetrics", targets: ["MediaMetrics"]),
         // Exposed so a SEPARATE package (e.g. vpx-swift) can conform to `ExternalVideoDecoder` and
         // build `DecodedVideoFrame`s to hand back through `MediaBridge.register(externalDecoder:)` —
         // the binary-free seam for deferred codecs (VP9/VP8/…). See DEFERRED-CODEC-PLAN.md §9.
@@ -34,15 +38,20 @@ let package = Package(
             swiftSettings: [.swiftLanguageMode(.v5)]   // CMSampleBuffer/CVPixelBuffer aren't Sendable
         ),
         // MediaMeasure carries the alpha-capable writers (ProRes 4444 / HEVC-with-alpha) that the
-        // alpha-preserving normalize routes to. Acyclic — MediaMeasure has no dependencies of its own.
+        // alpha-preserving normalize routes to. Acyclic — MediaMeasure's only dependency is the
+        // dependency-free MediaMetrics harness (Foundation + os, no media frameworks).
         .target(name: "MediaBridge",
-                dependencies: ["MediaImport", "MediaMeasure",
+                dependencies: ["MediaImport", "MediaMeasure", "MediaMetrics",
                                .product(name: "MatroskaDemux", package: "matroska-swift")],
                 swiftSettings: [.swiftLanguageMode(.v5)]),
         .target(name: "ImageBridge", swiftSettings: [.swiftLanguageMode(.v5)]),
-        .target(name: "MediaMeasure", swiftSettings: [.swiftLanguageMode(.v5)]),
+        .target(name: "MediaMeasure", dependencies: ["MediaMetrics"],
+                swiftSettings: [.swiftLanguageMode(.v5)]),
+        // Zero dependencies — the leaf every layer may import (see MediaMetrics.swift header).
+        .target(name: "MediaMetrics", swiftSettings: [.swiftLanguageMode(.v5)]),
         .testTarget(name: "MediaBridgeTests",
                     dependencies: ["MediaBridge", "MediaImport", "MediaMeasure", "ImageBridge",
+                                   "MediaMetrics",
                                    .product(name: "MatroskaDemux", package: "matroska-swift")]),
     ]
 )

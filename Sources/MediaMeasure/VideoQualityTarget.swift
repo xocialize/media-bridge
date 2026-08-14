@@ -2,6 +2,7 @@ import Accelerate
 import Foundation
 import AVFoundation
 import CoreMedia
+import MediaMetrics
 import VideoToolbox
 
 /// Video analog of `ImageQualityTarget`: re-encode a clip to the **lowest bitrate whose per-frame
@@ -283,6 +284,12 @@ public enum VideoQualityTarget {
                               denoiseStrength: Float? = nil,
                               onProgress: (@Sendable (SearchProgress) -> Void)? = nil)
         async throws -> Result {
+        let mmEncode = MediaMetrics.begin("vqt.encode", lane: "orchestrate",
+                                          attrs: ["input": input.lastPathComponent,
+                                                  "profile": profile.codecLabel,
+                                                  "target": String(format: "%.0f", targetScore)])
+        defer { MediaMetrics.end(mmEncode) }
+        let mmPrepare = MediaMetrics.begin("vqt.prepare", lane: "orchestrate")
         let asset = AVURLAsset(url: input)
         let duration = try await asset.load(.duration).seconds
         guard let vtrack = try await asset.loadTracks(withMediaType: .video).first else {
@@ -339,6 +346,7 @@ public enum VideoQualityTarget {
                      sourceBitrate / 1e6, iterations, min(frameCap, (frameCount + stride - 1) / stride),
                      stride, frameCount))
         MediaProfile.log("SSIMULACRA2 backend → \(SSIMULACRA2Metal.diagnostics())")
+        MediaMetrics.end(mmPrepare, extra: ["frames": "\(frameCount)", "stride": "\(stride)"])
         var profTranscodeMs = 0.0, profScoreMs = 0.0
 
         let tmpDir = FileManager.default.temporaryDirectory
@@ -359,12 +367,17 @@ public enum VideoQualityTarget {
             temps.append(ref)
             let tRef = DispatchTime.now()
             emit(.mezzanine(toneMapSDR: toneMapSDR, downscale: downscaled), 0.05)
-            try await renderDownscaleMezzanine(input: input, output: ref, bitrate: Int(ceiling),
-                                               outWidth: outW, outHeight: outH,
-                                               codec: profile.codec,
-                                               lookAhead: profile.lookAheadFrames,
-                                               toneMapSDR: toneMapSDR,
-                                               denoiseStrength: denoiseStrength)
+            try await MediaMetrics.time("vqt.mezzanine", lane: "encode",
+                                        attrs: ["out": "\(outW)x\(outH)",
+                                                "toneMapSDR": "\(toneMapSDR)",
+                                                "denoise": "\(denoiseStrength != nil)"]) {
+                try await renderDownscaleMezzanine(input: input, output: ref, bitrate: Int(ceiling),
+                                                   outWidth: outW, outHeight: outH,
+                                                   codec: profile.codec,
+                                                   lookAhead: profile.lookAheadFrames,
+                                                   toneMapSDR: toneMapSDR,
+                                                   denoiseStrength: denoiseStrength)
+            }
             let ms = MediaProfile.ms(since: tRef)
             profTranscodeMs += ms
             MediaProfile.log(String(format: "mezzanine: %d×%d → %d×%d%@%@ · %.0f ms",
@@ -424,19 +437,30 @@ public enum VideoQualityTarget {
             emit(.pass(label: label, index: passIndex, planned: plannedPasses, bitrate: Int(b)),
                  passFraction(0.05))
             let tEnc = DispatchTime.now()
-            try await reencodeVideo(input: searchInput, output: tmp, bitrate: Int(b),
-                                    outWidth: candW, outHeight: candH,
-                                    codec: profile.codec, webSafeAudio: profile.webSafeAudio,
-                                    maxQP: profile.maxAllowedQP, minQP: minQP,
-                                    lookAhead: profile.lookAheadFrames,
-                                    normalizeAudioAboveBPS: profile.normalizeAudioAbovePerChannelBPS)
+            try await MediaMetrics.time("vqt.pass.encode", lane: "encode",
+                                        attrs: ["label": label,
+                                                "mbps": String(format: "%.2f", b / 1e6),
+                                                "minQP": minQP.map(String.init) ?? ""]) {
+                try await reencodeVideo(input: searchInput, output: tmp, bitrate: Int(b),
+                                        outWidth: candW, outHeight: candH,
+                                        codec: profile.codec, webSafeAudio: profile.webSafeAudio,
+                                        maxQP: profile.maxAllowedQP, minQP: minQP,
+                                        lookAhead: profile.lookAheadFrames,
+                                        normalizeAudioAboveBPS: profile.normalizeAudioAbovePerChannelBPS)
+            }
             let encMs = MediaProfile.ms(since: tEnc); profTranscodeMs += encMs
             emit(.scoring(label: label, index: passIndex, planned: plannedPasses),
                  passFraction(0.6))
             let tSc = DispatchTime.now()
-            var scored = try await scoreOf(tmp)
+            var scored = try await MediaMetrics.time("vqt.pass.score", lane: "score",
+                                                     attrs: ["label": label]) {
+                try await scoreOf(tmp)
+            }
             if abs(scored.p10 - targetScore) < nearGateBand, stride > 1 {
-                let refined = try await scoreOf(tmp, refined: true)
+                let refined = try await MediaMetrics.time("vqt.pass.rescore", lane: "score",
+                                                          attrs: ["label": label]) {
+                    try await scoreOf(tmp, refined: true)
+                }
                 MediaProfile.log(String(format: "%@: near-gate %.1f → re-scored %.1f (%d frames)",
                                         label, scored.p10, refined.p10, refined.framesScored))
                 scored = refined
@@ -445,6 +469,10 @@ public enum VideoQualityTarget {
             MediaProfile.log(String(format: "%@: %.2f Mbps · transcode %.0f ms · score %.0f ms · p10 %.1f",
                                     label, b / 1e6, encMs, scMs, scored.p10))
             let cleared = scored.p10 >= targetScore
+            MediaMetrics.event("vqt.passResult",
+                               attrs: ["label": label, "p10": String(format: "%.2f", scored.p10),
+                                       "cleared": "\(cleared)",
+                                       "mbps": String(format: "%.2f", b / 1e6)])
             if cleared { best = (Int(b), scored, tmp) }
             emit(.passResult(label: label, p10: scored.p10, cleared: cleared,
                              bestBitrate: best?.bitrate, bestP10: best?.score.p10),
@@ -518,13 +546,20 @@ public enum VideoQualityTarget {
             plannedPasses += 1
             emit(.pass(label: "ceiling", index: passesDone + 1, planned: plannedPasses,
                        bitrate: Int(hi)), passFraction(0.05))
-            try await reencodeVideo(input: searchInput, output: tmp, bitrate: Int(hi),
-                                    outWidth: candW, outHeight: candH,
-                                    codec: profile.codec, webSafeAudio: profile.webSafeAudio,
-                                    maxQP: profile.maxAllowedQP,
-                                    lookAhead: profile.lookAheadFrames,
-                                    normalizeAudioAboveBPS: profile.normalizeAudioAbovePerChannelBPS)
-            chosen = (Int(hi), try await scoreOf(tmp), tmp)
+            try await MediaMetrics.time("vqt.pass.encode", lane: "encode",
+                                        attrs: ["label": "ceiling",
+                                                "mbps": String(format: "%.2f", hi / 1e6)]) {
+                try await reencodeVideo(input: searchInput, output: tmp, bitrate: Int(hi),
+                                        outWidth: candW, outHeight: candH,
+                                        codec: profile.codec, webSafeAudio: profile.webSafeAudio,
+                                        maxQP: profile.maxAllowedQP,
+                                        lookAhead: profile.lookAheadFrames,
+                                        normalizeAudioAboveBPS: profile.normalizeAudioAbovePerChannelBPS)
+            }
+            chosen = (Int(hi),
+                      try await MediaMetrics.time("vqt.pass.score", lane: "score",
+                                                  attrs: ["label": "ceiling"]) { try await scoreOf(tmp) },
+                      tmp)
         }
 
         // Deliverable lands at the host's `output` ONLY on a genuine win (cleared the floor AND smaller),
@@ -533,6 +568,7 @@ public enum VideoQualityTarget {
         // miss, leave NO file at `output` — never orphan a best-effort encode. (Fixes EMBED-003 skip-orphan
         // + EMBED-005 partial-write-on-failure.)
         emit(.finalizing, 0.95)
+        let mmFinalize = MediaMetrics.begin("vqt.finalize", lane: "io")
         let outBytes = (try? chosen.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         // A format *conversion* (web profile) delivers even when larger — the size gate is the
         // profile's call. A floor miss delivers the ceiling encode when the profile says best-effort
@@ -549,6 +585,7 @@ public enum VideoQualityTarget {
             try? FileManager.default.removeItem(at: output)
         }
         for t in temps { try? FileManager.default.removeItem(at: t) }
+        MediaMetrics.end(mmFinalize, extra: ["delivered": "\(didWin)"])
 
         let profTotal = profTranscodeMs + profScoreMs
         if profTotal > 0 {

@@ -10,6 +10,7 @@
 import CoreGraphics
 import Foundation
 import ImageIO
+import MediaMetrics
 import UniformTypeIdentifiers
 
 public enum ImageQualityTarget {
@@ -38,22 +39,33 @@ public enum ImageQualityTarget {
     public static func encodeHEIC(_ image: CGImage, targetScore: Double,
                                   iterations: Int = 8,
                                   channelScalars: SSIMULACRA2.ChannelScalars? = nil) throws -> Result {
+        let mm = MediaMetrics.begin("iqt.search", lane: "orchestrate",
+                                    attrs: ["codec": "heic", "target": "\(targetScore)",
+                                            "w": "\(image.width)", "h": "\(image.height)"])
+        defer { MediaMetrics.end(mm) }
         var bestData: Data?
         let search = try QualityTargetSearch.search(target: targetScore, lo: 0.1, hi: 1.0,
                                                     iterations: iterations) { q in
-            let data = try encode(image, quality: q)
-            let decoded = try decode(data)
-            let score: Double
-            if let channelScalars {
-                score = try SSIMULACRA2.score(reference: image, distorted: decoded, channelScalars: channelScalars)
-            } else {
-                score = try SSIMULACRA2.score(reference: image, distorted: decoded)
+            let data = try MediaMetrics.time("iqt.encode", lane: "encode", detail: 1,
+                                             attrs: ["codec": "heic", "q": String(format: "%.3f", q)]) {
+                try encode(image, quality: q)
+            }
+            let decoded = try MediaMetrics.time("iqt.decode", lane: "decode", detail: 1,
+                                                attrs: ["codec": "heic"]) { try decode(data) }
+            let score: Double = try MediaMetrics.time("iqt.score", lane: "score", detail: 1) {
+                if let channelScalars {
+                    return try SSIMULACRA2.score(reference: image, distorted: decoded, channelScalars: channelScalars)
+                }
+                return try SSIMULACRA2.score(reference: image, distorted: decoded)
             }
             bestData = data        // last evaluated; the search ends on the chosen knob
             return score
         }
         // Re-encode at the chosen quality so `data` matches the returned `quality` exactly.
-        let data = try encode(image, quality: search.quality)
+        let data = try MediaMetrics.time("iqt.finalEncode", lane: "encode", detail: 1,
+                                         attrs: ["codec": "heic"]) {
+            try encode(image, quality: search.quality)
+        }
         _ = bestData
         return Result(data: data, quality: search.quality, score: search.score,
                       metTarget: search.metTarget)
@@ -82,17 +94,30 @@ public enum ImageQualityTarget {
     public static func encodeJPEG(_ image: CGImage, targetScore: Double,
                                   iterations: Int = 8,
                                   channelScalars: SSIMULACRA2.ChannelScalars? = nil) throws -> Result {
+        let mm = MediaMetrics.begin("iqt.search", lane: "orchestrate",
+                                    attrs: ["codec": "jpeg", "target": "\(targetScore)",
+                                            "w": "\(image.width)", "h": "\(image.height)"])
+        defer { MediaMetrics.end(mm) }
         let search = try QualityTargetSearch.search(target: targetScore, lo: 0.1, hi: 1.0,
                                                     iterations: iterations) { q in
-            let data = try encode(image, quality: q, type: .jpeg)
-            let decoded = try decode(data)
-            if let channelScalars {
-                return try SSIMULACRA2.score(reference: image, distorted: decoded,
-                                             channelScalars: channelScalars)
+            let data = try MediaMetrics.time("iqt.encode", lane: "encode", detail: 1,
+                                             attrs: ["codec": "jpeg", "q": String(format: "%.3f", q)]) {
+                try encode(image, quality: q, type: .jpeg)
             }
-            return try SSIMULACRA2.score(reference: image, distorted: decoded)
+            let decoded = try MediaMetrics.time("iqt.decode", lane: "decode", detail: 1,
+                                                attrs: ["codec": "jpeg"]) { try decode(data) }
+            return try MediaMetrics.time("iqt.score", lane: "score", detail: 1) {
+                if let channelScalars {
+                    return try SSIMULACRA2.score(reference: image, distorted: decoded,
+                                                 channelScalars: channelScalars)
+                }
+                return try SSIMULACRA2.score(reference: image, distorted: decoded)
+            }
         }
-        let data = try encode(image, quality: search.quality, type: .jpeg)
+        let data = try MediaMetrics.time("iqt.finalEncode", lane: "encode", detail: 1,
+                                         attrs: ["codec": "jpeg"]) {
+            try encode(image, quality: search.quality, type: .jpeg)
+        }
         return Result(data: data, quality: search.quality, score: search.score,
                       metTarget: search.metTarget)
     }
@@ -116,13 +141,18 @@ public enum ImageQualityTarget {
     /// conversion where losslessness is not a given, and the receipt should say what actually happened.
     public static func encodePNG(_ image: CGImage,
                                  channelScalars: SSIMULACRA2.ChannelScalars? = nil) throws -> PNGResult {
-        let data = try encodePNGData(image)
-        let decoded = try decode(data)
-        let score: Double
-        if let channelScalars {
-            score = try SSIMULACRA2.score(reference: image, distorted: decoded, channelScalars: channelScalars)
-        } else {
-            score = try SSIMULACRA2.score(reference: image, distorted: decoded)
+        let mm = MediaMetrics.begin("iqt.png", lane: "orchestrate",
+                                    attrs: ["w": "\(image.width)", "h": "\(image.height)"])
+        defer { MediaMetrics.end(mm) }
+        let data = try MediaMetrics.time("iqt.encode", lane: "encode", detail: 1,
+                                         attrs: ["codec": "png"]) { try encodePNGData(image) }
+        let decoded = try MediaMetrics.time("iqt.decode", lane: "decode", detail: 1,
+                                            attrs: ["codec": "png"]) { try decode(data) }
+        let score: Double = try MediaMetrics.time("iqt.score", lane: "score", detail: 1) {
+            if let channelScalars {
+                return try SSIMULACRA2.score(reference: image, distorted: decoded, channelScalars: channelScalars)
+            }
+            return try SSIMULACRA2.score(reference: image, distorted: decoded)
         }
         return PNGResult(data: data, score: score)
     }

@@ -1,0 +1,123 @@
+//
+// MediaMetricsTests.swift — MediaBridgeTests
+//
+// The harness must be trustworthy before its numbers are: spans record what they bracket, detail
+// filtering filters, lane utilization merges overlaps (union, not double-count), and both export
+// formats parse. No timing assertions — this suite runs in Debug where durations mean nothing.
+//
+
+import Foundation
+import XCTest
+@testable import MediaMetrics
+
+final class MediaMetricsTests: XCTestCase {
+
+    override func setUp() {
+        super.setUp()
+        MediaMetrics.enable(detail: 1)
+    }
+
+    override func tearDown() {
+        MediaMetrics.disable()
+        MediaMetrics.reset()
+        super.tearDown()
+    }
+
+    func testSpansRecordAndAggregate() throws {
+        MediaMetrics.time("t.alpha", lane: "cpu") { usleep(2000) }
+        MediaMetrics.time("t.alpha", lane: "cpu") { usleep(2000) }
+        MediaMetrics.time("t.beta", lane: "io") { usleep(1000) }
+
+        let report = MediaMetrics.report()
+        let alpha = report.spans.filter { $0.name == "t.alpha" }
+        XCTAssertEqual(alpha.count, 2)
+        XCTAssertTrue(alpha.allSatisfy { $0.durationSeconds > 0.001 })
+
+        let agg = report.aggregated()
+        let alphaStat = try XCTUnwrap(agg.first { $0.name == "t.alpha" })
+        XCTAssertEqual(alphaStat.count, 2)
+        XCTAssertEqual(alphaStat.lane, "cpu")
+        XCTAssertGreaterThan(alphaStat.totalSeconds, 0.002)
+    }
+
+    func testDetailFiltering() {
+        MediaMetrics.enable(detail: 0)
+        MediaMetrics.time("t.stage", detail: 0) {}
+        MediaMetrics.time("t.frame", detail: 1) {}
+        MediaMetrics.time("t.kernel", detail: 2) {}
+        let names = Set(MediaMetrics.report().spans.map(\.name))
+        XCTAssertTrue(names.contains("t.stage"))
+        XCTAssertFalse(names.contains("t.frame"))
+        XCTAssertFalse(names.contains("t.kernel"))
+    }
+
+    func testDisabledRecordsNothingAndBodyStillRuns() {
+        MediaMetrics.disable()
+        MediaMetrics.reset()
+        var ran = false
+        MediaMetrics.time("t.off") { ran = true }
+        XCTAssertTrue(ran)
+        XCTAssertTrue(MediaMetrics.report().spans.isEmpty)
+    }
+
+    func testManualBracketAndExtraAttrs() {
+        let h = MediaMetrics.begin("t.manual", lane: "encode", attrs: ["k": "v"])
+        XCTAssertNotNil(h)
+        MediaMetrics.end(h, extra: ["outcome": "ok"])
+        let span = MediaMetrics.report().spans.first { $0.name == "t.manual" }
+        XCTAssertEqual(span?.attrs["k"], "v")
+        XCTAssertEqual(span?.attrs["outcome"], "ok")
+        XCTAssertEqual(span?.lane, "encode")
+    }
+
+    func testErrorPropagatesAndSpanStillRecords() {
+        struct Boom: Error {}
+        XCTAssertThrowsError(try MediaMetrics.time("t.throws") { throw Boom() })
+        XCTAssertEqual(MediaMetrics.report().spans.filter { $0.name == "t.throws" }.count, 1)
+    }
+
+    func testAsyncSpanCoversAwait() async {
+        await MediaMetrics.time("t.async", lane: "score") {
+            try? await Task.sleep(nanoseconds: 3_000_000)
+        }
+        let span = MediaMetrics.report().spans.first { $0.name == "t.async" }
+        XCTAssertNotNil(span)
+        XCTAssertGreaterThan(span?.durationSeconds ?? 0, 0.002)
+    }
+
+    func testIntervalMergeUnionsOverlaps() {
+        // (0,10)+(5,15) overlap → 15; (20,25) separate → +5.
+        let merged = MetricsReport.mergeIntervals([(0, 10), (5, 15), (20, 25)])
+        XCTAssertEqual(merged.count, 2)
+        XCTAssertEqual(merged[0].0, 0); XCTAssertEqual(merged[0].1, 15)
+        XCTAssertEqual(merged[1].0, 20); XCTAssertEqual(merged[1].1, 25)
+    }
+
+    func testExportsParse() throws {
+        MediaMetrics.time("t.export", lane: "cpu", attrs: ["a": "1"]) { usleep(500) }
+        let report = MediaMetrics.report()
+
+        // NDJSON: every line is a JSON object; first is meta with a build stamp.
+        let lines = String(data: report.ndjson(), encoding: .utf8)!
+            .split(separator: "\n").map(String.init)
+        XCTAssertGreaterThanOrEqual(lines.count, 2)
+        for line in lines {
+            let obj = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+            XCTAssertNotNil(obj?["t"])
+        }
+        XCTAssertTrue(lines[0].contains("\"buildConfiguration\""))
+
+        // Chrome trace: parses, and carries thread_name metadata + at least one X event.
+        let trace = try JSONSerialization.jsonObject(with: report.chromeTrace()) as? [String: Any]
+        let events = try XCTUnwrap(trace?["traceEvents"] as? [[String: Any]])
+        XCTAssertTrue(events.contains { $0["ph"] as? String == "M" })
+        XCTAssertTrue(events.contains { $0["ph"] as? String == "X" && $0["name"] as? String == "t.export" })
+    }
+
+    func testEventIsZeroDuration() {
+        MediaMetrics.event("t.mark", attrs: ["p10": "80.1"])
+        let span = MediaMetrics.report().spans.first { $0.name == "t.mark" }
+        XCTAssertEqual(span?.durationNS, 0)
+        XCTAssertEqual(span?.attrs["p10"], "80.1")
+    }
+}
