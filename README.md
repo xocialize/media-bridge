@@ -26,7 +26,7 @@ package can supply an external decoder — see the seam below).
 ## Install
 
 ```swift
-.package(url: "https://github.com/xocialize/media-bridge.git", from: "0.27.0")
+.package(url: "https://github.com/xocialize/media-bridge.git", from: "0.29.0")
 ```
 
 macOS 14+. Swift 6.2 toolchain (targets build in Swift 5 language mode).

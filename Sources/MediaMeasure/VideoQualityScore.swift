@@ -12,10 +12,26 @@ public struct VideoQualityScore: Sendable {
     public let minimum: Double
     public let p10: Double          // 10th-percentile frame (worst-ish)
     public let framesScored: Int
+    /// The per-frame scores behind the aggregates, in decode order of the SAMPLED frames. Exposed
+    /// so a refinement pass can score only NEW frames and merge (`VideoQuality.aggregate`) instead
+    /// of re-scoring from scratch — the near-gate rescore was measured at 42% of a near-floor
+    /// item's wall precisely because it threw this sample away (PERFORMANCE-BASELINE §4.3).
+    public let scores: [Double]
 }
 
 public enum VideoQuality {
     public enum ScoreError: Error { case noVideoTrack, dimensionMismatch, noFramesScored }
+
+    /// Reduce per-frame scores to the standard aggregate. Public so callers can MERGE samples —
+    /// e.g. a base pass + an offset refinement pass — and re-aggregate without re-scoring.
+    /// Precondition: `scores` is non-empty.
+    public static func aggregate(_ scores: [Double]) -> VideoQualityScore {
+        let sorted = scores.sorted()
+        let mean = scores.reduce(0, +) / Double(scores.count)
+        let p10 = sorted[Int(Double(sorted.count - 1) * 0.1)]
+        return VideoQualityScore(mean: mean, minimum: sorted[0], p10: p10,
+                                 framesScored: scores.count, scores: scores)
+    }
 
     /// Per-frame SSIMULACRA2 of `distorted` vs `reference` (same frame order assumed), aggregated.
     /// GPU-scored when a Metal device is present. `sampleStride` scores every Nth decoded frame;
@@ -27,12 +43,20 @@ public enum VideoQuality {
     /// share a resolution (the same-res optimize path). NB: the reference is resampled here with
     /// CoreGraphics while the encoder downscales with VideoToolbox — a small resampler delta makes the
     /// score slightly conservative vs a same-pipeline reference (fine for a floor; calibrate on real content).
+    ///
+    /// `sampleOffset` phase-shifts the sampled indices (score frames where
+    /// `(idx − offset) % stride == 0`). An offset pass at `stride/2` scores exactly the midpoint
+    /// frames a base pass skipped — merge the two samples via `aggregate` for 2× density at 1×
+    /// additional scoring cost. Skipped frames are advanced WITHOUT the CVPixelBuffer→CGImage
+    /// conversion (measured 19–31 decoded per scored frame; converting the skips was pure waste).
     public static func videoScore(reference: URL, distorted: URL, sampleStride: Int = 1,
-                                  maxFrames: Int = 60, matchSize: CGSize? = nil) throws -> VideoQualityScore {
+                                  maxFrames: Int = 60, matchSize: CGSize? = nil,
+                                  sampleOffset: Int = 0) throws -> VideoQualityScore {
         let mm = MediaMetrics.begin("videoScore", lane: "score",
                                     attrs: ["ref": reference.lastPathComponent,
                                             "dist": distorted.lastPathComponent,
-                                            "stride": "\(sampleStride)", "cap": "\(maxFrames)"])
+                                            "stride": "\(sampleStride)", "cap": "\(maxFrames)",
+                                            "offset": "\(sampleOffset)"])
         let ref = try FrameStream(reference)
         let dist = try FrameStream(distorted)
         // Use the **full-GPU per-channel path** (products + blur + map/reduce on device), the same one the
@@ -56,29 +80,36 @@ public enum VideoQuality {
         }
         while scores.count < maxFrames {
             let tN = DispatchTime.now()
+            let stride = max(1, sampleStride)
+            let willScore = idx >= sampleOffset && (idx - sampleOffset) % stride == 0
+            guard willScore else {
+                // Stride skip: advance both readers, no CGImage conversion (the fast path).
+                let hS = MediaMetrics.begin("vs.skipPair", lane: "decode", detail: 1)
+                let advanced = ref.skip() && dist.skip()
+                MediaMetrics.end(hS)
+                if !advanced { break }
+                decodeMs += MediaProfile.ms(since: tN); decoded += 1
+                idx += 1
+                continue
+            }
             let hD = MediaMetrics.begin("vs.decodePair", lane: "decode", detail: 1)
             guard let r0 = ref.next(), let d0 = dist.next() else { MediaMetrics.end(hD); break }
             MediaMetrics.end(hD)
             decodeMs += MediaProfile.ms(since: tN); decoded += 1
-            if idx % max(1, sampleStride) == 0 {
-                let r = MediaMetrics.time("vs.resample", lane: "cpu", detail: 2) { resample(r0, to: matchSize) }
-                let d = MediaMetrics.time("vs.resample", lane: "cpu", detail: 2) { resample(d0, to: matchSize) }
-                guard r.width == d.width, r.height == d.height else { throw ScoreError.dimensionMismatch }
-                let tS = DispatchTime.now()
-                scores.append(try MediaMetrics.time("vs.ssimu2", lane: "score", detail: 1,
-                                                    attrs: ["frame": "\(idx)"]) { try score(r, d) })
-                ssimMs += MediaProfile.ms(since: tS)
-            }
+            let r = MediaMetrics.time("vs.resample", lane: "cpu", detail: 2) { resample(r0, to: matchSize) }
+            let d = MediaMetrics.time("vs.resample", lane: "cpu", detail: 2) { resample(d0, to: matchSize) }
+            guard r.width == d.width, r.height == d.height else { throw ScoreError.dimensionMismatch }
+            let tS = DispatchTime.now()
+            scores.append(try MediaMetrics.time("vs.ssimu2", lane: "score", detail: 1,
+                                                attrs: ["frame": "\(idx)"]) { try score(r, d) })
+            ssimMs += MediaProfile.ms(since: tS)
             idx += 1
         }
         guard !scores.isEmpty else { throw ScoreError.noFramesScored }
-        MediaProfile.log(String(format: "  videoScore: decoded %d (decode+convert %.0f ms) · scored %d "
+        MediaProfile.log(String(format: "  videoScore: advanced %d (decode %.0f ms) · scored %d "
             + "(ssimu2 %.0f ms, %@)", decoded, decodeMs, scores.count, ssimMs, gpu != nil ? "GPU" : "CPU"))
 
-        let sorted = scores.sorted()
-        let mean = scores.reduce(0, +) / Double(scores.count)
-        let p10 = sorted[Int(Double(sorted.count - 1) * 0.1)]
-        return VideoQualityScore(mean: mean, minimum: sorted[0], p10: p10, framesScored: scores.count)
+        return aggregate(scores)
     }
 
     /// Per-frame SSIMULACRA2 with **presentation-time pairing** — for scoring across ENCODERS,
@@ -135,10 +166,7 @@ public enum VideoQuality {
         if skipped > 0 {
             MediaProfile.log("  videoScorePTS: \(skipped) sample(s) had no partner within \(tolerance)s — skipped")
         }
-        let sorted = scores.sorted()
-        let mean = scores.reduce(0, +) / Double(scores.count)
-        let p10 = sorted[Int(Double(sorted.count - 1) * 0.1)]
-        return VideoQualityScore(mean: mean, minimum: sorted[0], p10: p10, framesScored: scores.count)
+        return aggregate(scores)
     }
 
     /// High-quality CoreGraphics resample to `size` (no-op if `size` is nil or already matches).
@@ -194,4 +222,9 @@ final class FrameStream {
         VTCreateCGImageFromCVPixelBuffer(buffer, options: nil, imageOut: &cg)
         return cg
     }
+
+    /// Advance one frame WITHOUT the CVPixelBuffer→CGImage conversion — the stride-skip fast path.
+    /// A strided score advances 19–31 frames per frame scored (measured); converting the skips was
+    /// the decode lane's dominant waste. Returns false at end of stream.
+    func skip() -> Bool { output.copyNextSampleBuffer() != nil }
 }

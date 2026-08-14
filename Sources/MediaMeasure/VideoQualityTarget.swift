@@ -337,6 +337,12 @@ public enum VideoQualityTarget {
         let fpsRaw = Double((try? await vtrack.load(.nominalFrameRate)) ?? 30)
         let fps = fpsRaw > 0 ? fpsRaw : 30                       // some tracks report 0
         let frameCount = max(1, Int((fps * duration).rounded()))
+        // ⚠️ Do NOT "regularize" this stride (e.g. round to even). Measured 2026-08-14
+        // (forgebench 20260814-142039 + stride-5 dense rescores): an even sampling lattice
+        // resonates with content/GOP periodicity and over-reads p10 by ~3.3 points (vs ~1.3 for
+        // the raw stride's phase-walking lattice) — the search then ships smaller files that only
+        // *sampled* above the floor. The raw stride plus the midpoint-offset union refinement
+        // (two interleaved lattices) is the most phase-diverse estimator available at this cost.
         let stride = searchStride.map { max(1, $0) }
             ?? max(1, frameCount / max(1, minScoredFrames))
         let frameCap = searchStride == nil ? maxScoredFrames : 60
@@ -409,20 +415,23 @@ public enum VideoQualityTarget {
         // Score off the cooperative pool at .utility QoS (EMBED-004): the host drives encode from a
         // .userInitiated Task, so scoring inline would block a high-QoS thread on CoreGraphics's
         // Default-QoS rasterization → a priority inversion. Awaiting the hop suspends instead of blocking.
-        func scoreOf(_ url: URL, refined: Bool = false) async throws -> VideoQualityScore {
-            let s = refined ? max(1, stride / 2) : stride
-            let cap = refined ? frameCap * 2 : frameCap
-            return try await ScoringExecutor.run {
+        func scoreOf(_ url: URL, sampleOffset: Int = 0) async throws -> VideoQualityScore {
+            try await ScoringExecutor.run {
                 try VideoQuality.videoScore(reference: scoreRef, distorted: url,
-                                            sampleStride: s, maxFrames: cap)
+                                            sampleStride: stride, maxFrames: frameCap,
+                                            sampleOffset: sampleOffset)
             }
         }
         // A p10 over ~13 sampled frames jitters ±1 near the gate — enough to pin the binary
         // search's lower bound above the true clearing point (Ferrari: landed 15.8 Mbps where
         // ~11.5 clears, +15% bytes) and to stall the squeeze walk-down. Candidates landing within
-        // this band of the floor get re-scored at 2× sampling before the verdict; only borderline
-        // iterations pay (one extra scoring pass, no extra encode). Skipped when the stride is
-        // already 1 — every frame is scored and there is nothing to refine.
+        // this band of the floor get their sampling density DOUBLED before the verdict —
+        // incrementally: the pass's sample is already scored, so the refinement scores only the
+        // OFFSET frames (the midpoints the base stride skipped) and merges. Measured before the
+        // merge existed: from-scratch 2× rescores were 42% of a near-floor item's wall, more than
+        // all its encodes (PERFORMANCE-BASELINE §4.3). For even strides the merged set is
+        // frame-identical to the old from-scratch refined set; odd strides shift membership by
+        // ≤1 frame (same density, equivalent estimator). Skipped when the stride is already 1.
         let nearGateBand = 1.5
 
         // Max QP rides on every search candidate (it only ever lifts the tail — floor-safe, keeps
@@ -457,13 +466,18 @@ public enum VideoQualityTarget {
                 try await scoreOf(tmp)
             }
             if abs(scored.p10 - targetScore) < nearGateBand, stride > 1 {
-                let refined = try await MediaMetrics.time("vqt.pass.rescore", lane: "score",
-                                                          attrs: ["label": label]) {
-                    try await scoreOf(tmp, refined: true)
+                // Score ONLY the midpoint frames and merge with the sample already in hand.
+                // A degenerate offset past EOF (explicit tiny-clip strides) keeps the base verdict.
+                let offsetPass = try? await MediaMetrics.time("vqt.pass.rescore", lane: "score",
+                                                              attrs: ["label": label]) {
+                    try await scoreOf(tmp, sampleOffset: max(1, stride / 2))
                 }
-                MediaProfile.log(String(format: "%@: near-gate %.1f → re-scored %.1f (%d frames)",
-                                        label, scored.p10, refined.p10, refined.framesScored))
-                scored = refined
+                if let offsetPass {
+                    let refined = VideoQuality.aggregate(scored.scores + offsetPass.scores)
+                    MediaProfile.log(String(format: "%@: near-gate %.1f → merged-refine %.1f (%d frames)",
+                                            label, scored.p10, refined.p10, refined.framesScored))
+                    scored = refined
+                }
             }
             let scMs = MediaProfile.ms(since: tSc); profScoreMs += scMs
             MediaProfile.log(String(format: "%@: %.2f Mbps · transcode %.0f ms · score %.0f ms · p10 %.1f",
