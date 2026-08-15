@@ -398,7 +398,25 @@ public enum VideoQualityTarget {
         let candW: Int? = needsMezzanine ? nil : outW
         let candH: Int? = needsMezzanine ? nil : outH
 
-        var lo = ceiling * 0.04, hi = ceiling
+        // ── Search priors (lever 4) — deterministic, content-derived, one kill switch ──────────
+        // MEDIABRIDGE_NO_SEARCHPRIOR=1 restores the blind [0.04·C, C] fixed-6-pass search.
+        //   · Shrink profiles start the bracket at 0.35·C: every observed clearing landing on the
+        //     corpus sits at 0.71–0.99·C (layersb 0.88, 4K master 0.71, keynote 0.86, ibm-1080
+        //     0.99), and a sub-0.35 lander still gets found by the existing descent extension.
+        //     Conversion profiles keep 0.04·C — a pristine master can legitimately land far lower.
+        //   · The bisection stops when the bracket converges to 5% (bracketEpsilon) — replayed
+        //     against the recorded verdict curves this preserves the chosen candidates while
+        //     dropping the final futile refinement pass (which is usually a near-gate rescore
+        //     pass too); the corridor squeeze anchored on EMITTED bytes is the fine-tuner.
+        //   · Slope-projection abort: after two misses, project the local Δp10/Δbitrate to the
+        //     bracket ceiling; if even C cannot come within 1.0 of the floor, further bisection
+        //     is futile (honda: flat at p10 ~62.6 across 0.52–0.99·C, 17 under floor — 4 wasted
+        //     passes; the projection rule aborts after 2 while correctly letting architecture
+        //     79.8-projected / keynote 83.4-projected / ibm 80.1-projected searches continue).
+        let searchPriors = ProcessInfo.processInfo.environment["MEDIABRIDGE_NO_SEARCHPRIOR"] == nil
+        let bracketEpsilon = searchPriors ? 0.05 : 0.0
+        let abortMargin = 1.0
+        var lo = ceiling * (searchPriors && profile.requireSmaller ? 0.35 : 0.04), hi = ceiling
         let initialLo = lo
         var best: (bitrate: Int, score: VideoQualityScore, url: URL)?
 
@@ -446,7 +464,18 @@ public enum VideoQualityTarget {
         // `reencodeVideo` inputs produce identical bytes, so trajectories and deliverables must
         // match the serial arm byte-for-byte (bench-gated). Kill switch for A/B and emergencies:
         // MEDIABRIDGE_NO_SPECULATE=1 restores inline serial encodes.
+        //
+        // ⚖️ ADAPTIVE GATE (added when lever 3 inverted this lever's economics): speculation pays
+        // only while the scoring window can absorb encode work — with V1 scoring (score ≥ encode)
+        // it measured −19% wall; with RESIDENT scoring at 1080p (score ≈ 0.3 s vs ~1.3 s encodes)
+        // a mispredicted branch occupies the serial lane longer than the window it hides in, and
+        // the same clips measured +21% wall. So the search boots SERIAL, measures its own true
+        // per-pass encode/score costs, and enables speculation only when score ≥ ½·encode.
+        // Scheduling never changes trajectories (measured), so the timing-dependent gate cannot
+        // change results — only wall clock.
         let speculate = ProcessInfo.processInfo.environment["MEDIABRIDGE_NO_SPECULATE"] == nil
+        var specActive = false
+        var serialEncMs = 0.0, serialScMs = 0.0, serialPasses = 0
 
         final class EncodeLane: @unchecked Sendable {
             private let lock = NSLock()
@@ -512,7 +541,7 @@ public enum VideoQualityTarget {
         /// Queue `b` for encoding if it isn't already (temps are registered here, on the search
         /// task — never from inside a lane job, so the temps array stays single-writer).
         func ensureQueued(_ b: Double) {
-            guard speculate else { return }
+            guard specActive else { return }
             let tmp = tmpDir.appendingPathComponent("vqt-\(UUID().uuidString).mp4")
             temps.append(tmp)
             _ = lane.submit(key: b.bitPattern, encodeRun(b, minQP: nil, to: tmp))
@@ -522,6 +551,7 @@ public enum VideoQualityTarget {
         // the search monotone). Min QP NEVER does: it caps achievable quality with a content-
         // dependent mapping, which can make a floor unreachable by construction (the BGRA-ceiling
         // failure mode, reintroduced by policy). It applies only in the corridor squeeze below.
+        var lastPassP10 = 0.0   // the most recent pass's gating score (the abort projection's input)
         func searchStep(_ b: Double, _ label: String, minQP: Int? = nil) async throws -> Bool {
             let passIndex = passesDone + 1
             if passIndex > plannedPasses { plannedPasses = passIndex }
@@ -580,9 +610,13 @@ public enum VideoQualityTarget {
                 }
             }
             let scMs = MediaProfile.ms(since: tSc); profScoreMs += scMs
+            // While serial, these are TRUE work costs (no overlap) — the adaptive gate's inputs.
+            // Frozen once speculation activates (encMs then measures residual wait, not work).
+            if !specActive { serialEncMs += encMs; serialScMs += scMs; serialPasses += 1 }
             MediaProfile.log(String(format: "%@: %.2f Mbps · transcode %.0f ms · score %.0f ms · p10 %.1f",
                                     label, b / 1e6, encMs, scMs, scored.p10))
             let cleared = scored.p10 >= targetScore
+            lastPassP10 = scored.p10
             MediaMetrics.event("vqt.passResult",
                                attrs: ["label": label, "p10": String(format: "%.2f", scored.p10),
                                        "cleared": "\(cleared)",
@@ -598,12 +632,30 @@ public enum VideoQualityTarget {
         // Momentum for speculation ORDER only (which branch encodes first): the search's purpose
         // is walking down, so start assuming clears. A wrong guess costs nothing but queue order.
         var lastCleared = true
+        var misses: [(bitrate: Double, p10: Double)] = []
         for i in 0..<iterations {
+            if bracketEpsilon > 0, (hi - lo) <= bracketEpsilon * hi {
+                MediaProfile.log(String(format: "bracket converged (%.2f–%.2f Mbps, ≤%.0f%%) — %@",
+                                        lo / 1e6, hi / 1e6, bracketEpsilon * 100,
+                                        best != nil ? "squeeze refines from emitted bytes"
+                                                    : "nothing in-bracket clears"))
+                break
+            }
             let b = (lo + hi) / 2
             let bClear = (lo + b) / 2                     // next candidate if this one clears
             let bMiss = (b + hi) / 2                      // next candidate if this one misses
+            // Break-even is a FULL encode, not half: with the serial lane, a wrong-order pass
+            // costs 2·enc − sc (loser drains, then the winner), which beats serial (enc) only
+            // when sc > enc. A 0.5 threshold shipped first and measurably regressed near-floor
+            // 1080p +17% (rescore-inflated pass-1 windows tripped it; bracketed run 173757).
+            if speculate, !specActive, serialPasses >= 1, serialScMs >= serialEncMs {
+                specActive = true
+                MediaProfile.log(String(format: "speculation ON (score %.0f ms ≥ encode %.0f ms per pass)",
+                                        serialScMs / Double(serialPasses),
+                                        serialEncMs / Double(serialPasses)))
+            }
             ensureQueued(b)                               // this pass's own encode leads the queue
-            if speculate, i + 1 < iterations {
+            if specActive, i + 1 < iterations {
                 for nb in (lastCleared ? [bClear, bMiss] : [bMiss, bClear]) { ensureQueued(nb) }
             }
             if try await searchStep(b, "iter \(i + 1)") {
@@ -614,6 +666,22 @@ public enum VideoQualityTarget {
                 lo = b                                    // below floor → need more bitrate
                 lastCleared = false
                 lane.revoke(bClear.bitPattern)
+                misses.append((b, lastPassP10))
+                if searchPriors, best == nil, misses.count >= 2 {
+                    let (b1, p1) = misses[misses.count - 2]
+                    let (b2, p2) = misses[misses.count - 1]
+                    let slope = b2 > b1 ? max(0, (p2 - p1) / ((b2 - b1) / 1e6)) : 0
+                    let projected = p2 + slope * ((hi - b2) / 1e6)
+                    if projected < targetScore - abortMargin {
+                        MediaProfile.log(String(format: "abort: p10 %.1f at %.2f Mbps projects to "
+                            + "%.1f at the %.2f Mbps ceiling (floor %.0f) — bisection is futile",
+                                                p2, b2 / 1e6, projected, hi / 1e6, targetScore))
+                        MediaMetrics.event("vqt.abort",
+                                           attrs: ["projected": String(format: "%.1f", projected)])
+                        lane.revoke(bClear.bitPattern)
+                        break
+                    }
+                }
             }
         }
 
@@ -628,11 +696,16 @@ public enum VideoQualityTarget {
             var lo2 = Double(current.bitrate) * 0.02
             var hi2 = Double(current.bitrate)
             for i in 0..<iterations {
+                if bracketEpsilon > 0, (hi2 - lo2) <= bracketEpsilon * hi2 {
+                    MediaProfile.log(String(format: "descent bracket converged (%.2f–%.2f Mbps)",
+                                            lo2 / 1e6, hi2 / 1e6))
+                    break
+                }
                 let b = (lo2 + hi2) / 2
                 let bClear = (lo2 + b) / 2
                 let bMiss = (b + hi2) / 2
                 ensureQueued(b)
-                if speculate, i + 1 < iterations {
+                if specActive, i + 1 < iterations {
                     for nb in (lastCleared ? [bClear, bMiss] : [bMiss, bClear]) { ensureQueued(nb) }
                 }
                 if try await searchStep(b, "descent \(i + 1)") {
@@ -704,6 +777,12 @@ public enum VideoQualityTarget {
                       try await MediaMetrics.time("vqt.pass.score", lane: "score",
                                                   attrs: ["label": "ceiling"]) { try await scoreOf(tmp) },
                       tmp)
+            // The bisection probes interior points only — `hi` itself is first encoded HERE. When
+            // content clears exactly at the ceiling (ibm-1080: every interior probe missed, the
+            // ceiling scored 80.45), that is a genuine floor-met candidate: promote it so
+            // `metTarget`/delivery treat it like any other winner instead of skipping a
+            // legitimately smaller, floor-clearing deliverable.
+            if chosen.score.p10 >= targetScore { best = chosen }
         }
 
         // Deliverable lands at the host's `output` ONLY on a genuine win (cleared the floor AND smaller),
