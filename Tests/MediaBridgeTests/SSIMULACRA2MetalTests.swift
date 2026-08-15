@@ -53,6 +53,48 @@ final class SSIMULACRA2MetalTests: XCTestCase {
                           "full-GPU=\(gpuScore) swift=\(swiftScore) Δ=\(abs(gpuScore - swiftScore))")
     }
 
+    /// Resident whole-score path (ingest + XYB + pyramid + reductions on-device, one sync) vs the
+    /// pure-Swift score — the ±0.05 bar the routing relies on. Odd, non-multiple-of-16 dims
+    /// exercise the pyramid's edge clamp and every kernel's bounds guard; the second call reuses
+    /// the pooled working set and must reproduce the first bit-for-bit.
+    func testResidentScoreMatchesSwiftScore() throws {
+        guard let metal = SSIMULACRA2Metal(), metal.residentAvailable else {
+            throw XCTSkip("no Metal device / resident disabled")
+        }
+        // Gradient pair, same fixture as the V1 tests.
+        let ref = gradientImage(160, 120, shift: 0)
+        let dist = gradientImage(160, 120, shift: 0.05)
+        let swiftScore = try SSIMULACRA2.score(reference: ref, distorted: dist)
+        let resident = try metal.scoreResident(reference: ref, distorted: dist)
+        XCTAssertLessThan(abs(resident - swiftScore), 0.05,
+                          "resident=\(resident) swift=\(swiftScore) Δ=\(abs(resident - swiftScore))")
+
+        // Odd dims + deterministic noise (LCG) — pyramid edges, bounds guards, six full scales.
+        let refN = noiseImage(131, 97, seed: 0x1234_5678)
+        let distN = noiseImage(131, 97, seed: 0x8765_4321)
+        let swiftN = try SSIMULACRA2.score(reference: refN, distorted: distN)
+        let residentN = try metal.scoreResident(reference: refN, distorted: distN)
+        XCTAssertLessThan(abs(residentN - swiftN), 0.05,
+                          "resident=\(residentN) swift=\(swiftN) Δ=\(abs(residentN - swiftN))")
+
+        // Pool reuse determinism: identical inputs through the cached set → identical output.
+        let again = try metal.scoreResident(reference: refN, distorted: distN)
+        XCTAssertEqual(again, residentN, "pooled re-score must be deterministic")
+    }
+
+    private func noiseImage(_ w: Int, _ h: Int, seed: UInt32) -> CGImage {
+        let cs = CGColorSpaceCreateDeviceRGB()
+        let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                            space: cs, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        let buf = ctx.data!.bindMemory(to: UInt8.self, capacity: w * h * 4)
+        var s = seed
+        func next() -> UInt8 { s = s &* 1_664_525 &+ 1_013_904_223; return UInt8((s >> 16) & 0xff) }
+        for i in 0..<(w * h) {
+            buf[i * 4] = next(); buf[i * 4 + 1] = next(); buf[i * 4 + 2] = next(); buf[i * 4 + 3] = 255
+        }
+        return ctx.makeImage()!
+    }
+
     // MARK: - Reference (mirrors SSIMULACRA2.gaussianKernel + blur)
 
     private func firKernel(sigma: Float) -> [Float] {

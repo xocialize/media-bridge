@@ -65,6 +65,13 @@ public enum VideoQuality {
         let gpu = SSIMULACRA2Metal.shared
         func score(_ r: CGImage, _ d: CGImage) throws -> Double {
             if let gpu {
+                // Resident path when available: ingest + XYB + pyramid + reductions all
+                // on-device, one sync per frame (vs the V1 per-channel path's 18). Same FIR math;
+                // parity gated at ±0.05 in SSIMULACRA2MetalTests. MEDIAMEASURE_NO_RESIDENT=1
+                // drops back to V1 for A/B.
+                if gpu.residentAvailable {
+                    return try gpu.scoreResident(reference: r, distorted: d)
+                }
                 return try SSIMULACRA2.score(reference: r, distorted: d,
                                              channelScalars: gpu.channelScalarsFunction)
             }
@@ -131,6 +138,13 @@ public enum VideoQuality {
         let gpu = SSIMULACRA2Metal.shared
         func score(_ r: CGImage, _ d: CGImage) throws -> Double {
             if let gpu {
+                // Resident path when available: ingest + XYB + pyramid + reductions all
+                // on-device, one sync per frame (vs the V1 per-channel path's 18). Same FIR math;
+                // parity gated at ±0.05 in SSIMULACRA2MetalTests. MEDIAMEASURE_NO_RESIDENT=1
+                // drops back to V1 for A/B.
+                if gpu.residentAvailable {
+                    return try gpu.scoreResident(reference: r, distorted: d)
+                }
                 return try SSIMULACRA2.score(reference: r, distorted: d,
                                              channelScalars: gpu.channelScalarsFunction)
             }

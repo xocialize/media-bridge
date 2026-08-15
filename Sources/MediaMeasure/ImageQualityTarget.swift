@@ -53,10 +53,7 @@ public enum ImageQualityTarget {
             let decoded = try MediaMetrics.time("iqt.decode", lane: "decode", detail: 1,
                                                 attrs: ["codec": "heic"]) { try decode(data) }
             let score: Double = try MediaMetrics.time("iqt.score", lane: "score", detail: 1) {
-                if let channelScalars {
-                    return try SSIMULACRA2.score(reference: image, distorted: decoded, channelScalars: channelScalars)
-                }
-                return try SSIMULACRA2.score(reference: image, distorted: decoded)
+                try gpuOrInjected(reference: image, distorted: decoded, channelScalars: channelScalars)
             }
             bestData = data        // last evaluated; the search ends on the chosen knob
             return score
@@ -107,11 +104,7 @@ public enum ImageQualityTarget {
             let decoded = try MediaMetrics.time("iqt.decode", lane: "decode", detail: 1,
                                                 attrs: ["codec": "jpeg"]) { try decode(data) }
             return try MediaMetrics.time("iqt.score", lane: "score", detail: 1) {
-                if let channelScalars {
-                    return try SSIMULACRA2.score(reference: image, distorted: decoded,
-                                                 channelScalars: channelScalars)
-                }
-                return try SSIMULACRA2.score(reference: image, distorted: decoded)
+                try gpuOrInjected(reference: image, distorted: decoded, channelScalars: channelScalars)
             }
         }
         let data = try MediaMetrics.time("iqt.finalEncode", lane: "encode", detail: 1,
@@ -149,10 +142,7 @@ public enum ImageQualityTarget {
         let decoded = try MediaMetrics.time("iqt.decode", lane: "decode", detail: 1,
                                             attrs: ["codec": "png"]) { try decode(data) }
         let score: Double = try MediaMetrics.time("iqt.score", lane: "score", detail: 1) {
-            if let channelScalars {
-                return try SSIMULACRA2.score(reference: image, distorted: decoded, channelScalars: channelScalars)
-            }
-            return try SSIMULACRA2.score(reference: image, distorted: decoded)
+            try gpuOrInjected(reference: image, distorted: decoded, channelScalars: channelScalars)
         }
         return PNGResult(data: data, score: score)
     }
@@ -187,6 +177,21 @@ public enum ImageQualityTarget {
         ] as CFDictionary)
         guard CGImageDestinationFinalize(dest) else { throw EncodeError.encodeFailed }
         return out as Data
+    }
+
+    /// A non-nil `channelScalars` is the caller saying "use the GPU" — honor that intent with the
+    /// resident whole-score path when it's available (one sync per score vs V1's 18); a nil stays
+    /// pure-CPU (the explicit-backend and parity paths are untouched).
+    private static func gpuOrInjected(reference: CGImage, distorted: CGImage,
+                                      channelScalars: SSIMULACRA2.ChannelScalars?) throws -> Double {
+        if channelScalars != nil, let gpu = SSIMULACRA2Metal.shared, gpu.residentAvailable {
+            return try gpu.scoreResident(reference: reference, distorted: distorted)
+        }
+        if let channelScalars {
+            return try SSIMULACRA2.score(reference: reference, distorted: distorted,
+                                         channelScalars: channelScalars)
+        }
+        return try SSIMULACRA2.score(reference: reference, distorted: distorted)
     }
 
     // MARK: - ImageIO HEIC

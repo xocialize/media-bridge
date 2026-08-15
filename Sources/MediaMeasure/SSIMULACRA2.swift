@@ -107,7 +107,10 @@ public enum SSIMULACRA2 {
         }
     }
 
-    private struct Scale {
+    // Internal (not private): the resident Metal driver reproduces this pipeline on-device and
+    // funnels its pooled scalars back through the SAME Scale/finalScore/kernel — one source of
+    // truth for the trained weights and the final polynomial.
+    struct Scale {
         var avgSsim = [Double](repeating: 0, count: 6)    // [c*2 + n]
         var avgEdge = [Double](repeating: 0, count: 12)   // [c*4 + k]
     }
@@ -153,7 +156,7 @@ public enum SSIMULACRA2 {
         return finalScore(scales)
     }
 
-    private static func finalScore(_ scales: [Scale]) -> Double {
+    static func finalScore(_ scales: [Scale]) -> Double {
         var ssim = 0.0
         var i = 0
         for c in 0..<3 {
@@ -201,9 +204,9 @@ public enum SSIMULACRA2 {
 
     // MARK: - XYB
 
-    private static let kB0: Float = 0.0037930732552754493
-    private static let cbrtBias: Float = cbrtf(0.0037930732552754493)
-    private static let C2 = 0.0009
+    static let kB0: Float = 0.0037930732552754493
+    static let cbrtBias: Float = cbrtf(0.0037930732552754493)
+    static let C2 = 0.0009
 
     /// linear RGB planes → 3 positive-XYB planes (X, Y, B), each `count` long.
     private static func toPositiveXYB(_ r: [Float], _ g: [Float], _ b: [Float],
@@ -297,7 +300,7 @@ public enum SSIMULACRA2 {
 
     // MARK: - Gaussian blur (FIR, σ=1.5, separable, edge-clamp)
 
-    private static func gaussianKernel(sigma: Float) -> [Float] {
+    static func gaussianKernel(sigma: Float) -> [Float] {
         let radius = Int(ceilf(sigma * 4))
         var k = [Float](); k.reserveCapacity(radius * 2 + 1)
         var sum: Float = 0
