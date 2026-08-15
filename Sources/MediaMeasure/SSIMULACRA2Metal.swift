@@ -11,7 +11,10 @@ import MediaMetrics
 ///
 /// Stage 1 (this file): the separable Gaussian blur — the dominant cost and the parity-critical stage.
 /// Later stages (XYB ingest, products, SSIM/edge maps, reductions, downsample, final) extend this.
-public final class SSIMULACRA2Metal {
+// @unchecked Sendable: genuinely concurrency-safe as of the multi-set pool — every mutable member
+// (`pool`) sits behind `poolLock`; device/queue/pipelines are immutable after init; `scoreResident`
+// callers each hold a distinct working set. The Kit's width-3 bulk default calls this concurrently.
+public final class SSIMULACRA2Metal: @unchecked Sendable {
 
     public let device: MTLDevice
     private let queue: MTLCommandQueue
@@ -269,26 +272,45 @@ public final class SSIMULACRA2Metal {
         }
     }
     private let poolLock = NSLock()
-    private var cachedSet: WorkingSet?
+    /// Multi-set pool (was a single cached set): the Kit's bulk default of 3 concurrent stills
+    /// (ForgeOptimizerKit v0.12.0, AB-R-0069) meant callers beyond the one cache allocated a
+    /// transient working set PER SCORE (~0.18 GB @1080p, ~0.75 GB @4K — the 2.31× was measured
+    /// WITH that churn). Policy: sets are reused by exact (w, h); a checkout for NEW dims evicts
+    /// idle mismatched sets (a 4K batch's sets don't linger under 1080p work); at checkin, idle
+    /// sets trim to `maxIdleSets` so steady-state width-3 batches reuse 2 and allocate at most
+    /// one fresh set per BATCH, and an idle process holds ≤2 sets. In-flight count is bounded by
+    /// the callers' own width (the Kit clamps at 8).
+    private var pool: [WorkingSet] = []
+    private static let maxIdleSets = 2
 
     private func checkout(w: Int, h: Int, kernel: [Float], partialFloats: Int) -> WorkingSet? {
         poolLock.lock()
-        if let s = cachedSet, s.w == w, s.h == h, !s.inUse, s.partialCapacity >= partialFloats {
+        if let s = pool.first(where: { !$0.inUse && $0.w == w && $0.h == h
+                                       && $0.partialCapacity >= partialFloats }) {
             s.inUse = true
             poolLock.unlock()
             return s
         }
+        pool.removeAll { !$0.inUse && ($0.w != w || $0.h != h) }   // dims changed → drop stale idles
         poolLock.unlock()
         guard let fresh = WorkingSet(device: device, w: w, h: h, kernel: kernel,
                                      partialFloats: partialFloats) else { return nil }
         fresh.inUse = true
         poolLock.lock()
-        if cachedSet == nil || (cachedSet?.inUse == false) { cachedSet = fresh }   // adopt as the cache
+        pool.append(fresh)
         poolLock.unlock()
         return fresh
     }
     private func checkin(_ set: WorkingSet) {
-        poolLock.lock(); set.inUse = false; poolLock.unlock()
+        poolLock.lock()
+        set.inUse = false
+        var idle = 0
+        pool.removeAll { s in
+            guard !s.inUse else { return false }
+            idle += 1
+            return idle > Self.maxIdleSets
+        }
+        poolLock.unlock()
     }
 
     /// Full SSIMULACRA2 with ingest, XYB, the 2×2 pyramid, products, blurs, and reductions all

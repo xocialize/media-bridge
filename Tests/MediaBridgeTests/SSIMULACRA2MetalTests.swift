@@ -95,6 +95,44 @@ final class SSIMULACRA2MetalTests: XCTestCase {
         return ctx.makeImage()!
     }
 
+    /// The multi-set pool behind the Kit's width-3 bulk default: three CONCURRENT resident scores
+    /// of the same pair must all equal the serial answer (each caller gets its own set — no
+    /// cross-talk), and a dims change afterward must still score correctly (idle-set eviction).
+    func testResidentPoolConcurrencyAndDimsChange() async throws {
+        guard let metal = SSIMULACRA2Metal(), metal.residentAvailable else {
+            throw XCTSkip("no Metal device / resident disabled")
+        }
+        let ref = gradientImage(160, 120, shift: 0)
+        let dist = gradientImage(160, 120, shift: 0.05)
+        let serial = try metal.scoreResident(reference: ref, distorted: dist)
+
+        // CGImage is immutable-in-practice; the package's .v5 stance made this exact call. The
+        // scorer itself is @unchecked Sendable (pool-locked) as of the multi-set pool.
+        struct Pair: @unchecked Sendable { let r: CGImage, d: CGImage }
+        let pair = Pair(r: ref, d: dist)
+        let concurrent = await withTaskGroup(of: Double?.self) { group -> [Double] in
+            for _ in 0..<3 {
+                group.addTask { try? metal.scoreResident(reference: pair.r, distorted: pair.d) }
+            }
+            var out: [Double] = []
+            for await s in group { if let s { out.append(s) } }
+            return out
+        }
+        XCTAssertEqual(concurrent.count, 3)
+        for s in concurrent {
+            XCTAssertEqual(s, serial, "a pooled concurrent score must equal the serial answer")
+        }
+
+        // Dims change: stale idle sets evict, the new geometry scores clean, and going BACK to
+        // the first geometry still agrees with the original answer.
+        let refN = noiseImage(97, 131, seed: 0x0BAD_F00D)
+        let distN = noiseImage(97, 131, seed: 0x0D15_EA5E)
+        let swiftN = try SSIMULACRA2.score(reference: refN, distorted: distN)
+        let residentN = try metal.scoreResident(reference: refN, distorted: distN)
+        XCTAssertLessThan(abs(residentN - swiftN), 0.05)
+        XCTAssertEqual(try metal.scoreResident(reference: ref, distorted: dist), serial)
+    }
+
     // MARK: - Reference (mirrors SSIMULACRA2.gaussianKernel + blur)
 
     private func firKernel(sigma: Float) -> [Float] {
