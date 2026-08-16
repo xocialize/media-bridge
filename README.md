@@ -127,7 +127,11 @@ not the decision. Scaling uses a measured-good vImage Lanczos path; HDR→SDR us
   - **DTS / TrueHD** — the only open decoders are GPL or nonexistent; deferred under the
     permissive-only bar.
 - **Encodes:** HEVC / H.264 (VideoToolbox) + AAC (AudioToolbox); ProRes 4444 / HEVC-with-alpha via
-  the alpha writers. No AV1/VP9 encode (VideoToolbox can't on Apple Silicon).
+  the alpha writers. No AV1/VP9 encode **in this package** — VideoToolbox can't on Apple Silicon,
+  and libvpx is a vendored binary this package won't carry. **VP9-with-alpha encode does exist in
+  the stack**: [`vpx-swift`](https://github.com/xocialize/vpx-swift) is a transparent-WebM *encoder*
+  as well as the VP9/VP8 decoder for the seam below — it holds libvpx so this package stays
+  pure-Swift and binary-free. The package boundary *is* the quarantine.
 
 ## External-decoder seam (VP9/VP8 without contaminating this package)
 
