@@ -447,9 +447,18 @@ public enum VideoQualityTarget {
         // incrementally: the pass's sample is already scored, so the refinement scores only the
         // OFFSET frames (the midpoints the base stride skipped) and merges. Measured before the
         // merge existed: from-scratch 2× rescores were 42% of a near-floor item's wall, more than
-        // all its encodes (PERFORMANCE-BASELINE §4.3). For even strides the merged set is
-        // frame-identical to the old from-scratch refined set; odd strides shift membership by
-        // ≤1 frame (same density, equivalent estimator). Skipped when the stride is already 1.
+        // all its encodes (PERFORMANCE-BASELINE §4.3). Skipped when the stride is already 1.
+        //
+        // Density, stated exactly — the contract is "double the base pass", not "reproduce the old
+        // rescore". For EVEN strides the two interleaved lattices union to the stride-N/2 lattice,
+        // so the merged set is frame-identical to the old from-scratch refined set. For ODD
+        // strides they are NOT the same set and NOT the same density: the union of two stride-N
+        // lattices is 2/N, where the old `stride/2` rescore was 2/(N−1) — 0.4 vs 0.5 at N=5. Since
+        // the stride is deliberately left un-regularized (see the ⚠️ above), odd is the common
+        // case, so this is a real ~20% sparser near-gate sample than before the incremental merge.
+        // It is accepted: the phase diversity of two interleaved lattices is the point, and the
+        // cost is one scoring pass instead of two. Restoring the old density would change search
+        // outcomes and belongs in a measured decision, not here.
         let nearGateBand = 1.5
 
         // ── Speculative encode lane ──────────────────────────────────────────────────────
