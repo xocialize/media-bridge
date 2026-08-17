@@ -601,10 +601,32 @@ public enum VideoQualityTarget {
         // a second concurrent VT encode session (single-session is the pattern this OS beta has
         // validated; the new concurrency is encode-during-decode, the ordinary AV pattern). The
         // verdict claims the branch it needs; the other is revoked if unstarted, or drains and
-        // its temp dies with the rest. Scheduling is the ONLY thing that changes — identical
-        // `reencodeVideo` inputs produce identical bytes, so trajectories and deliverables must
-        // match the serial arm byte-for-byte (bench-gated). Kill switch for A/B and emergencies:
-        // MEDIABRIDGE_NO_SPECULATE=1 restores inline serial encodes.
+        // its temp dies with the rest. Scheduling is the ONLY thing that changes, so the lane must
+        // reproduce the serial arm's TRAJECTORY and VERDICT exactly — same bitrates, same pass
+        // sequence, same cleared/not per pass, same final p10 (bench-gated: forgebench compare.py's
+        // VERDICT PARITY section). Kill switch for A/B and emergencies: MEDIABRIDGE_NO_SPECULATE=1
+        // restores inline serial encodes.
+        //
+        // ⚠️ It does NOT gate on byte parity, and an earlier version of this comment wrongly claimed
+        // it could ("identical `reencodeVideo` inputs produce identical bytes"). They do not:
+        // byte-parity is an ENCODER property, not a pipeline property (LESSONS "Byte-parity is an
+        // ENCODER property"; AB-R-0050, AB-L-0013). VideoToolbox responds to the *timing* of
+        // appends, so the same frames fed at a different pace can come back re-encoded — five runs
+        // of ONE unmodified binary spread 48 B on the 4K master (~7 ppm) at identical trajectories,
+        // and two PURE-SERIAL runs differed at 931k byte positions.
+        //
+        // Resist the tempting shortcut that it is a resolution rule ("gate bytes at 1080p, skip at
+        // 4K"). Measured 2026-08-16 with a fixed-bitrate probe that bypasses this search entirely
+        // (`EncodeDeterminismTests`): the 4K master is stream-identical 12/12 IN ISOLATION — its
+        // bench variance is load-induced, i.e. produced by exactly the decode/score/speculate
+        // contention this lane creates — while `aisc_sevilla_players` at the same 3240×1920 as the
+        // byte-stable `aisc_ferrari_speed` varies 5.3% alone, and 19.2% at double the bitrate. That
+        // large regime is a MOVED GOP (27 keyframes in one run, 22 in the next), not QP dither.
+        //
+        // So a byte gate here would fire on noise on the master while catching nothing real, and
+        // asserting one would have convicted this lane for something a serial control exonerates in
+        // four minutes. forgebench's compare.py gates bytes within an explicit tolerance for the
+        // same reason; trajectory + verdict is the claim this lane actually owes.
         //
         // ⚖️ ADAPTIVE GATE (added when lever 3 inverted this lever's economics): speculation pays
         // only while the scoring window can absorb encode work — with V1 scoring (score ≥ encode)
