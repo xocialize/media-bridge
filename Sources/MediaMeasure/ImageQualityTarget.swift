@@ -31,14 +31,39 @@ public enum ImageQualityTarget {
 
     public enum EncodeError: Error { case encodeFailed, decodeFailed }
 
+    /// Which SSIMULACRA2 implementation scores the search — stated, rather than inferred from
+    /// whether `channelScalars` happens to be non-nil.
+    ///
+    /// The legacy `channelScalars:` parameter conflates two different requests. Every in-tree
+    /// caller passes `SSIMULACRA2Metal.shared?.channelScalarsFunction` purely to *mean* "use the
+    /// GPU", and the resident whole-score path (one sync per score vs the per-channel path's 18)
+    /// serves that intent far better than the closure they handed over — so the closure was
+    /// discarded. That is right for them and wrong for anyone injecting a backend they actually
+    /// need honored: a pinned `MTLDevice`, a CPU implementation for parity work, an A/B harness.
+    /// Naming the choice separates the two.
+    public enum ScoringBackend: Sendable {
+        /// Pure-Swift `SSIMULACRA2.score`. Honored exactly — never silently upgraded to the GPU.
+        case cpu
+        /// `SSIMULACRA2Metal.shared`'s resident whole-score path, falling back to CPU when no
+        /// Metal device is present or `MEDIAMEASURE_NO_RESIDENT` is set.
+        case residentGPU
+        /// The caller's own per-channel implementation. Honored **exactly** — this is the case the
+        /// legacy parameter could not express.
+        case injected(SSIMULACRA2.ChannelScalars)
+    }
+
     /// Encode `image` as HEIC at the lowest quality whose decoded result scores ≥ `targetScore`.
-    /// `channelScalars` injects SSIMULACRA2's per-channel hot path (e.g.
-    /// `SSIMULACRA2Metal.shared?.channelScalarsFunction` = all-GPU) — the search calls SSIMULACRA2 up to
-    /// `iterations` times, so a GPU backend cuts the encode time multiple-fold while keeping the achieved
-    /// score within fp tolerance of the CPU path. `nil` = pure-Swift.
+    /// The search calls SSIMULACRA2 up to `iterations` times, so the scoring backend dominates.
+    ///
+    /// Pass `backend:` to say which one — `.residentGPU` for the fast path, `.cpu` for pure Swift,
+    /// `.injected(fn)` to have your own implementation honored exactly. When `backend` is nil the
+    /// deprecated `channelScalars:` is interpreted exactly as it always has been (non-nil ⇒ prefer
+    /// the resident GPU path, discarding the closure; nil ⇒ CPU), so existing callers are
+    /// bit-for-bit unchanged.
     public static func encodeHEIC(_ image: CGImage, targetScore: Double,
                                   iterations: Int = 8,
-                                  channelScalars: SSIMULACRA2.ChannelScalars? = nil) throws -> Result {
+                                  channelScalars: SSIMULACRA2.ChannelScalars? = nil,
+                                  backend: ScoringBackend? = nil) throws -> Result {
         let mm = MediaMetrics.begin("iqt.search", lane: "orchestrate",
                                     attrs: ["codec": "heic", "target": "\(targetScore)",
                                             "w": "\(image.width)", "h": "\(image.height)"])
@@ -53,7 +78,8 @@ public enum ImageQualityTarget {
             let decoded = try MediaMetrics.time("iqt.decode", lane: "decode", detail: 1,
                                                 attrs: ["codec": "heic"]) { try decode(data) }
             let score: Double = try MediaMetrics.time("iqt.score", lane: "score", detail: 1) {
-                try gpuOrInjected(reference: image, distorted: decoded, channelScalars: channelScalars)
+                try score(reference: image, distorted: decoded,
+                          channelScalars: channelScalars, backend: backend)
             }
             bestData = data        // last evaluated; the search ends on the chosen knob
             return score
@@ -73,10 +99,11 @@ public enum ImageQualityTarget {
     /// CoreGraphics's Default-QoS rasterization (EMBED-004). Prefer this from async contexts.
     public static func encodeHEIC(_ image: CGImage, targetScore: Double,
                                   iterations: Int = 8,
-                                  channelScalars: SSIMULACRA2.ChannelScalars? = nil) async throws -> Result {
+                                  channelScalars: SSIMULACRA2.ChannelScalars? = nil,
+                                  backend: ScoringBackend? = nil) async throws -> Result {
         try await ScoringExecutor.run {
             try encodeHEIC(image, targetScore: targetScore, iterations: iterations,
-                           channelScalars: channelScalars)
+                           channelScalars: channelScalars, backend: backend)
         }
     }
 
@@ -88,9 +115,13 @@ public enum ImageQualityTarget {
     /// JPEG rings and inflates, which is why the caller races it against PNG and ships the smaller
     /// deliverable that keeps its guarantee, rather than classifying up front. ⚠️ JPEG has no
     /// alpha — callers gate transparency to PNG before reaching for this.
+    ///
+    /// Scoring backend: see `encodeHEIC`. Prefer `backend:`; `channelScalars:` is the legacy
+    /// spelling, kept for source compatibility and interpreted exactly as it always was.
     public static func encodeJPEG(_ image: CGImage, targetScore: Double,
                                   iterations: Int = 8,
-                                  channelScalars: SSIMULACRA2.ChannelScalars? = nil) throws -> Result {
+                                  channelScalars: SSIMULACRA2.ChannelScalars? = nil,
+                                  backend: ScoringBackend? = nil) throws -> Result {
         let mm = MediaMetrics.begin("iqt.search", lane: "orchestrate",
                                     attrs: ["codec": "jpeg", "target": "\(targetScore)",
                                             "w": "\(image.width)", "h": "\(image.height)"])
@@ -104,7 +135,8 @@ public enum ImageQualityTarget {
             let decoded = try MediaMetrics.time("iqt.decode", lane: "decode", detail: 1,
                                                 attrs: ["codec": "jpeg"]) { try decode(data) }
             return try MediaMetrics.time("iqt.score", lane: "score", detail: 1) {
-                try gpuOrInjected(reference: image, distorted: decoded, channelScalars: channelScalars)
+                try score(reference: image, distorted: decoded,
+                          channelScalars: channelScalars, backend: backend)
             }
         }
         let data = try MediaMetrics.time("iqt.finalEncode", lane: "encode", detail: 1,
@@ -118,10 +150,11 @@ public enum ImageQualityTarget {
     /// Async entry point — off the cooperative pool at `.utility` QoS (EMBED-004), like `encodeHEIC`.
     public static func encodeJPEG(_ image: CGImage, targetScore: Double,
                                   iterations: Int = 8,
-                                  channelScalars: SSIMULACRA2.ChannelScalars? = nil) async throws -> Result {
+                                  channelScalars: SSIMULACRA2.ChannelScalars? = nil,
+                                  backend: ScoringBackend? = nil) async throws -> Result {
         try await ScoringExecutor.run {
             try encodeJPEG(image, targetScore: targetScore, iterations: iterations,
-                           channelScalars: channelScalars)
+                           channelScalars: channelScalars, backend: backend)
         }
     }
 
@@ -132,8 +165,12 @@ public enum ImageQualityTarget {
     /// which is enabled. The score is **measured on the decode round-trip, never asserted** from
     /// "PNG is lossless": a 16-bit, CMYK, or exotic-colorspace source passes through an 8-bit RGB(A)
     /// conversion where losslessness is not a given, and the receipt should say what actually happened.
+    ///
+    /// Scoring backend: see `encodeHEIC`. Prefer `backend:`; `channelScalars:` is the legacy
+    /// spelling, kept for source compatibility and interpreted exactly as it always was.
     public static func encodePNG(_ image: CGImage,
-                                 channelScalars: SSIMULACRA2.ChannelScalars? = nil) throws -> PNGResult {
+                                 channelScalars: SSIMULACRA2.ChannelScalars? = nil,
+                                 backend: ScoringBackend? = nil) throws -> PNGResult {
         let mm = MediaMetrics.begin("iqt.png", lane: "orchestrate",
                                     attrs: ["w": "\(image.width)", "h": "\(image.height)"])
         defer { MediaMetrics.end(mm) }
@@ -142,7 +179,8 @@ public enum ImageQualityTarget {
         let decoded = try MediaMetrics.time("iqt.decode", lane: "decode", detail: 1,
                                             attrs: ["codec": "png"]) { try decode(data) }
         let score: Double = try MediaMetrics.time("iqt.score", lane: "score", detail: 1) {
-            try gpuOrInjected(reference: image, distorted: decoded, channelScalars: channelScalars)
+            try score(reference: image, distorted: decoded,
+                          channelScalars: channelScalars, backend: backend)
         }
         return PNGResult(data: data, score: score)
     }
@@ -150,9 +188,10 @@ public enum ImageQualityTarget {
     /// Async entry point: runs the encode + round-trip score off the cooperative pool at `.utility`
     /// QoS (same EMBED-004 inversion guard as `encodeHEIC`). Prefer this from async contexts.
     public static func encodePNG(_ image: CGImage,
-                                 channelScalars: SSIMULACRA2.ChannelScalars? = nil) async throws -> PNGResult {
+                                 channelScalars: SSIMULACRA2.ChannelScalars? = nil,
+                                 backend: ScoringBackend? = nil) async throws -> PNGResult {
         try await ScoringExecutor.run {
-            try encodePNG(image, channelScalars: channelScalars)
+            try encodePNG(image, channelScalars: channelScalars, backend: backend)
         }
     }
 
@@ -179,11 +218,31 @@ public enum ImageQualityTarget {
         return out as Data
     }
 
-    /// A non-nil `channelScalars` is the caller saying "use the GPU" — honor that intent with the
-    /// resident whole-score path when it's available (one sync per score vs V1's 18); a nil stays
-    /// pure-CPU (the explicit-backend and parity paths are untouched).
-    private static func gpuOrInjected(reference: CGImage, distorted: CGImage,
-                                      channelScalars: SSIMULACRA2.ChannelScalars?) throws -> Double {
+    /// Resolve the scoring backend for one comparison.
+    ///
+    /// An explicit `backend` always wins and is honored exactly — in particular `.injected(fn)`
+    /// calls `fn`, and `.cpu` stays on the pure-Swift path even when a GPU is sitting right there.
+    /// With no explicit backend we fall through to the legacy `channelScalars` reading, preserved
+    /// verbatim so every existing caller is bit-for-bit unchanged: non-nil means "the caller wants
+    /// the GPU", which the resident whole-score path serves better than the closure it handed over
+    /// (one sync per score vs the per-channel path's 18), and nil means CPU.
+    private static func score(reference: CGImage, distorted: CGImage,
+                              channelScalars: SSIMULACRA2.ChannelScalars?,
+                              backend: ScoringBackend?) throws -> Double {
+        switch backend {
+        case .cpu:
+            return try SSIMULACRA2.score(reference: reference, distorted: distorted)
+        case .residentGPU:
+            if let gpu = SSIMULACRA2Metal.shared, gpu.residentAvailable {
+                return try gpu.scoreResident(reference: reference, distorted: distorted)
+            }
+            return try SSIMULACRA2.score(reference: reference, distorted: distorted)
+        case .injected(let fn):
+            return try SSIMULACRA2.score(reference: reference, distorted: distorted,
+                                         channelScalars: fn)
+        case nil:
+            break                                   // legacy reading, below
+        }
         if channelScalars != nil, let gpu = SSIMULACRA2Metal.shared, gpu.residentAvailable {
             return try gpu.scoreResident(reference: reference, distorted: distorted)
         }

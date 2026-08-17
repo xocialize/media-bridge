@@ -82,6 +82,58 @@ final class SSIMULACRA2MetalTests: XCTestCase {
         XCTAssertEqual(again, residentN, "pooled re-score must be deterministic")
     }
 
+    /// The resident path rasterizes into POOLED upload buffers, and `CGContext.draw` composites
+    /// source-over — so before the clear, an image carrying alpha blended against whatever the
+    /// working set held from its previous occupant. That made the score a function of what the
+    /// pool scored last, and diverged from the CPU path, which composites over black every call.
+    /// Nothing else in this suite exercises alpha: every other fixture writes A = 255.
+    func testResidentScoreIsDeterministicForTranslucentInput() throws {
+        guard let metal = SSIMULACRA2Metal(), metal.residentAvailable else {
+            throw XCTSkip("no Metal device / resident disabled")
+        }
+        let (w, h) = (160, 120)
+        let ref = translucentImage(w, h, tint: 0)
+        let dist = translucentImage(w, h, tint: 6)
+
+        let first = try metal.scoreResident(reference: ref, distorted: dist)
+        // Poison the pooled upload buffers with an unrelated OPAQUE pair at the SAME dims — the
+        // pool reuses by (w, h), so this lands in the very working set the pair just used.
+        _ = try metal.scoreResident(reference: noiseImage(w, h, seed: 0x0A11_CE00),
+                                    distorted: noiseImage(w, h, seed: 0x0B0B_0B0B))
+        let second = try metal.scoreResident(reference: ref, distorted: dist)
+
+        XCTAssertEqual(first, second,
+                       "a translucent score must not depend on what the pool scored before it")
+
+        // …and the ground it composites over must be the CPU path's ground (black), not merely
+        // *some* stable ground — otherwise the two backends disagree on every alpha-bearing still.
+        let swiftScore = try SSIMULACRA2.score(reference: ref, distorted: dist)
+        XCTAssertLessThan(abs(second - swiftScore), 0.05,
+                          "resident=\(second) swift=\(swiftScore) Δ=\(abs(second - swiftScore))")
+    }
+
+    /// White premultiplied by a left-to-right alpha ramp (B=G=R=A), the `AlphaVideoWriterTests:8`
+    /// idiom — the only genuinely non-opaque fixture shape in this suite. `tint` darkens the
+    /// colour slightly so a ref/dist pair scores below 100; premultiplication requires RGB ≤ A.
+    private func translucentImage(_ w: Int, _ h: Int, tint: Int) -> CGImage {
+        let cs = CGColorSpaceCreateDeviceRGB()
+        let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                            space: cs, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        let buf = ctx.data!.bindMemory(to: UInt8.self, capacity: w * h * 4)
+        for y in 0..<h {
+            for x in 0..<w {
+                let a = x * 255 / max(1, w - 1)          // fully transparent → fully opaque
+                let v = max(0, a - tint)
+                let i = (y * w + x) * 4
+                buf[i] = UInt8(v)
+                buf[i + 1] = UInt8(v)
+                buf[i + 2] = UInt8(max(0, v - (y % 3)))  // a little vertical structure to score on
+                buf[i + 3] = UInt8(a)
+            }
+        }
+        return ctx.makeImage()!
+    }
+
     private func noiseImage(_ w: Int, _ h: Int, seed: UInt32) -> CGImage {
         let cs = CGColorSpaceCreateDeviceRGB()
         let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,

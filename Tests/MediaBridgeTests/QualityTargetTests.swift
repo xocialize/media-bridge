@@ -22,6 +22,51 @@ final class QualityTargetTests: XCTestCase {
         return ctx.makeImage()!
     }
 
+    /// `channelScalars:` was a flag in disguise: non-nil meant "use the GPU", and the closure was
+    /// discarded in favour of the resident whole-score path. That is right for the callers who
+    /// pass `SSIMULACRA2Metal.shared?.channelScalarsFunction`, and wrong for anyone injecting a
+    /// backend they need honored. `backend:` names the choice; these three cases pin all of it,
+    /// including that the legacy reading is preserved byte-for-byte.
+    func testScoringBackendIsHonoredAndLegacyReadingPreserved() throws {
+        final class Spy: @unchecked Sendable {
+            private let lock = NSLock()
+            private var count = 0
+            var calls: Int { lock.lock(); defer { lock.unlock() }; return count }
+            func hit() { lock.lock(); count += 1; lock.unlock() }
+        }
+        let spy = Spy()
+        // Deterministic stand-in — the contract under test is WHETHER this runs, not what it returns.
+        let injected: SSIMULACRA2.ChannelScalars = { _, _, _, _, _ in
+            spy.hit()
+            return SSIMULACRA2.ChannelResult(ssimL1: 0.99, ssimL4: 0.99, artifactL1: 0.01,
+                                             artifactL4: 0.01, detailL1: 0.01, detailL4: 0.01)
+        }
+        let img = makeImage()
+
+        // 1. `.injected` is honored exactly — the whole point of the new case.
+        _ = try ImageQualityTarget.encodeHEIC(img, targetScore: 80, iterations: 2,
+                                              backend: .injected(injected))
+        XCTAssertGreaterThan(spy.calls, 0, "an injected backend must actually be called")
+
+        // 2. An explicit backend WINS over the legacy parameter, and `.cpu` is not silently
+        //    upgraded to the GPU just because a device is present.
+        let afterInjected = spy.calls
+        _ = try ImageQualityTarget.encodeHEIC(img, targetScore: 80, iterations: 2,
+                                              channelScalars: injected, backend: .cpu)
+        XCTAssertEqual(spy.calls, afterInjected, "backend: .cpu must override channelScalars:")
+
+        // 3. Legacy reading, preserved verbatim: with no explicit backend a non-nil
+        //    `channelScalars` still means "prefer the resident GPU path", closure discarded.
+        //    Only assertable when that path exists — otherwise the fallback legitimately calls it.
+        if let gpu = SSIMULACRA2Metal.shared, gpu.residentAvailable {
+            let afterCPU = spy.calls
+            _ = try ImageQualityTarget.encodeHEIC(img, targetScore: 80, iterations: 2,
+                                                  channelScalars: injected)
+            XCTAssertEqual(spy.calls, afterCPU,
+                           "legacy channelScalars: must keep routing to the resident path unchanged")
+        }
+    }
+
     func testSearchMeetsTarget() throws {
         let img = makeImage()
         let r = try ImageQualityTarget.encodeHEIC(img, targetScore: 80, iterations: 6)

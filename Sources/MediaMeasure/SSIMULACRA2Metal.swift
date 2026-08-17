@@ -461,8 +461,27 @@ public final class SSIMULACRA2Metal: @unchecked Sendable {
         return SSIMULACRA2.finalScore(scales)
     }
 
+    /// True when `draw` is guaranteed to overwrite every destination byte — no alpha channel means
+    /// source-over degenerates to a copy. Conservative: a `premultipliedLast` image whose pixels
+    /// happen to all be opaque still reports non-opaque here, and pays the clear.
+    private static func isOpaque(_ image: CGImage) -> Bool {
+        switch image.alphaInfo {
+        case .none, .noneSkipFirst, .noneSkipLast: return true
+        default: return false
+        }
+    }
+
     private static func rasterize(_ image: CGImage, into buf: MTLBuffer,
                                   width: Int, height: Int) throws {
+        // ⚠️ The destination is a POOLED buffer holding the previous occupant's pixels (and
+        // uninitialized memory on first use), and `CGContext.draw` composites source-over — so an
+        // image carrying alpha would blend against whatever was there, making the score depend on
+        // what the pool scored last. Zero first. Black is not an arbitrary choice: it is exactly
+        // what the CPU twin composites over (`SSIMULACRA2.linearRGB` allocates
+        // `[UInt8](repeating: 0, …)` every call), so this is what keeps the two paths in parity.
+        // `.copy` blend mode is NOT an equivalent shortcut — it diverges for straight-alpha
+        // sources, which do not carry premultiplied-over-black RGB.
+        if !isOpaque(image) { memset(buf.contents(), 0, width * height * 4) }
         let space = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
         guard let ctx = CGContext(data: buf.contents(), width: width, height: height,
                                   bitsPerComponent: 8, bytesPerRow: width * 4, space: space,

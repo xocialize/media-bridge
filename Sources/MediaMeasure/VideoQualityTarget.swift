@@ -16,6 +16,131 @@ import VideoToolbox
 /// last START without a matching END names the operation that was in flight. Open-write-sync-close
 /// per event: raceless, and the fsync survives a hard lock. Off (zero cost) unless the env var is
 /// set — a library shouldn't write files as a silent side effect.
+/// A one-way "stop" flag, set from a `withTaskCancellationHandler` on any thread and read from the
+/// `requestMediaDataWhenReady` pump — which runs on a `DispatchQueue`, OUTSIDE the Task context,
+/// where `Task.isCancelled` is simply not visible. This flag is the only channel into that pump.
+/// `NSLock` rather than `Synchronization.Atomic`: the package floor is macOS 14 and `Atomic` is 15+.
+/// The per-frame read costs tens of nanoseconds against millisecond frames.
+final class CancelFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var flag = false
+    func set() { lock.lock(); flag = true; lock.unlock() }
+    var isSet: Bool { lock.lock(); defer { lock.unlock() }; return flag }
+}
+
+/// Runs its body at most once, ever. Guards `group.leave()` against an over-leave crash: adding a
+/// cancellation early-out gives each pump a THIRD terminal path, and `requestMediaDataWhenReady`
+/// may re-invoke its closure after `markAsFinished()` — so "we already left" has to be a fact, not
+/// an assumption. (This also closes a latent over-leave in the mezzanine's video pump, which had
+/// two unguarded `leave()` sites before any of this.)
+final class Once: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = false
+    func run(_ body: () -> Void) {
+        lock.lock(); let first = !done; done = true; lock.unlock()
+        if first { body() }
+    }
+}
+
+/// The speculative encode lane: a serial FIFO chain of encode jobs, never two concurrent VT encode
+/// sessions. Bisection has only two possible next bitrates, so while a candidate scores, both
+/// encode ahead on the otherwise-idle hardware encoder; the verdict claims the branch it needs and
+/// the loser is revoked (if unstarted) or drains.
+///
+/// File scope rather than nested inside `encode` so it can be unit-tested directly — its
+/// revoke/cancel/drain semantics are what guarantee no writer outlives a search, and that guarantee
+/// deserves tests that do not have to drive a whole video search to reach it.
+final class EncodeLane: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending: [UInt64: Task<URL?, Error>] = [:]
+    private var revoked: Set<UInt64> = []
+    private var tail: Task<Void, Never>?
+    /// Every outstanding job, keyed AND un-keyed. `pending` only holds *claimable* (keyed) jobs, so
+    /// it cannot reach the plain serialized encodes — and those are exactly the ones that would
+    /// otherwise hold a throwing search hostage for a full clip-length encode.
+    private var live: [UInt64: Task<URL?, Error>] = [:]
+    private var seq: UInt64 = 0
+
+    /// Enqueue behind everything already queued. A `key` makes the job claimable (speculation);
+    /// `nil` is a plain serialized encode. Re-submitting a pending key returns the existing job; a
+    /// fresh submit clears any stale revocation of its key.
+    func submit(key: UInt64?, _ run: @escaping @Sendable () async throws -> URL) -> Task<URL?, Error> {
+        lock.lock(); defer { lock.unlock() }
+        if let key, let existing = pending[key] { return existing }
+        if let key { revoked.remove(key) }
+        let prev = tail
+        seq &+= 1
+        let id = seq
+        let job = Task<URL?, Error> {
+            defer { self.retire(id) }
+            await prev?.value
+            if let key, self.isRevoked(key) { return nil }
+            try Task.checkCancellation()      // never start an encode that is already doomed
+            return try await run()
+        }
+        live[id] = job
+        if let key { pending[key] = job }
+        tail = Task { _ = try? await job.value }
+        return job
+    }
+
+    func claim(_ key: UInt64) -> Task<URL?, Error>? {
+        lock.lock(); defer { lock.unlock() }
+        return pending.removeValue(forKey: key)
+    }
+
+    func revoke(_ key: UInt64) {
+        lock.lock(); defer { lock.unlock() }
+        revoked.insert(key)
+        pending.removeValue(forKey: key)
+    }
+
+    /// Revoke every key still queued. Used when a search loop EXITS EARLY — bracket convergence,
+    /// the slope-projection abort, the descent break — where the surviving speculative candidate is
+    /// never claimed and never revoked, so it would encode the whole clip and `drain()` would wait
+    /// for it: the convergence break saving one pass and immediately spending one.
+    func revokeAll() {
+        lock.lock(); defer { lock.unlock() }
+        revoked.formUnion(pending.keys)
+        pending.removeAll()
+    }
+
+    /// Revoke every key AND cancel every outstanding job, keyed or not, started or not. An unstarted
+    /// job throws at its `checkCancellation`; a started one stops at its next pump iteration (see
+    /// `reencodeVideo`'s `CancelFlag`). `tail` is deliberately NOT cancelled — `drain()` is what
+    /// waits on it, and cancelling it would let the drain return before the last writer is down.
+    func cancelAll() {
+        let victims: [Task<URL?, Error>] = {
+            lock.lock(); defer { lock.unlock() }
+            revoked.formUnion(pending.keys)
+            pending.removeAll()
+            return Array(live.values)
+        }()
+        // Cancel OUTSIDE the lock: `Task.cancel()` runs any installed `onCancel` body synchronously
+        // on this thread, so holding the lock here would make a future handler that touches the
+        // lane deadlock. Structural, not incidental.
+        for t in victims { t.cancel() }
+    }
+
+    /// Await every queued/running job (revoked ones self-skip) — no writer outlives the search, and
+    /// temp cleanup never races an in-flight encode.
+    func drain() async {
+        let t: Task<Void, Never>? = { lock.lock(); defer { lock.unlock() }; return tail }()
+        await t?.value
+    }
+
+    private func isRevoked(_ key: UInt64) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return revoked.contains(key)
+    }
+
+    /// Called from the job body, off-lock, so `live` never outgrows the outstanding set.
+    private func retire(_ id: UInt64) {
+        lock.lock(); defer { lock.unlock() }
+        live[id] = nil
+    }
+}
+
 enum VTBreadcrumb {
     static let path: String? = ProcessInfo.processInfo.environment["MEDIABRIDGE_VT_LOG"]
 
@@ -357,6 +482,13 @@ public enum VideoQualityTarget {
 
         let tmpDir = FileManager.default.temporaryDirectory
         var temps: [URL] = []
+        // Every temp dies with this call — success, throw, or cancellation. A `defer` is the only
+        // placement that covers all three of the paths that create them: a mezzanine failure
+        // (below), a mid-search throw, and a failed atomic DELIVERY (`copyItem`/`moveItem` further
+        // down, which run AFTER the search has already drained — a missing output directory or a
+        // full disk used to leave every `vqt-*.mp4` on disk). It runs after the catch below, so the
+        // lane has already been brought down before anything is unlinked.
+        defer { for t in temps { try? FileManager.default.removeItem(at: t) } }
 
         // Scoring reference AND (for a downscale) the search input. Same-res: the source itself.
         // Downscale: a near-lossless Lanczos MEZZANINE at the target resolution — candidates encode
@@ -447,9 +579,18 @@ public enum VideoQualityTarget {
         // incrementally: the pass's sample is already scored, so the refinement scores only the
         // OFFSET frames (the midpoints the base stride skipped) and merges. Measured before the
         // merge existed: from-scratch 2× rescores were 42% of a near-floor item's wall, more than
-        // all its encodes (PERFORMANCE-BASELINE §4.3). For even strides the merged set is
-        // frame-identical to the old from-scratch refined set; odd strides shift membership by
-        // ≤1 frame (same density, equivalent estimator). Skipped when the stride is already 1.
+        // all its encodes (PERFORMANCE-BASELINE §4.3). Skipped when the stride is already 1.
+        //
+        // Density, stated exactly — the contract is "double the base pass", not "reproduce the old
+        // rescore". For EVEN strides the two interleaved lattices union to the stride-N/2 lattice,
+        // so the merged set is frame-identical to the old from-scratch refined set. For ODD
+        // strides they are NOT the same set and NOT the same density: the union of two stride-N
+        // lattices is 2/N, where the old `stride/2` rescore was 2/(N−1) — 0.4 vs 0.5 at N=5. Since
+        // the stride is deliberately left un-regularized (see the ⚠️ above), odd is the common
+        // case, so this is a real ~20% sparser near-gate sample than before the incremental merge.
+        // It is accepted: the phase diversity of two interleaved lattices is the point, and the
+        // cost is one scoring pass instead of two. Restoring the old density would change search
+        // outcomes and belongs in a measured decision, not here.
         let nearGateBand = 1.5
 
         // ── Speculative encode lane ──────────────────────────────────────────────────────
@@ -460,10 +601,32 @@ public enum VideoQualityTarget {
         // a second concurrent VT encode session (single-session is the pattern this OS beta has
         // validated; the new concurrency is encode-during-decode, the ordinary AV pattern). The
         // verdict claims the branch it needs; the other is revoked if unstarted, or drains and
-        // its temp dies with the rest. Scheduling is the ONLY thing that changes — identical
-        // `reencodeVideo` inputs produce identical bytes, so trajectories and deliverables must
-        // match the serial arm byte-for-byte (bench-gated). Kill switch for A/B and emergencies:
-        // MEDIABRIDGE_NO_SPECULATE=1 restores inline serial encodes.
+        // its temp dies with the rest. Scheduling is the ONLY thing that changes, so the lane must
+        // reproduce the serial arm's TRAJECTORY and VERDICT exactly — same bitrates, same pass
+        // sequence, same cleared/not per pass, same final p10 (bench-gated: forgebench compare.py's
+        // VERDICT PARITY section). Kill switch for A/B and emergencies: MEDIABRIDGE_NO_SPECULATE=1
+        // restores inline serial encodes.
+        //
+        // ⚠️ It does NOT gate on byte parity, and an earlier version of this comment wrongly claimed
+        // it could ("identical `reencodeVideo` inputs produce identical bytes"). They do not:
+        // byte-parity is an ENCODER property, not a pipeline property (LESSONS "Byte-parity is an
+        // ENCODER property"; AB-R-0050, AB-L-0013). VideoToolbox responds to the *timing* of
+        // appends, so the same frames fed at a different pace can come back re-encoded — five runs
+        // of ONE unmodified binary spread 48 B on the 4K master (~7 ppm) at identical trajectories,
+        // and two PURE-SERIAL runs differed at 931k byte positions.
+        //
+        // Resist the tempting shortcut that it is a resolution rule ("gate bytes at 1080p, skip at
+        // 4K"). Measured 2026-08-16 with a fixed-bitrate probe that bypasses this search entirely
+        // (`EncodeDeterminismTests`): the 4K master is stream-identical 12/12 IN ISOLATION — its
+        // bench variance is load-induced, i.e. produced by exactly the decode/score/speculate
+        // contention this lane creates — while `aisc_sevilla_players` at the same 3240×1920 as the
+        // byte-stable `aisc_ferrari_speed` varies 5.3% alone, and 19.2% at double the bitrate. That
+        // large regime is a MOVED GOP (27 keyframes in one run, 22 in the next), not QP dither.
+        //
+        // So a byte gate here would fire on noise on the master while catching nothing real, and
+        // asserting one would have convicted this lane for something a serial control exonerates in
+        // four minutes. forgebench's compare.py gates bytes within an explicit tolerance for the
+        // same reason; trajectory + verdict is the claim this lane actually owes.
         //
         // ⚖️ ADAPTIVE GATE (added when lever 3 inverted this lever's economics): speculation pays
         // only while the scoring window can absorb encode work — with V1 scoring (score ≥ encode)
@@ -474,52 +637,15 @@ public enum VideoQualityTarget {
         // Scheduling never changes trajectories (measured), so the timing-dependent gate cannot
         // change results — only wall clock.
         let speculate = ProcessInfo.processInfo.environment["MEDIABRIDGE_NO_SPECULATE"] == nil
-        var specActive = false
+        // Test/bench seam, third of three (`MEDIABRIDGE_NO_SPECULATE`, `MEDIABRIDGE_NO_SEARCHPRIOR`):
+        // force the lane on from pass 1, bypassing the measured gate below. The gate compares real
+        // resident-scoring wall against a real hardware encode, which no test can arrange
+        // deterministically — on Apple silicon at test clip sizes the encode always wins and the
+        // lane never engages, so its cleanup semantics would go untested. Read per-call so `setenv`
+        // from a test works. Forcing it cannot change RESULTS, only scheduling (measured).
+        var specActive = ProcessInfo.processInfo.environment["MEDIABRIDGE_FORCE_SPECULATE"] == "1"
         var serialEncMs = 0.0, serialScMs = 0.0, serialPasses = 0
 
-        final class EncodeLane: @unchecked Sendable {
-            private let lock = NSLock()
-            private var pending: [UInt64: Task<URL?, Error>] = [:]
-            private var revoked: Set<UInt64> = []
-            private var tail: Task<Void, Never>?
-
-            /// Enqueue behind everything already queued. A `key` makes the job claimable
-            /// (speculation); `nil` is a plain serialized encode. Re-submitting a pending key
-            /// returns the existing job; a fresh submit clears any stale revocation of its key.
-            func submit(key: UInt64?, _ run: @escaping @Sendable () async throws -> URL) -> Task<URL?, Error> {
-                lock.lock(); defer { lock.unlock() }
-                if let key, let existing = pending[key] { return existing }
-                if let key { revoked.remove(key) }
-                let prev = tail
-                let job = Task<URL?, Error> {
-                    await prev?.value
-                    if let key, self.isRevoked(key) { return nil }
-                    return try await run()
-                }
-                if let key { pending[key] = job }
-                tail = Task { _ = try? await job.value }
-                return job
-            }
-            func claim(_ key: UInt64) -> Task<URL?, Error>? {
-                lock.lock(); defer { lock.unlock() }
-                return pending.removeValue(forKey: key)
-            }
-            func revoke(_ key: UInt64) {
-                lock.lock(); defer { lock.unlock() }
-                revoked.insert(key)
-                pending.removeValue(forKey: key)
-            }
-            private func isRevoked(_ key: UInt64) -> Bool {
-                lock.lock(); defer { lock.unlock() }
-                return revoked.contains(key)
-            }
-            /// Await every queued/running job (revoked ones self-skip) — no writer outlives the
-            /// search, and temp cleanup never races an in-flight encode.
-            func drain() async {
-                let t: Task<Void, Never>? = { lock.lock(); defer { lock.unlock() }; return tail }()
-                await t?.value
-            }
-        }
         let lane = EncodeLane()
 
         // The encode work itself, as a lane job. Captures are Sendable value types only.
@@ -577,14 +703,21 @@ public enum VideoQualityTarget {
                                                               "mbps": String(format: "%.2f", b / 1e6),
                                                               "minQP": minQP.map(String.init) ?? "",
                                                               "spec": claimed != nil ? "hit" : "miss"]) {
-                try await job.value
+                // Layer 2 of cancellation: lane jobs are UNSTRUCTURED Tasks, so they inherit no
+                // cancellation from us, and `await job.value` is not itself a cancellation-aware
+                // suspension. Without this bridge, cancelling the search parks here until the
+                // encode finishes on its own and nothing on the lane ever stops.
+                try await withTaskCancellationHandler { try await job.value }
+                onCancel: { job.cancel() }
             }
             if encoded == nil {
                 // Unreachable by construction (a claimed job is never revoked) — but if it ever
                 // happens, pay the inline encode rather than fail the pass.
                 let fresh = tmpDir.appendingPathComponent("vqt-\(UUID().uuidString).mp4")
                 temps.append(fresh)
-                encoded = try await lane.submit(key: nil, encodeRun(b, minQP: minQP, to: fresh)).value
+                let fallback = lane.submit(key: nil, encodeRun(b, minQP: minQP, to: fresh))
+                encoded = try await withTaskCancellationHandler { try await fallback.value }
+                onCancel: { fallback.cancel() }
             }
             guard let tmp = encoded else { throw EncodeError.noVideoTrack }
             let encMs = MediaProfile.ms(since: tEnc); profTranscodeMs += encMs
@@ -633,203 +766,228 @@ public enum VideoQualityTarget {
         // is walking down, so start assuming clears. A wrong guess costs nothing but queue order.
         var lastCleared = true
         var misses: [(bitrate: Double, p10: Double)] = []
-        for i in 0..<iterations {
-            if bracketEpsilon > 0, (hi - lo) <= bracketEpsilon * hi {
-                MediaProfile.log(String(format: "bracket converged (%.2f–%.2f Mbps, ≤%.0f%%) — %@",
-                                        lo / 1e6, hi / 1e6, bracketEpsilon * 100,
-                                        best != nil ? "squeeze refines from emitted bytes"
-                                                    : "nothing in-bracket clears"))
-                break
-            }
-            let b = (lo + hi) / 2
-            let bClear = (lo + b) / 2                     // next candidate if this one clears
-            let bMiss = (b + hi) / 2                      // next candidate if this one misses
-            // Break-even is a FULL encode, not half: with the serial lane, a wrong-order pass
-            // costs 2·enc − sc (loser drains, then the winner), which beats serial (enc) only
-            // when sc > enc. A 0.5 threshold shipped first and measurably regressed near-floor
-            // 1080p +17% (rescore-inflated pass-1 windows tripped it; bracketed run 173757).
-            if speculate, !specActive, serialPasses >= 1, serialScMs >= serialEncMs {
-                specActive = true
-                MediaProfile.log(String(format: "speculation ON (score %.0f ms ≥ encode %.0f ms per pass)",
-                                        serialScMs / Double(serialPasses),
-                                        serialEncMs / Double(serialPasses)))
-            }
-            ensureQueued(b)                               // this pass's own encode leads the queue
-            if specActive, i + 1 < iterations {
-                for nb in (lastCleared ? [bClear, bMiss] : [bMiss, bClear]) { ensureQueued(nb) }
-            }
-            if try await searchStep(b, "iter \(i + 1)") {
-                hi = b                                    // clears → try smaller (lower bitrate)
-                lastCleared = true
-                lane.revoke(bMiss.bitPattern)
-            } else {
-                lo = b                                    // below floor → need more bitrate
-                lastCleared = false
-                lane.revoke(bClear.bitPattern)
-                misses.append((b, lastPassP10))
-                if searchPriors, best == nil, misses.count >= 2 {
-                    let (b1, p1) = misses[misses.count - 2]
-                    let (b2, p2) = misses[misses.count - 1]
-                    let slope = b2 > b1 ? max(0, (p2 - p1) / ((b2 - b1) / 1e6)) : 0
-                    let projected = p2 + slope * ((hi - b2) / 1e6)
-                    if projected < targetScore - abortMargin {
-                        MediaProfile.log(String(format: "abort: p10 %.1f at %.2f Mbps projects to "
-                            + "%.1f at the %.2f Mbps ceiling (floor %.0f) — bisection is futile",
-                                                p2, b2 / 1e6, projected, hi / 1e6, targetScore))
-                        MediaMetrics.event("vqt.abort",
-                                           attrs: ["projected": String(format: "%.1f", projected)])
-                        lane.revoke(bClear.bitPattern)
-                        break
-                    }
-                }
-            }
-        }
-
-        // Descent extension: `lo` never moved — no candidate ever failed the floor, so the true
-        // clearing point sits somewhere BELOW everything tested (very compressible content, or an
-        // over-provisioned master), and stopping here would ship bits the perceptual floor never
-        // asked for. One extension pass reaches 50× further down; it only runs when the floor never
-        // pushed back, so typical content pays nothing.
-        if lo == initialLo, let current = best {
-            MediaProfile.log("descent: no candidate failed the floor — extending the search down")
-            plannedPasses += iterations   // re-pace the progress bar for the extension
-            var lo2 = Double(current.bitrate) * 0.02
-            var hi2 = Double(current.bitrate)
+        // Everything that can queue lane work lives inside. `defer` cannot `await`, so the
+        // drain has to be a catch: on any throw the lane is cancelled and drained BEFORE the
+        // temp `defer` above fires, so no writer is ever still holding a file we then unlink.
+        do {
             for i in 0..<iterations {
-                if bracketEpsilon > 0, (hi2 - lo2) <= bracketEpsilon * hi2 {
-                    MediaProfile.log(String(format: "descent bracket converged (%.2f–%.2f Mbps)",
-                                            lo2 / 1e6, hi2 / 1e6))
+                if bracketEpsilon > 0, (hi - lo) <= bracketEpsilon * hi {
+                    MediaProfile.log(String(format: "bracket converged (%.2f–%.2f Mbps, ≤%.0f%%) — %@",
+                                            lo / 1e6, hi / 1e6, bracketEpsilon * 100,
+                                            best != nil ? "squeeze refines from emitted bytes"
+                                                        : "nothing in-bracket clears"))
                     break
                 }
-                let b = (lo2 + hi2) / 2
-                let bClear = (lo2 + b) / 2
-                let bMiss = (b + hi2) / 2
-                ensureQueued(b)
+                let b = (lo + hi) / 2
+                let bClear = (lo + b) / 2                     // next candidate if this one clears
+                let bMiss = (b + hi) / 2                      // next candidate if this one misses
+                // Break-even is a FULL encode, not half: with the serial lane, a wrong-order pass
+                // costs 2·enc − sc (loser drains, then the winner), which beats serial (enc) only
+                // when sc > enc. A 0.5 threshold shipped first and measurably regressed near-floor
+                // 1080p +17% (rescore-inflated pass-1 windows tripped it; bracketed run 173757).
+                if speculate, !specActive, serialPasses >= 1, serialScMs >= serialEncMs {
+                    specActive = true
+                    MediaProfile.log(String(format: "speculation ON (score %.0f ms ≥ encode %.0f ms per pass)",
+                                            serialScMs / Double(serialPasses),
+                                            serialEncMs / Double(serialPasses)))
+                }
+                ensureQueued(b)                               // this pass's own encode leads the queue
                 if specActive, i + 1 < iterations {
                     for nb in (lastCleared ? [bClear, bMiss] : [bMiss, bClear]) { ensureQueued(nb) }
                 }
-                if try await searchStep(b, "descent \(i + 1)") {
-                    hi2 = b
+                if try await searchStep(b, "iter \(i + 1)") {
+                    hi = b                                    // clears → try smaller (lower bitrate)
                     lastCleared = true
                     lane.revoke(bMiss.bitPattern)
                 } else {
-                    lo2 = b
+                    lo = b                                    // below floor → need more bitrate
                     lastCleared = false
                     lane.revoke(bClear.bitPattern)
+                    misses.append((b, lastPassP10))
+                    if searchPriors, best == nil, misses.count >= 2 {
+                        let (b1, p1) = misses[misses.count - 2]
+                        let (b2, p2) = misses[misses.count - 1]
+                        let slope = b2 > b1 ? max(0, (p2 - p1) / ((b2 - b1) / 1e6)) : 0
+                        let projected = p2 + slope * ((hi - b2) / 1e6)
+                        if projected < targetScore - abortMargin {
+                            MediaProfile.log(String(format: "abort: p10 %.1f at %.2f Mbps projects to "
+                                + "%.1f at the %.2f Mbps ceiling (floor %.0f) — bisection is futile",
+                                                    p2, b2 / 1e6, projected, hi / 1e6, targetScore))
+                            MediaMetrics.event("vqt.abort",
+                                               attrs: ["projected": String(format: "%.1f", projected)])
+                            lane.revoke(bClear.bitPattern)
+                            break
+                        }
+                    }
                 }
             }
-        }
 
-        // Corridor squeeze: one post-search candidate below the winner's *emitted* rate with the
-        // min-QP corridor engaged. The corridor redistributes easy-frame overspend into the hard
-        // band, clearing the same floor at a lower rate on real content (Sevilla: −10–15% bytes at
-        // equal p10) — but its floor↔QP mapping is content-dependent, so it must never gate the
-        // search itself. Adopt only a candidate that still clears the floor AND is strictly smaller;
-        // any other outcome keeps the incumbent. (Nominal targets overshoot what ABR actually
-        // emits, so the probe anchors on emitted bytes, not the nominal search bitrate.)
-        // Up to 3 steps: the binary search's landing is jittery (p10 over ~13 sampled frames flips
-        // near the gate, pinning `lo` above the true clearing point — Ferrari landed 15.8 Mbps
-        // where ~11.5 clears), and each adopted step re-anchors on the new winner's emitted rate,
-        // so the walk-down follows actual bytes, not nominal fiction. Stops the first time a
-        // candidate fails the floor or fails to shrink.
-        if let squeezeMinQP = profile.minAllowedQP {
-            for _ in 0..<3 {
-                guard let current = best else { break }
-                let curBytes = (try? current.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-                let actualRate = duration > 0 ? Double(curBytes) * 8 / duration : 0
-                guard actualRate > 0 else { break }
-                MediaProfile.log(String(format: "corridor squeeze: winner emitted %.2f Mbps — probing %.2f with QP ≥ %d",
-                                        actualRate / 1e6, actualRate * 0.92 / 1e6, squeezeMinQP))
-                guard try await searchStep(actualRate * 0.92, "squeeze", minQP: squeezeMinQP),
-                      let nb = best, nb.url != current.url else { break }
-                let nbBytes = (try? nb.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-                if nbBytes >= curBytes { best = current; break }   // not smaller → keep the incumbent
-            }
-        }
+            // Fix for the orphaned speculative: every early exit above — bracket convergence, the
+            // slope-projection abort, or simply running out of iterations — leaves the branch that
+            // WOULD have been the next pass still queued and unclaimed. Nothing will ever claim it, so
+            // it would encode the whole clip and `drain()` below would wait for it, spending exactly
+            // the pass the convergence break just saved. Unstarted jobs self-skip; one already running
+            // still drains, which is the honest bound.
+            lane.revokeAll()
 
-        let chosen: (bitrate: Int, score: VideoQualityScore, url: URL)
-        if let best {
-            chosen = best
-        } else {
-            let tmp = tmpDir.appendingPathComponent("vqt-final-\(UUID().uuidString).mp4")
-            temps.append(tmp)
-            plannedPasses += 1
-            emit(.pass(label: "ceiling", index: passesDone + 1, planned: plannedPasses,
-                       bitrate: Int(hi)), passFraction(0.05))
-            // Through the lane like every other encode — never concurrent with a draining loser.
-            _ = try await MediaMetrics.time("vqt.pass.encode", lane: "encode",
-                                            attrs: ["label": "ceiling",
-                                                    "mbps": String(format: "%.2f", hi / 1e6)]) {
-                try await lane.submit(key: nil) {
-                    try await MediaMetrics.time("vqt.spec.encode", lane: "encode",
-                                                attrs: ["mbps": String(format: "%.2f", hi / 1e6)]) {
-                        try await reencodeVideo(input: searchInput, output: tmp, bitrate: Int(hi),
-                                                outWidth: candW, outHeight: candH,
-                                                codec: profile.codec, webSafeAudio: profile.webSafeAudio,
-                                                maxQP: profile.maxAllowedQP,
-                                                lookAhead: profile.lookAheadFrames,
-                                                normalizeAudioAboveBPS: profile.normalizeAudioAbovePerChannelBPS)
+            // Descent extension: `lo` never moved — no candidate ever failed the floor, so the true
+            // clearing point sits somewhere BELOW everything tested (very compressible content, or an
+            // over-provisioned master), and stopping here would ship bits the perceptual floor never
+            // asked for. One extension pass reaches 50× further down; it only runs when the floor never
+            // pushed back, so typical content pays nothing.
+            if lo == initialLo, let current = best {
+                MediaProfile.log("descent: no candidate failed the floor — extending the search down")
+                plannedPasses += iterations   // re-pace the progress bar for the extension
+                var lo2 = Double(current.bitrate) * 0.02
+                var hi2 = Double(current.bitrate)
+                for i in 0..<iterations {
+                    if bracketEpsilon > 0, (hi2 - lo2) <= bracketEpsilon * hi2 {
+                        MediaProfile.log(String(format: "descent bracket converged (%.2f–%.2f Mbps)",
+                                                lo2 / 1e6, hi2 / 1e6))
+                        break
                     }
-                    return tmp
-                }.value
+                    let b = (lo2 + hi2) / 2
+                    let bClear = (lo2 + b) / 2
+                    let bMiss = (b + hi2) / 2
+                    ensureQueued(b)
+                    if specActive, i + 1 < iterations {
+                        for nb in (lastCleared ? [bClear, bMiss] : [bMiss, bClear]) { ensureQueued(nb) }
+                    }
+                    if try await searchStep(b, "descent \(i + 1)") {
+                        hi2 = b
+                        lastCleared = true
+                        lane.revoke(bMiss.bitPattern)
+                    } else {
+                        lo2 = b
+                        lastCleared = false
+                        lane.revoke(bClear.bitPattern)
+                    }
+                }
             }
-            chosen = (Int(hi),
-                      try await MediaMetrics.time("vqt.pass.score", lane: "score",
-                                                  attrs: ["label": "ceiling"]) { try await scoreOf(tmp) },
-                      tmp)
-            // The bisection probes interior points only — `hi` itself is first encoded HERE. When
-            // content clears exactly at the ceiling (ibm-1080: every interior probe missed, the
-            // ceiling scored 80.45), that is a genuine floor-met candidate: promote it so
-            // `metTarget`/delivery treat it like any other winner instead of skipping a
-            // legitimately smaller, floor-clearing deliverable.
-            if chosen.score.p10 >= targetScore { best = chosen }
+
+            lane.revokeAll()      // same orphan on the descent loop's own breaks
+
+            // Corridor squeeze: one post-search candidate below the winner's *emitted* rate with the
+            // min-QP corridor engaged. The corridor redistributes easy-frame overspend into the hard
+            // band, clearing the same floor at a lower rate on real content (Sevilla: −10–15% bytes at
+            // equal p10) — but its floor↔QP mapping is content-dependent, so it must never gate the
+            // search itself. Adopt only a candidate that still clears the floor AND is strictly smaller;
+            // any other outcome keeps the incumbent. (Nominal targets overshoot what ABR actually
+            // emits, so the probe anchors on emitted bytes, not the nominal search bitrate.)
+            // Up to 3 steps: the binary search's landing is jittery (p10 over ~13 sampled frames flips
+            // near the gate, pinning `lo` above the true clearing point — Ferrari landed 15.8 Mbps
+            // where ~11.5 clears), and each adopted step re-anchors on the new winner's emitted rate,
+            // so the walk-down follows actual bytes, not nominal fiction. Stops the first time a
+            // candidate fails the floor or fails to shrink.
+            if let squeezeMinQP = profile.minAllowedQP {
+                for _ in 0..<3 {
+                    guard let current = best else { break }
+                    let curBytes = (try? current.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                    let actualRate = duration > 0 ? Double(curBytes) * 8 / duration : 0
+                    guard actualRate > 0 else { break }
+                    MediaProfile.log(String(format: "corridor squeeze: winner emitted %.2f Mbps — probing %.2f with QP ≥ %d",
+                                            actualRate / 1e6, actualRate * 0.92 / 1e6, squeezeMinQP))
+                    guard try await searchStep(actualRate * 0.92, "squeeze", minQP: squeezeMinQP),
+                          let nb = best, nb.url != current.url else { break }
+                    let nbBytes = (try? nb.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                    if nbBytes >= curBytes { best = current; break }   // not smaller → keep the incumbent
+                }
+            }
+
+            let chosen: (bitrate: Int, score: VideoQualityScore, url: URL)
+            if let best {
+                chosen = best
+            } else {
+                let tmp = tmpDir.appendingPathComponent("vqt-final-\(UUID().uuidString).mp4")
+                temps.append(tmp)
+                plannedPasses += 1
+                emit(.pass(label: "ceiling", index: passesDone + 1, planned: plannedPasses,
+                           bitrate: Int(hi)), passFraction(0.05))
+                // Through the lane like every other encode — never concurrent with a draining loser.
+                _ = try await MediaMetrics.time("vqt.pass.encode", lane: "encode",
+                                                attrs: ["label": "ceiling",
+                                                        "mbps": String(format: "%.2f", hi / 1e6)]) {
+                    let job = lane.submit(key: nil) {
+                        try await MediaMetrics.time("vqt.spec.encode", lane: "encode",
+                                                    attrs: ["mbps": String(format: "%.2f", hi / 1e6)]) {
+                            try await reencodeVideo(input: searchInput, output: tmp, bitrate: Int(hi),
+                                                    outWidth: candW, outHeight: candH,
+                                                    codec: profile.codec, webSafeAudio: profile.webSafeAudio,
+                                                    maxQP: profile.maxAllowedQP,
+                                                    lookAhead: profile.lookAheadFrames,
+                                                    normalizeAudioAboveBPS: profile.normalizeAudioAbovePerChannelBPS)
+                        }
+                        return tmp
+                    }
+                    return try await withTaskCancellationHandler { try await job.value }
+                    onCancel: { job.cancel() }
+                }
+                chosen = (Int(hi),
+                          try await MediaMetrics.time("vqt.pass.score", lane: "score",
+                                                      attrs: ["label": "ceiling"]) { try await scoreOf(tmp) },
+                          tmp)
+                // The bisection probes interior points only — `hi` itself is first encoded HERE. When
+                // content clears exactly at the ceiling (ibm-1080: every interior probe missed, the
+                // ceiling scored 80.45), that is a genuine floor-met candidate: promote it so
+                // `metTarget`/delivery treat it like any other winner instead of skipping a
+                // legitimately smaller, floor-clearing deliverable.
+                if chosen.score.p10 >= targetScore { best = chosen }
+            }
+
+            // Deliverable lands at the host's `output` ONLY on a genuine win (cleared the floor AND smaller),
+            // and ATOMICALLY (same-dir staging + rename — rename(2) is atomic, so `output` appears whole or not
+            // at all; a non-atomic copy could leave a partial file if the source invalidates mid-copy). On a
+            // miss, leave NO file at `output` — never orphan a best-effort encode. (Fixes EMBED-003 skip-orphan
+            // + EMBED-005 partial-write-on-failure.)
+            // Drain revoked/loser lane jobs before touching temps — no writer may outlive the search.
+            await lane.drain()
+            emit(.finalizing, 0.95)
+            let mmFinalize = MediaMetrics.begin("vqt.finalize", lane: "io")
+            let outBytes = (try? chosen.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            // A format *conversion* (web profile) delivers even when larger — the size gate is the
+            // profile's call. A floor miss delivers the ceiling encode when the profile says best-effort
+            // (`chosen` IS that encode on a miss); `metTarget` reports the miss either way.
+            let didWin = (best != nil || profile.bestEffortOnFloorMiss)
+                && (!profile.requireSmaller || outBytes < inBytes)
+            if didWin {
+                let staging = output.deletingLastPathComponent()
+                    .appendingPathComponent(".forge-\(UUID().uuidString).tmp")
+                try FileManager.default.copyItem(at: chosen.url, to: staging)
+                try? FileManager.default.removeItem(at: output)
+                try FileManager.default.moveItem(at: staging, to: output)
+            } else {
+                try? FileManager.default.removeItem(at: output)
+            }
+            MediaMetrics.end(mmFinalize, extra: ["delivered": "\(didWin)"])   // temps: see the defer above
+
+            let profTotal = profTranscodeMs + profScoreMs
+            if profTotal > 0 {
+                MediaProfile.log(String(format: "TOTAL: transcode %.0f ms (%.0f%%) · score %.0f ms (%.0f%%)",
+                                        profTranscodeMs, 100 * profTranscodeMs / profTotal,
+                                        profScoreMs, 100 * profScoreMs / profTotal))
+            }
+
+            // Publish the whole reduction, not just the gating number (BRIDGE-061). `frameCount` is the
+            // clip's own length, so `framesScored / frameCount` states plainly that this was a sample.
+            let aggregation = Aggregation(
+                percentile: 10, percentileScore: chosen.score.p10,
+                mean: chosen.score.mean, minimum: chosen.score.minimum,
+                framesScored: chosen.score.framesScored, frameCount: frameCount)
+
+            return Result(bitrate: chosen.bitrate, score: chosen.score.p10, aggregation: aggregation,
+                          inputBytes: inBytes,
+                          outputBytes: outBytes, sourceWidth: vw, sourceHeight: vh,
+                          width: outW, height: outH, metTarget: best != nil, delivered: didWin)
+        } catch {
+            // Nothing outlives the search. Cancel first — an unstarted encode never begins and
+            // a started one stops at its next pump iteration — then wait for the chain to
+            // unwind. Revoke-and-drain alone would not do: revocation structurally cannot reach
+            // the un-keyed serialized encode, so the throw path would still block for one full
+            // clip-length encode, the exact cost the cancellation work exists to remove.
+            lane.cancelAll()
+            await lane.drain()
+            throw error
         }
-
-        // Deliverable lands at the host's `output` ONLY on a genuine win (cleared the floor AND smaller),
-        // and ATOMICALLY (same-dir staging + rename — rename(2) is atomic, so `output` appears whole or not
-        // at all; a non-atomic copy could leave a partial file if the source invalidates mid-copy). On a
-        // miss, leave NO file at `output` — never orphan a best-effort encode. (Fixes EMBED-003 skip-orphan
-        // + EMBED-005 partial-write-on-failure.)
-        // Drain revoked/loser lane jobs before touching temps — no writer may outlive the search.
-        await lane.drain()
-        emit(.finalizing, 0.95)
-        let mmFinalize = MediaMetrics.begin("vqt.finalize", lane: "io")
-        let outBytes = (try? chosen.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-        // A format *conversion* (web profile) delivers even when larger — the size gate is the
-        // profile's call. A floor miss delivers the ceiling encode when the profile says best-effort
-        // (`chosen` IS that encode on a miss); `metTarget` reports the miss either way.
-        let didWin = (best != nil || profile.bestEffortOnFloorMiss)
-            && (!profile.requireSmaller || outBytes < inBytes)
-        if didWin {
-            let staging = output.deletingLastPathComponent()
-                .appendingPathComponent(".forge-\(UUID().uuidString).tmp")
-            try FileManager.default.copyItem(at: chosen.url, to: staging)
-            try? FileManager.default.removeItem(at: output)
-            try FileManager.default.moveItem(at: staging, to: output)
-        } else {
-            try? FileManager.default.removeItem(at: output)
-        }
-        for t in temps { try? FileManager.default.removeItem(at: t) }
-        MediaMetrics.end(mmFinalize, extra: ["delivered": "\(didWin)"])
-
-        let profTotal = profTranscodeMs + profScoreMs
-        if profTotal > 0 {
-            MediaProfile.log(String(format: "TOTAL: transcode %.0f ms (%.0f%%) · score %.0f ms (%.0f%%)",
-                                    profTranscodeMs, 100 * profTranscodeMs / profTotal,
-                                    profScoreMs, 100 * profScoreMs / profTotal))
-        }
-
-        // Publish the whole reduction, not just the gating number (BRIDGE-061). `frameCount` is the
-        // clip's own length, so `framesScored / frameCount` states plainly that this was a sample.
-        let aggregation = Aggregation(
-            percentile: 10, percentileScore: chosen.score.p10,
-            mean: chosen.score.mean, minimum: chosen.score.minimum,
-            framesScored: chosen.score.framesScored, frameCount: frameCount)
-
-        return Result(bitrate: chosen.bitrate, score: chosen.score.p10, aggregation: aggregation,
-                      inputBytes: inBytes,
-                      outputBytes: outBytes, sourceWidth: vw, sourceHeight: vh,
-                      width: outW, height: outH, metTarget: best != nil, delivered: didWin)
     }
 
     /// Map a video format description's colour attachments to an `AVVideoColorPropertiesKey` dict,
@@ -863,11 +1021,6 @@ public enum VideoQualityTarget {
         ]
     }
 
-    /// Render the near-lossless downscale MEZZANINE: per-frame Lanczos (CoreImage) to the target
-    /// resolution, encoded at the (generous) ceiling bitrate, audio passthrough-muxed. This is the
-    /// scoring reference AND the search input for a downscale — the writer's own scaler aliases
-    /// texture (measured p10 38.6 vs 61.7 on the upscale-to-source leg at equal near-lossless
-    /// bitrate; see `encode`) and must never touch quality-gated pixels.
     /// Measure how much a conservative temporal denoise (VTTemporalNoiseFilter @ 0.1) would change
     /// this clip: the NOISE PROBE behind the camera-class self-gate. Returns the mean per-frame
     /// SSIMULACRA2 of denoised-vs-undenoised over a small sample (both sides run through the
@@ -875,6 +1028,14 @@ public enum VideoQualityTarget {
     /// is unavailable (pre-macOS-26) or the clip can't be read. Calibration (2026-08-10, corpus):
     /// clean production footage measures 95.9–99.5 (the filter no-ops); genuine handheld grain
     /// measures ~65 — a ~30-point chasm. Callers gate at < 90 → camera-noisy.
+    ///
+    /// The parenthesised cancellation above is the CONTRACT, and until 2026-08-16 the
+    /// implementation did not honour it — it scored against the raw BGRA decode, so the conversion
+    /// delta was counted as noise (`TemporalDenoise.probe`'s ⚠️ has the mechanism and the numbers).
+    /// Re-verified against the same signage corpus after the fix: `ibmplaycharacters_1080p` 97.3,
+    /// `tp_honda_1080p` 98.4, `is_architecture_1080p` 95.0 — the 95.9–99.5 band above still holds,
+    /// so the < 90 gate is unchanged. The pre-fix probe read those same three clips 94.1 / 96.6 /
+    /// **90.9** — clean signage footage sitting 0.87 above the gate it must clear comfortably.
     public static func noiseProbe(input: URL, sampleFrames: Int = 30) async -> Double? {
         guard #available(macOS 26.0, *) else { return nil }
         return await TemporalDenoise.probe(input: input, sampleFrames: sampleFrames)
@@ -890,6 +1051,11 @@ public enum VideoQualityTarget {
             || v == (kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String)
     }
 
+    /// Render the near-lossless downscale MEZZANINE: per-frame Lanczos (CoreImage) to the target
+    /// resolution, encoded at the (generous) ceiling bitrate, audio passthrough-muxed. This is the
+    /// scoring reference AND the search input for a downscale — the writer's own scaler aliases
+    /// texture (measured p10 38.6 vs 61.7 on the upscale-to-source leg at equal near-lossless
+    /// bitrate; see `encode`) and must never touch quality-gated pixels.
     public static func renderDownscaleMezzanine(input: URL, output: URL, bitrate: Int,
                                                 outWidth: Int, outHeight: Int,
                                                 codec: AVVideoCodecType,
@@ -981,6 +1147,20 @@ public enum VideoQualityTarget {
         guard writer.startWriting() else { throw EncodeError.encodeFailed }
         writer.startSession(atSourceTime: .zero)
 
+        // Placed ABOVE the denoise branch deliberately: that branch has ~5 `throw
+        // EncodeError.encodeFailed` sites which, before this, each abandoned a live VT session and
+        // a half-written mezzanine. Status-guarded, so it composes with the explicit
+        // `cancelWriting()` on the reader-failed path below.
+        var completed = false
+        let cancelled = CancelFlag()
+        defer {
+            if !completed {
+                if reader.status == .reading { reader.cancelReading() }
+                if writer.status == .writing { writer.cancelWriting() }
+                try? FileManager.default.removeItem(at: output)
+            }
+        }
+
         // vImage Lanczos (default kernel) per frame, gamma-space, straight on the BGRA buffers.
         // Measured on the upscale-to-source leg at near-lossless bitrate (Sevilla 4K→1080):
         // writer's own scaler p10 38.6 (texture aliases; no bitrate buys it back) · CG .high 61.7 ·
@@ -1068,6 +1248,11 @@ public enum VideoQualityTarget {
             for _ in 0..<4 { if let f = readCompressed() { window.append(f) } }
             var cursor = 0
             while cursor < window.count {
+                // This loop pumps inline on the search task rather than through
+                // `requestMediaDataWhenReady`, so it needs its own check. The `Task.sleep` further
+                // down is a cancellation point too, but only fires when the writer is NOT ready —
+                // on a fast encoder this loop can run to EOF without ever reaching it.
+                try Task.checkCancellation()
                 let current = window[cursor]
                 let prev = cursor > 0 ? [window[cursor - 1]] : []
                 let next = Array(window.suffix(from: min(cursor + 1, window.count)).prefix(2))
@@ -1101,10 +1286,19 @@ public enum VideoQualityTarget {
         let group = DispatchGroup()
         if denoiseStrength == nil {
         group.enter()
+        // One `Once` per pump: this closure had TWO unguarded `group.leave()` sites (EOF and
+        // append-failure) and the cancel early-out adds a third, so "we already left" must be a
+        // fact rather than an assumption about re-entry after `markAsFinished()`.
+        let finishVideo = Once()
         videoIn.requestMediaDataWhenReady(on: DispatchQueue(label: "vqt.mezz.video")) {
             while videoIn.isReadyForMoreMediaData {
+                if cancelled.isSet {
+                    finishVideo.run { videoIn.markAsFinished(); group.leave() }
+                    return
+                }
                 guard let s = videoOut.copyNextSampleBuffer() else {
-                    videoIn.markAsFinished(); group.leave(); return
+                    finishVideo.run { videoIn.markAsFinished(); group.leave() }
+                    return
                 }
                 guard let src = CMSampleBufferGetImageBuffer(s) else { continue }
                 var pb: CVPixelBuffer?
@@ -1130,24 +1324,47 @@ public enum VideoQualityTarget {
                 }
                 if !adaptor.append(pb, withPresentationTime: CMSampleBufferGetPresentationTimeStamp(s)) {
                     FileHandle.standardError.write(Data("vqt: mezzanine append failed: \(String(describing: writer.error))\n".utf8))
-                    videoIn.markAsFinished(); group.leave(); return
+                    finishVideo.run { videoIn.markAsFinished(); group.leave() }
+                    return
                 }
             }
         }
         }   // end denoiseStrength == nil (callback video pump)
         if let audioIn, let audioOut {
             group.enter()
+            // Its own `Once`: the audio pump runs on BOTH video paths, so cancelling the inline
+            // denoise loop has to bring this one down too.
+            let finishAudio = Once()
             audioIn.requestMediaDataWhenReady(on: DispatchQueue(label: "vqt.mezz.audio")) {
                 while audioIn.isReadyForMoreMediaData {
+                    if cancelled.isSet {
+                        finishAudio.run { audioIn.markAsFinished(); group.leave() }
+                        return
+                    }
                     if let s = audioOut.copyNextSampleBuffer() {
-                        if !audioIn.append(s) { audioIn.markAsFinished(); group.leave(); return }
-                    } else { audioIn.markAsFinished(); group.leave(); return }
+                        if !audioIn.append(s) {
+                            finishAudio.run { audioIn.markAsFinished(); group.leave() }
+                            return
+                        }
+                    } else {
+                        finishAudio.run { audioIn.markAsFinished(); group.leave() }
+                        return
+                    }
                 }
             }
         }
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            group.notify(queue: DispatchQueue(label: "vqt.mezz.done")) { cont.resume() }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                group.notify(queue: DispatchQueue(label: "vqt.mezz.done")) { cont.resume() }
+            }
+        } onCancel: {
+            // Same shape as `reencodeVideo`: the flag cannot reach a pump parked inside
+            // `copyNextSampleBuffer()`, and a pump that never re-enters its loop never leaves the
+            // group. `cancelReading()` lands the reader in `.cancelled`, not `.failed`.
+            cancelled.set()
+            reader.cancelReading()
         }
+        if cancelled.isSet || Task.isCancelled { throw CancellationError() }
         if reader.status == .failed {
             writer.cancelWriting()
             throw EncodeError.sourceAborted(reader.error)
@@ -1156,6 +1373,7 @@ public enum VideoQualityTarget {
             writer.finishWriting { cont.resume() }
         }
         if writer.status == .failed { throw EncodeError.sourceAborted(writer.error) }
+        completed = true
     }
 
     /// Transcode the video track to `codec` (HEVC default) at a target average bitrate;
@@ -1309,26 +1527,64 @@ public enum VideoQualityTarget {
         guard writer.startWriting() else { throw EncodeError.encodeFailed }
         writer.startSession(atSourceTime: .zero)
 
+        // Any exit that isn't a completed `finishWriting` leaves the reader/writer live and the VT
+        // session held. Status-guarded so it is idempotent with the explicit `cancelWriting` on the
+        // `reader.status == .failed` path below — calling it twice, or after `finishWriting`, is an
+        // AVFoundation misuse. One `defer` covers every throw path in the back half, forever.
+        var completed = false
+        let cancelled = CancelFlag()
+        defer {
+            if !completed {
+                if reader.status == .reading { reader.cancelReading() }
+                if writer.status == .writing { writer.cancelWriting() }
+                try? FileManager.default.removeItem(at: output)
+            }
+        }
+
         let group = DispatchGroup()
         func pump(_ input: AVAssetWriterInput, _ out: AVAssetReaderTrackOutput, _ label: String) {
             group.enter()
+            let finish = Once()          // exactly one leave per pump, across all three exits
             input.requestMediaDataWhenReady(on: DispatchQueue(label: "vqt.\(label)")) {
                 while input.isReadyForMoreMediaData {
+                    // This closure runs on a DispatchQueue, outside the Task context, so
+                    // `Task.isCancelled` is unreadable here — the flag is the only channel.
+                    if cancelled.isSet {
+                        finish.run { input.markAsFinished(); group.leave() }
+                        return
+                    }
                     if let s = out.copyNextSampleBuffer() {
                         if !input.append(s) {
                             FileHandle.standardError.write(Data("vqt: \(label) append failed: \(String(describing: writer.error))\n".utf8))
-                            input.markAsFinished(); group.leave(); return
+                            finish.run { input.markAsFinished(); group.leave() }
+                            return
                         }
-                    } else { input.markAsFinished(); group.leave(); return }
+                    } else {
+                        finish.run { input.markAsFinished(); group.leave() }
+                        return
+                    }
                 }
             }
         }
         pump(videoIn, videoOut, "video")
         if let audioIn, let audioOut { pump(audioIn, audioOut, "audio") }
 
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            group.notify(queue: DispatchQueue(label: "vqt.done")) { cont.resume() }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                group.notify(queue: DispatchQueue(label: "vqt.done")) { cont.resume() }
+            }
+        } onCancel: {
+            // Set the flag AND wake a pump that is blocked inside `copyNextSampleBuffer()` — the
+            // flag alone cannot reach it, and a pump that never re-enters its `while` never leaves
+            // the group, so `notify` would never fire. `cancelReading()` is thread-safe and lands
+            // the reader in `.cancelled`, NOT `.failed`, so the check below is unaffected.
+            // Resumes nothing: the continuation is still resumed by exactly one `group.notify`.
+            cancelled.set()
+            reader.cancelReading()
         }
+        // Cancellation is checked BEFORE the failure check: a cancelled reader can race a genuine
+        // fault, and "the caller cancelled" is the truer diagnosis than a spurious `sourceAborted`.
+        if cancelled.isSet || Task.isCancelled { throw CancellationError() }
         // A reader failure mid-pump surfaces as `copyNextSampleBuffer() == nil` — indistinguishable from
         // a clean EOF — so a truncated/garbled source (FigExport-class faults) would otherwise finalize a
         // SHORT "successful" encode and silently pass. Check the terminal status explicitly and THROW, so
@@ -1342,5 +1598,6 @@ public enum VideoQualityTarget {
             writer.finishWriting { cont.resume() }
         }
         if writer.status == .failed { throw EncodeError.sourceAborted(writer.error) }
+        completed = true          // past here the writer is finalized; the defer must not touch it
     }
 }
