@@ -863,11 +863,6 @@ public enum VideoQualityTarget {
         ]
     }
 
-    /// Render the near-lossless downscale MEZZANINE: per-frame Lanczos (CoreImage) to the target
-    /// resolution, encoded at the (generous) ceiling bitrate, audio passthrough-muxed. This is the
-    /// scoring reference AND the search input for a downscale — the writer's own scaler aliases
-    /// texture (measured p10 38.6 vs 61.7 on the upscale-to-source leg at equal near-lossless
-    /// bitrate; see `encode`) and must never touch quality-gated pixels.
     /// Measure how much a conservative temporal denoise (VTTemporalNoiseFilter @ 0.1) would change
     /// this clip: the NOISE PROBE behind the camera-class self-gate. Returns the mean per-frame
     /// SSIMULACRA2 of denoised-vs-undenoised over a small sample (both sides run through the
@@ -875,6 +870,14 @@ public enum VideoQualityTarget {
     /// is unavailable (pre-macOS-26) or the clip can't be read. Calibration (2026-08-10, corpus):
     /// clean production footage measures 95.9–99.5 (the filter no-ops); genuine handheld grain
     /// measures ~65 — a ~30-point chasm. Callers gate at < 90 → camera-noisy.
+    ///
+    /// The parenthesised cancellation above is the CONTRACT, and until 2026-08-16 the
+    /// implementation did not honour it — it scored against the raw BGRA decode, so the conversion
+    /// delta was counted as noise (`TemporalDenoise.probe`'s ⚠️ has the mechanism and the numbers).
+    /// Re-verified against the same signage corpus after the fix: `ibmplaycharacters_1080p` 97.3,
+    /// `tp_honda_1080p` 98.4, `is_architecture_1080p` 95.0 — the 95.9–99.5 band above still holds,
+    /// so the < 90 gate is unchanged. The pre-fix probe read those same three clips 94.1 / 96.6 /
+    /// **90.9** — clean signage footage sitting 0.87 above the gate it must clear comfortably.
     public static func noiseProbe(input: URL, sampleFrames: Int = 30) async -> Double? {
         guard #available(macOS 26.0, *) else { return nil }
         return await TemporalDenoise.probe(input: input, sampleFrames: sampleFrames)
@@ -890,6 +893,11 @@ public enum VideoQualityTarget {
             || v == (kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String)
     }
 
+    /// Render the near-lossless downscale MEZZANINE: per-frame Lanczos (CoreImage) to the target
+    /// resolution, encoded at the (generous) ceiling bitrate, audio passthrough-muxed. This is the
+    /// scoring reference AND the search input for a downscale — the writer's own scaler aliases
+    /// texture (measured p10 38.6 vs 61.7 on the upscale-to-source leg at equal near-lossless
+    /// bitrate; see `encode`) and must never touch quality-gated pixels.
     public static func renderDownscaleMezzanine(input: URL, output: URL, bitrate: Int,
                                                 outWidth: Int, outHeight: Int,
                                                 codec: AVVideoCodecType,

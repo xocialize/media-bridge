@@ -70,9 +70,20 @@ final class TemporalDenoiseTests: XCTestCase {
     /// strength-alternation storm, since removed). A bare `swift test` must never be able to
     /// wedge a machine; TNF coverage runs as a deliberately-armed probe with breadcrumbs
     /// (`MEDIABRIDGE_VT_LOG`) and an operator watching.
+    ///
+    /// The cost of opt-in is that a failure here is INVISIBLE to a bare `swift test` — the
+    /// clean-vs-noisy separation below was broken and reported green until 2026-08-16. There is no
+    /// CI in this repo to catch it, and there could not usefully be a hosted one: the filter needs
+    /// macOS 26 on Apple silicon that VideoToolbox will actually give a TNF session to. So the
+    /// backstop is a human running the line in the skip message before touching anything in
+    /// `TemporalDenoise` — which is why that message carries the whole command.
     private func requireTNFOptIn() throws {
         guard ProcessInfo.processInfo.environment["MEDIABRIDGE_TNF_TESTS"] == "1" else {
-            throw XCTSkip("TNF tests are opt-in: set MEDIABRIDGE_TNF_TESTS=1 (see header)")
+            throw XCTSkip("""
+                TNF coverage SKIPPED (opt-in — see the header for why). This suite is the only \
+                check on the noise probe's gate; run it before landing any TemporalDenoise change:
+                  MEDIABRIDGE_TNF_TESTS=1 swift test --filter TemporalDenoiseTests
+                """)
         }
     }
 
@@ -92,6 +103,11 @@ final class TemporalDenoiseTests: XCTestCase {
         let cleanRaw = await VideoQualityTarget.noiseProbe(input: clean)
         let noisyProbe = try XCTUnwrap(noisyRaw)
         let cleanProbe = try XCTUnwrap(cleanRaw)
+        // 90 is the SHIPPING gate, not a fixture-fitted number — it stays put. A clean reading of
+        // ~82 here means the probe has regressed to scoring against the raw BGRA decode, which
+        // charges the BGRA↔4:2:0-video-range conversion to the noise budget; the conversion is
+        // worth ~16 points on this full-range-RGB fixture and the filter itself only ~1.3. See
+        // `TemporalDenoise.probe`'s ⚠️. Corrected, this fixture reads ~92 and the corpus 95–98.
         XCTAssertLessThan(noisyProbe, 90, "pure temporal noise must gate as camera-noisy (got \(noisyProbe))")
         XCTAssertGreaterThan(cleanProbe, 90, "clean content must stay above the gate (got \(cleanProbe))")
         XCTAssertGreaterThan(cleanProbe - noisyProbe, 10,
