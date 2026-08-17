@@ -97,17 +97,36 @@ enum TemporalDenoise {
     }
 
     /// The noise probe: decode `sampleFrames` consecutive frames, filter at ONE FIXED strength
-    /// (0.1), score denoised frames against the decoded originals, return the mean. High (≥ ~96
-    /// measured) = the filter no-ops = clean; low (~65 on real grain) = camera-noisy.
+    /// (0.1), score each denoised frame against the SAME frame round-tripped without the filter,
+    /// return the mean. High (≥ ~96 measured) = the filter no-ops = clean; low (~65 on real
+    /// grain) = camera-noisy.
     ///
     /// ⚠️ Deliberately NO strength-0 baseline and NO per-frame strength changes. The first
     /// design alternated 0.0 ↔ 0.1 within one session to cancel round-trip deltas — and
     /// "strength change flushes the queue" (the documented behavior) became a 30-per-second
     /// flush storm that stalled the filter for ~240 s per run and then HARD-LOCKED the machine
     /// (2026-08-10, single core pegged, macOS 27 beta). Every clean run ever observed used one
-    /// fixed strength per session; this probe now does too. The round-trip delta this accepts is
-    /// negligible against the 99-vs-65 gate: the filter's pixel formats are the
-    /// lossless-compressed family.
+    /// fixed strength per session; this probe still does.
+    ///
+    /// The reference is round-tripped **by the pixel transfer sessions alone** — `compressed(from:)`
+    /// then `bgra(from:into:)`, no `VTFrameProcessor` call, no strength change, nothing that can
+    /// flush the filter queue. That is what cancels the conversion delta while fully respecting the
+    /// wedge lesson above: cancelling the round trip never required a second *filter* pass, only a
+    /// second *transfer*, and conflating those two is what produced the bug below.
+    ///
+    /// ⚠️ Scoring against the raw BGRA decode (as this did until 2026-08-16) measures
+    /// `conversion loss + denoise effect`, not the denoise effect. The filter's source formats are
+    /// the lossless-compressed **4:2:0 8-bit video-range** family (`.first` = `'&8v0'` =
+    /// `kCVPixelFormatType_Lossless_420YpCbCr8BiPlanarVideoRange`) — "lossless" describes the
+    /// surface's memory compression, NOT the colour conversion, which subsamples chroma and clamps
+    /// full-range RGB into 16–235. On corpus footage that term is ~0 (the source is already 4:2:0
+    /// video-range, so the trip is near-idempotent) which is exactly why the calibration looked
+    /// right and the bug hid; on full-range RGB-authored content it dominates. Measured on the
+    /// `TemporalDenoiseTests` clean fixture: raw-decode reference 82.0 (would falsely gate as
+    /// camera-noisy), round-trip reference 92.0, with the filter itself accounting for only ~1.3
+    /// of the 18-point gap.
+    ///
+    /// Both sides now traverse the identical conversion, so the score is the filter's effect alone.
     static func probe(input: URL, sampleFrames: Int) async -> Double? {
         let asset = AVURLAsset(url: input)
         guard let vtrack = try? await asset.loadTracks(withMediaType: .video).first else { return nil }
@@ -125,17 +144,25 @@ enum TemporalDenoise {
         VTBreadcrumb.log("TNF-PROBE-START \(w)×\(h) frames=\(sampleFrames) strength=\(strength) src=\(input.lastPathComponent)")
         defer { VTBreadcrumb.log("TNF-PROBE-END src=\(input.lastPathComponent)") }
 
-        // The window keeps the ORIGINAL BGRA alongside the compressed working buffer so the
-        // denoised result can be scored against the true decoded frame — no strength-0 pass.
-        var window: [(pts: CMTime, comp: CVPixelBuffer, original: CGImage)] = []
-        func readNext() -> (pts: CMTime, comp: CVPixelBuffer, original: CGImage)? {
+        // The window carries only the compressed working buffer: BOTH scoring sides are produced
+        // from it by `asScorable(_:)` below, so the reference costs one extra transfer on the
+        // ~1-in-5 frames actually scored rather than a CGImage per decoded frame.
+        var window: [(pts: CMTime, comp: CVPixelBuffer)] = []
+        func readNext() -> (pts: CMTime, comp: CVPixelBuffer)? {
             guard let s = out.copyNextSampleBuffer(),
                   let bgra = CMSampleBufferGetImageBuffer(s),
                   let comp = session.compressed(from: bgra) else { return nil }
+            return (CMSampleBufferGetPresentationTimeStamp(s), comp)
+        }
+        /// Bring a working buffer back to BGRA as a `CGImage` — the form SSIMULACRA2 scores. Run on
+        /// the denoised frame AND on its unfiltered source, which is what cancels the conversion.
+        func asScorable(_ compressed: CVPixelBuffer) -> CGImage? {
+            var pb: CVPixelBuffer?
+            CVPixelBufferCreate(nil, w, h, kCVPixelFormatType_32BGRA, nil, &pb)
+            guard let pb, session.bgra(from: compressed, into: pb) else { return nil }
             var cg: CGImage?
-            VTCreateCGImageFromCVPixelBuffer(bgra, options: nil, imageOut: &cg)
-            guard let cg else { return nil }
-            return (CMSampleBufferGetPresentationTimeStamp(s), comp, cg)
+            VTCreateCGImageFromCVPixelBuffer(pb, options: nil, imageOut: &cg)
+            return cg
         }
         for _ in 0..<4 { if let f = readNext() { window.append(f) } }
 
@@ -155,21 +182,15 @@ enum TemporalDenoise {
                 next: next.map { ($0.pts, $0.comp) },
                 strength: strength),
                processed % 5 == 0 {
-                var denPB: CVPixelBuffer?
-                CVPixelBufferCreate(nil, w, h, kCVPixelFormatType_32BGRA, nil, &denPB)
-                if let denPB, session.bgra(from: denoised, into: denPB) {
-                    var denCG: CGImage?
-                    VTCreateCGImageFromCVPixelBuffer(denPB, options: nil, imageOut: &denCG)
-                    if let denCG {
-                        let s: Double?
-                        if let gpu {
-                            s = try? SSIMULACRA2.score(reference: current.original, distorted: denCG,
-                                                       channelScalars: gpu.channelScalarsFunction)
-                        } else {
-                            s = try? SSIMULACRA2.score(reference: current.original, distorted: denCG)
-                        }
-                        if let s { scores.append(s) }
+                if let refCG = asScorable(current.comp), let denCG = asScorable(denoised) {
+                    let s: Double?
+                    if let gpu {
+                        s = try? SSIMULACRA2.score(reference: refCG, distorted: denCG,
+                                                   channelScalars: gpu.channelScalarsFunction)
+                    } else {
+                        s = try? SSIMULACRA2.score(reference: refCG, distorted: denCG)
                     }
+                    if let s { scores.append(s) }
                 }
             }
             processed += 1
