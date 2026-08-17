@@ -15,8 +15,12 @@
 // the caller — a library must not write files as a silent side effect (the VTBreadcrumb rule).
 //
 // Overhead: off (default) each instrumentation point costs one unfair-lock check (~tens of ns
-// against stages measured in ms). On, a span append under the same lock. Spans are capped
-// (`maxSpans`) so a runaway loop degrades to a counted drop, never unbounded memory.
+// against stages measured in ms) — and NOTHING else: `attrs` is an autoclosure that the gate
+// short-circuits, so the dictionary and its string interpolations are never built. (That is the
+// whole reason `begin` takes an autoclosure rather than a dictionary: `ssimu2.channel` fires 18×
+// per frame score, and eagerly formatting attrs for spans nobody records is pure waste.) On, a
+// span append under the same lock. Spans are capped (`maxSpans`) so a runaway loop degrades to a
+// counted drop, never unbounded memory.
 //
 // ⚠️ Timings are only meaningful from a RELEASE build — Debug inverts conclusions on this codebase
 // (pure-Swift SSIMULACRA2 is 50–150× slower in Debug; BRIDGE-044). Every report is stamped with
@@ -66,7 +70,11 @@ public struct MetricSpanHandle: Sendable {
     let name: String
     let lane: String
     let attrs: [String: String]
-    let startNS: UInt64
+    /// ABSOLUTE uptime-nanoseconds at begin, deliberately not epoch-relative. Duration is
+    /// `now − startAbsNS`, which stays correct even if `reset`/`enable` moves the epoch while the
+    /// span is open — and the Kit holds spans open for whole items (minutes), so that is reachable.
+    /// The span's epoch-relative `startNS` is derived at `end`, against the epoch in force then.
+    let startAbsNS: UInt64
     let thread: UInt64
     let signpostID: UInt64
 }
@@ -290,12 +298,13 @@ public enum MediaMetrics {
     // MARK: Recording
 
     /// Time a synchronous body as one span. The body always runs; recording depends on
-    /// enablement + detail. `attrs` is an autoclosure — not built when collection is off.
+    /// enablement + detail. `attrs` is an autoclosure and is **not built when collection is off** —
+    /// it is forwarded unforced to the gate, never evaluated as an argument to it.
     @discardableResult
     public static func time<R>(_ name: String, lane: String = "cpu", detail: Int = 0,
                                attrs: @autoclosure () -> [String: String] = [:],
                                _ body: () throws -> R) rethrows -> R {
-        guard let h = begin(name, lane: lane, detail: detail, attrs: attrs()) else {
+        guard let h = begin(name, lane: lane, detail: detail, lazyAttrs: attrs) else {
             return try body()
         }
         defer { end(h) }
@@ -308,7 +317,7 @@ public enum MediaMetrics {
     public static func time<R>(_ name: String, lane: String = "cpu", detail: Int = 0,
                                attrs: @autoclosure () -> [String: String] = [:],
                                _ body: () async throws -> R) async rethrows -> R {
-        guard let h = begin(name, lane: lane, detail: detail, attrs: attrs()) else {
+        guard let h = begin(name, lane: lane, detail: detail, lazyAttrs: attrs) else {
             return try await body()
         }
         defer { end(h) }
@@ -316,31 +325,44 @@ public enum MediaMetrics {
     }
 
     /// Manual bracket for spans that cross closure boundaries. `nil` when off — pass it to `end`
-    /// unconditionally; both sides no-op.
+    /// unconditionally; both sides no-op. `attrs` is an autoclosure for the same reason `time`'s
+    /// is: `ssimu2` and `ssimu2.gpu` bracket per frame and per channel, and their attr dictionaries
+    /// must cost nothing when the collector is off.
     public static func begin(_ name: String, lane: String = "cpu", detail: Int = 0,
-                             attrs: [String: String] = [:]) -> MetricSpanHandle? {
-        let (on, epoch): (Bool, UInt64) = state.withLock {
-            ($0.enabled && detail <= $0.detail, $0.epochUptimeNS)
-        }
-        guard on else { return nil }
+                             attrs: @autoclosure () -> [String: String] = [:]) -> MetricSpanHandle? {
+        begin(name, lane: lane, detail: detail, lazyAttrs: attrs)
+    }
+
+    /// The one place the gate is evaluated. `lazyAttrs` is a distinct argument label (not an
+    /// overload of `attrs:`) so forwarding an already-unforced autoclosure can never resolve back
+    /// into the public entry point and re-introduce eager evaluation.
+    private static func begin(_ name: String, lane: String, detail: Int,
+                              lazyAttrs: () -> [String: String]) -> MetricSpanHandle? {
+        let on: Bool = state.withLock { $0.enabled && detail <= $0.detail }
+        guard on else { return nil }                 // ← attrs still unforced past this point
         let now = DispatchTime.now().uptimeNanoseconds
         let spid = OSSignpostID(log: signpostLog)
         os_signpost(.begin, log: signpostLog, name: "span", signpostID: spid,
                     "%{public}s", name)
-        return MetricSpanHandle(name: name, lane: lane, attrs: attrs,
-                                startNS: now &- epoch, thread: currentThreadID(),
+        return MetricSpanHandle(name: name, lane: lane, attrs: lazyAttrs(),
+                                startAbsNS: now, thread: currentThreadID(),
                                 signpostID: spid.rawValue)
     }
 
     public static func end(_ handle: MetricSpanHandle?, extra: [String: String] = [:]) {
         guard let h = handle else { return }
-        let nowRel: UInt64 = state.withLock { DispatchTime.now().uptimeNanoseconds &- $0.epochUptimeNS }
+        let nowAbs = DispatchTime.now().uptimeNanoseconds
+        let epoch: UInt64 = state.withLock { $0.epochUptimeNS }
         os_signpost(.end, log: signpostLog, name: "span",
                     signpostID: OSSignpostID(h.signpostID), "%{public}s", h.name)
-        let dur = nowRel > h.startNS ? nowRel - h.startNS : 0
+        // Duration is absolute — immune to an epoch move (`reset`/`enable`) while the span was
+        // open. Only the span's PLACEMENT on the timeline is epoch-relative, and a span that began
+        // before the current epoch clamps to 0 rather than wrapping into a garbage start.
+        let dur = nowAbs > h.startAbsNS ? nowAbs - h.startAbsNS : 0
+        let startRel = h.startAbsNS > epoch ? h.startAbsNS - epoch : 0
         var attrs = h.attrs
         for (k, v) in extra { attrs[k] = v }
-        append(MetricSpan(name: h.name, lane: h.lane, startNS: h.startNS, durationNS: dur,
+        append(MetricSpan(name: h.name, lane: h.lane, startNS: startRel, durationNS: dur,
                           attrs: attrs, thread: h.thread))
     }
 
