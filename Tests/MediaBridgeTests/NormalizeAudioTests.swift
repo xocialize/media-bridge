@@ -184,6 +184,64 @@ final class NormalizeAudioTests: XCTestCase {
         XCTAssertEqual(facts.codec, kAudioFormatMPEG4AAC)
     }
 
+    /// The LTX Studio field bug (AB-A-0026 thread): `targetSampleRate: nil` on a 24 kHz mono WAV
+    /// failed while 48 kHz worked — the default 128 kbps sits outside the AAC encoder's applicable
+    /// range at 24 kHz mono, so the writer refused the first append and left a broken artifact.
+    /// The bitrate must clamp to the encoder's range for the OUTPUT shape, not assume 48 kHz's.
+    func testLowRateSourcePreservedByDefault() async throws {
+        let src = try makeWAV(rate: 24_000, channels: 1, seconds: 2)
+        let dst = scratchURL("m4a")
+        let result = try await MediaBridge.normalizeAudio(input: src, output: dst)
+        XCTAssertFalse(result.passthrough)
+        let facts = try await audioFacts(dst)
+        XCTAssertEqual(facts.codec, kAudioFormatMPEG4AAC)
+        XCTAssertEqual(facts.rate, 24_000, "nil target must preserve the source rate")
+        XCTAssertEqual(facts.duration, 2, accuracy: 0.25)
+    }
+
+    /// The encoder's applicable bitrates are DISCRETE points (and the SDK pads the list with 0–0
+    /// entries): a request between points must snap to the nearest valid one, and a request below
+    /// the lowest must snap UP — the padding entries must never read as "0 is allowed".
+    func testOffMenuBitratesSnapToValidPoints() async throws {
+        let src = try makeWAV(rate: 24_000, channels: 1, seconds: 1)
+        for requested in [50_000, 4_000] {
+            let dst = scratchURL("m4a")
+            _ = try await MediaBridge.normalizeAudio(
+                input: src, output: dst, options: .init(aacBitrate: requested))
+            let facts = try await audioFacts(dst)
+            XCTAssertEqual(facts.codec, kAudioFormatMPEG4AAC, "requested \(requested)")
+            XCTAssertEqual(facts.rate, 24_000, "requested \(requested)")
+        }
+    }
+
+    func testTelephonyRatePreservedByDefault() async throws {
+        let src = try makeWAV(rate: 8_000, channels: 1, seconds: 1)
+        let dst = scratchURL("m4a")
+        _ = try await MediaBridge.normalizeAudio(input: src, output: dst)
+        let facts = try await audioFacts(dst)
+        XCTAssertEqual(facts.codec, kAudioFormatMPEG4AAC)
+        XCTAssertEqual(facts.rate, 8_000)
+    }
+
+    /// A failed encode must not leave a half-written artifact for a downstream probe to trip on,
+    /// and an unreadable INPUT must say so — not masquerade as "no audio track". Both halves of
+    /// the diagnosis the Studio thread paid four extra probes for.
+    func testUnreadableInputSurfacesUnderlyingError() async throws {
+        let src = scratchURL("m4a")
+        try Data().write(to: src)     // zero-byte "m4a"
+        let dst = scratchURL("m4a")
+        do {
+            _ = try await MediaBridge.normalizeAudio(input: src, output: dst)
+            XCTFail("expected a throw")
+        } catch let error as MediaBridge.NormalizeError {
+            guard case .unreadableInput = error else {
+                return XCTFail("expected unreadableInput, got \(error)")
+            }
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dst.path),
+                       "no output artifact may exist after a failed normalize")
+    }
+
     func testVideoOnlyInputThrowsNoAudioTrack() async throws {
         let src = try await makeVideoOnlyMP4()
         let dst = scratchURL("m4a")

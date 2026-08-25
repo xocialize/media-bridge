@@ -13,6 +13,7 @@
 //                       → AVAssetWriter AAC. Non-native codecs (Vorbis, …) defer honestly.
 //
 
+import AudioToolbox
 import AVFoundation
 import CoreMedia
 import Foundation
@@ -32,7 +33,10 @@ extension MediaBridge {
         }
         /// Output sample rate; `nil` keeps the source rate. (The LTX world wants 48_000.)
         public var targetSampleRate: Double?
-        /// AAC bitrate for the re-encode path. Ignored by passthrough.
+        /// AAC bitrate for the re-encode path. Ignored by passthrough. Clamped into the encoder's
+        /// applicable range for the output rate × channels — the range shrinks with the sample rate
+        /// (128 kbps is valid at 48 kHz mono and out of range at 24 kHz mono), and an out-of-range
+        /// request would otherwise kill the encode outright rather than degrade gracefully.
         public var aacBitrate: Int
         public var channels: ChannelPolicy
         /// Permit the no-re-encode fast path when the source stream is already acceptable
@@ -118,14 +122,61 @@ extension MediaBridge {
         }
     }
 
+    /// The AAC encoder accepts a bitrate SET that depends on sample rate × channels — 128 kbps is
+    /// valid at 48 kHz mono and out of range at 24 kHz mono (which tops out at 64 kbps), where the
+    /// writer's converter refuses the very first append ("Cannot Encode Media"). Ask AudioToolbox
+    /// for the applicable rates at the actual output shape and snap the request onto them, so a
+    /// default tuned for 48 kHz cannot sink a low-rate encode. Two measured traits of the answer:
+    /// the entries are DISCRETE points (min == max, e.g. 16k/20k/…/64k at 24 kHz mono), and the
+    /// array is padded with 0–0 entries that must be ignored or they poison a naive min(). Any
+    /// failure to answer leaves the request unchanged — no worse than not asking. (Found by LTX
+    /// Studio on the MLXCompanion 24 kHz voice WAVs; AB-A-0026 thread.)
+    private static func clampedAACBitrate(_ requested: Int, sampleRate: Double, channels: Int) -> Int {
+        guard sampleRate > 0, channels > 0 else { return requested }
+        var inASBD = AudioStreamBasicDescription(
+            mSampleRate: sampleRate, mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: UInt32(2 * channels), mFramesPerPacket: 1,
+            mBytesPerFrame: UInt32(2 * channels), mChannelsPerFrame: UInt32(channels),
+            mBitsPerChannel: 16, mReserved: 0)
+        var outASBD = AudioStreamBasicDescription(
+            mSampleRate: sampleRate, mFormatID: kAudioFormatMPEG4AAC, mFormatFlags: 0,
+            mBytesPerPacket: 0, mFramesPerPacket: 1024, mBytesPerFrame: 0,
+            mChannelsPerFrame: UInt32(channels), mBitsPerChannel: 0, mReserved: 0)
+        var conv: AudioConverterRef?
+        guard AudioConverterNew(&inASBD, &outASBD, &conv) == noErr, let c = conv else { return requested }
+        defer { AudioConverterDispose(c) }
+        var size: UInt32 = 0
+        guard AudioConverterGetPropertyInfo(c, kAudioConverterApplicableEncodeBitRates,
+                                            &size, nil) == noErr, size > 0 else { return requested }
+        let count = Int(size) / MemoryLayout<AudioValueRange>.size
+        var ranges = [AudioValueRange](repeating: AudioValueRange(), count: count)
+        guard AudioConverterGetProperty(c, kAudioConverterApplicableEncodeBitRates,
+                                        &size, &ranges) == noErr else { return requested }
+        let spans = ranges.filter { $0.mMaximum > 0 }
+        guard !spans.isEmpty else { return requested }
+        let r = Double(requested)
+        if spans.contains(where: { r >= $0.mMinimum && r <= $0.mMaximum }) { return requested }
+        var best = spans[0].mMinimum
+        for span in spans {
+            for edge in [span.mMinimum, span.mMaximum] where abs(edge - r) < abs(best - r) {
+                best = edge
+            }
+        }
+        return Int(best)
+    }
+
     // MARK: - Native-container path (AVFoundation)
 
     private static func normalizeNativeAudio(input: URL, output: URL,
                                              options: AudioNormalizeOptions) async throws -> NormalizedAudio {
         let asset = AVURLAsset(url: input)
-        guard let track = (try? await asset.loadTracks(withMediaType: .audio))?.first else {
-            throw NormalizeError.noAudioTrack
-        }
+        // "Couldn't read the file" and "the file has no audio" are different failures with different
+        // fixes — don't collapse the first into the second by swallowing the load error.
+        let audioTracks: [AVAssetTrack]
+        do { audioTracks = try await asset.loadTracks(withMediaType: .audio) }
+        catch { throw NormalizeError.unreadableInput(error.localizedDescription) }
+        guard let track = audioTracks.first else { throw NormalizeError.noAudioTrack }
         let formats = try await track.load(.formatDescriptions)
         guard let format = formats.first else { throw NormalizeError.noAudioTrack }
         let sourceFourCC = fourCC(CMFormatDescriptionGetMediaSubType(format))
@@ -164,11 +215,13 @@ extension MediaBridge {
             AVNumberOfChannelsKey: outChannels,
         ]
         if outRate > 0 { readerSettings[AVSampleRateKey] = outRate }
+        let effectiveRate = outRate > 0 ? outRate : 48_000
         let writerSettings: [String: Any] = [
             AVFormatIDKey: kAudioFormatMPEG4AAC,
-            AVSampleRateKey: outRate > 0 ? outRate : 48_000,
+            AVSampleRateKey: effectiveRate,
             AVNumberOfChannelsKey: outChannels,
-            AVEncoderBitRateKey: options.aacBitrate,
+            AVEncoderBitRateKey: clampedAACBitrate(options.aacBitrate,
+                                                   sampleRate: effectiveRate, channels: outChannels),
         ]
         try await transferNativeAudio(asset: asset, track: track, output: output,
                                       readerSettings: readerSettings, writerSettings: writerSettings,
@@ -198,30 +251,46 @@ extension MediaBridge {
         guard writer.canAdd(input) else { throw NormalizeError.exportFailed("writer rejected audio input") }
         writer.add(input)
 
-        guard reader.startReading() else {
-            throw NormalizeError.exportFailed("reader: \(reader.error?.localizedDescription ?? "startReading failed")")
+        // Failure messages carry the encode shape — "Cannot Encode Media" alone says nothing about
+        // which rate × channels × bitrate the converter refused.
+        let mode: String
+        if let ws = writerSettings {
+            mode = "AAC \(Int(ws[AVSampleRateKey] as? Double ?? 0)) Hz ×\(ws[AVNumberOfChannelsKey] as? Int ?? 0)"
+                 + " @ \(ws[AVEncoderBitRateKey] as? Int ?? 0) bps"
+        } else {
+            mode = "passthrough"
         }
-        guard writer.startWriting() else {
-            reader.cancelReading()
-            throw NormalizeError.exportFailed("writer: \(writer.error?.localizedDescription ?? "startWriting failed")")
-        }
-        writer.startSession(atSourceTime: .zero)
 
-        while let sample = trackOut.copyNextSampleBuffer() {
-            try await waitReady(input)
-            guard input.append(sample) else {
-                reader.cancelReading()
-                throw NormalizeError.exportFailed("append: \(writer.error?.localizedDescription ?? "unknown")")
+        do {
+            guard reader.startReading() else {
+                throw NormalizeError.exportFailed("reader: \(reader.error?.localizedDescription ?? "startReading failed")")
             }
-        }
-        guard reader.status == .completed else {
-            writer.cancelWriting()
-            throw NormalizeError.exportFailed("reader: \(reader.error?.localizedDescription ?? "status \(reader.status.rawValue)")")
-        }
-        input.markAsFinished()
-        await writer.finishWriting()
-        guard writer.status == .completed else {
-            throw NormalizeError.exportFailed("writer: \(writer.error?.localizedDescription ?? "status \(writer.status.rawValue)")")
+            guard writer.startWriting() else {
+                throw NormalizeError.exportFailed("writer: \(writer.error?.localizedDescription ?? "startWriting failed")")
+            }
+            writer.startSession(atSourceTime: .zero)
+
+            while let sample = trackOut.copyNextSampleBuffer() {
+                try await waitReady(input)
+                guard input.append(sample) else {
+                    throw NormalizeError.exportFailed("append [\(mode)]: \(writer.error?.localizedDescription ?? "unknown")")
+                }
+            }
+            guard reader.status == .completed else {
+                throw NormalizeError.exportFailed("reader: \(reader.error?.localizedDescription ?? "status \(reader.status.rawValue)")")
+            }
+            input.markAsFinished()
+            await writer.finishWriting()
+            guard writer.status == .completed else {
+                throw NormalizeError.exportFailed("writer [\(mode)]: \(writer.error?.localizedDescription ?? "status \(writer.status.rawValue)")")
+            }
+        } catch {
+            reader.cancelReading()
+            if writer.status == .writing { writer.cancelWriting() }
+            // A failed write must not leave a half-written artifact behind — a downstream probe of
+            // the leftover reads as a fresh mystery ("no audio track") far from the actual failure.
+            try? FileManager.default.removeItem(at: output)
+            throw error
         }
     }
 
@@ -262,32 +331,40 @@ extension MediaBridge {
         let outChannels = resolvedChannels(options.channels, source: pcm.channels)
         let outRate = options.targetSampleRate ?? pcm.sampleRate
 
+        let bitrate = clampedAACBitrate(options.aacBitrate, sampleRate: outRate, channels: outChannels)
+        let mode = "AAC \(Int(outRate)) Hz ×\(outChannels) @ \(bitrate) bps"
         try? FileManager.default.removeItem(at: output)
         let writer = try AVAssetWriter(outputURL: output, fileType: .m4a)
         let input = AVAssetWriterInput(mediaType: .audio, outputSettings: [
             AVFormatIDKey: kAudioFormatMPEG4AAC,
             AVSampleRateKey: outRate,
             AVNumberOfChannelsKey: outChannels,
-            AVEncoderBitRateKey: options.aacBitrate,
+            AVEncoderBitRateKey: bitrate,
         ])
         input.expectsMediaDataInRealTime = false
         guard writer.canAdd(input) else { throw NormalizeError.exportFailed("writer rejected audio input") }
         writer.add(input)
-        guard writer.startWriting() else {
-            throw NormalizeError.exportFailed("writer: \(writer.error?.localizedDescription ?? "startWriting failed")")
-        }
-        writer.startSession(atSourceTime: .zero)
-
-        for chunk in try pcm.makeSampleBuffers() {
-            try await waitReady(input)
-            guard input.append(chunk) else {
-                throw NormalizeError.exportFailed("append: \(writer.error?.localizedDescription ?? "unknown")")
+        do {
+            guard writer.startWriting() else {
+                throw NormalizeError.exportFailed("writer: \(writer.error?.localizedDescription ?? "startWriting failed")")
             }
-        }
-        input.markAsFinished()
-        await writer.finishWriting()
-        guard writer.status == .completed else {
-            throw NormalizeError.exportFailed("writer: \(writer.error?.localizedDescription ?? "status \(writer.status.rawValue)")")
+            writer.startSession(atSourceTime: .zero)
+
+            for chunk in try pcm.makeSampleBuffers() {
+                try await waitReady(input)
+                guard input.append(chunk) else {
+                    throw NormalizeError.exportFailed("append [\(mode)]: \(writer.error?.localizedDescription ?? "unknown")")
+                }
+            }
+            input.markAsFinished()
+            await writer.finishWriting()
+            guard writer.status == .completed else {
+                throw NormalizeError.exportFailed("writer [\(mode)]: \(writer.error?.localizedDescription ?? "status \(writer.status.rawValue)")")
+            }
+        } catch {
+            if writer.status == .writing { writer.cancelWriting() }
+            try? FileManager.default.removeItem(at: output)
+            throw error
         }
         return try await loadResult(output: output, sourceCodecID: track.codecID, passthrough: false)
     }
@@ -302,7 +379,10 @@ extension MediaBridge {
         let bytes = (try? output.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         guard bytes > 0 else { throw NormalizeError.exportFailed("normalize produced no bytes") }
         let asset = AVURLAsset(url: output)
-        guard let track = (try? await asset.loadTracks(withMediaType: .audio))?.first,
+        let outputTracks: [AVAssetTrack]
+        do { outputTracks = try await asset.loadTracks(withMediaType: .audio) }
+        catch { throw NormalizeError.exportFailed("output unreadable: \(error.localizedDescription)") }
+        guard let track = outputTracks.first,
               let format = (try? await track.load(.formatDescriptions))?.first,
               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee else {
             throw NormalizeError.exportFailed("output has no readable audio track")

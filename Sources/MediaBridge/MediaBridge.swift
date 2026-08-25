@@ -51,6 +51,10 @@ public enum MediaBridge {
         /// `normalizeAudio` found no audio track to normalize (video-only file, or a container with
         /// no tracks AVFoundation/Matroska can see).
         case noAudioTrack
+        /// `normalizeAudio` could not read the input at all — carries the underlying error, because
+        /// "the file is empty/corrupt/missing" and "the file has no audio" need different fixes and
+        /// collapsing them cost a real diagnosis four extra probes (AB-A-0026 thread).
+        case unreadableInput(String)
         /// The source video codec isn't natively decodable (VP9/VP8/…); it must be handled by a
         /// future SupportGate fallback. Surfaced here, never silently produced as a broken file.
         case deferredCodec(String)
