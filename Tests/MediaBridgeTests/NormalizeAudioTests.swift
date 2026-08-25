@@ -242,6 +242,64 @@ final class NormalizeAudioTests: XCTestCase {
                        "no output artifact may exist after a failed normalize")
     }
 
+    // MARK: - padToDuration (AB-A-0028: grid-fit silence pad, single generation)
+
+    /// Short content pads UP with trailing silence to the requested duration — in the same encode
+    /// generation, at a fractional (frame-grid-shaped) target, with the source rate preserved.
+    func testPadToDurationExtendsShortContent() async throws {
+        let src = try makeWAV(rate: 24_000, channels: 1, seconds: 1)
+        let dst = scratchURL("m4a")
+        let result = try await MediaBridge.normalizeAudio(
+            input: src, output: dst, options: .init(padToDuration: 2.52))
+        XCTAssertFalse(result.passthrough)
+        XCTAssertEqual(result.duration, 2.52, accuracy: 0.1)
+        let facts = try await audioFacts(dst)
+        XCTAssertEqual(facts.codec, kAudioFormatMPEG4AAC)
+        XCTAssertEqual(facts.rate, 24_000)
+        XCTAssertEqual(facts.duration, 2.52, accuracy: 0.1)
+    }
+
+    /// The operator policy the option encodes: pad up, NEVER trim — a target shorter than the
+    /// content leaves the content whole.
+    func testPadNeverTrims() async throws {
+        let src = try makeWAV(rate: 48_000, channels: 1, seconds: 2)
+        let dst = scratchURL("m4a")
+        let result = try await MediaBridge.normalizeAudio(
+            input: src, output: dst, options: .init(padToDuration: 0.5))
+        XCTAssertEqual(result.duration, 2, accuracy: 0.25)
+    }
+
+    /// Padding forces the re-encode only when it would actually happen: a passthrough-eligible
+    /// source shorter than the target re-encodes (silence cannot splice into a compressed stream),
+    /// while one already at/over the target passes through untouched.
+    func testPadDisablesPassthroughOnlyWhenNeeded() async throws {
+        let wav = try makeWAV(rate: 48_000, channels: 2, seconds: 2)
+        let aac = scratchURL("m4a")
+        _ = try await MediaBridge.normalizeAudio(input: wav, output: aac)
+
+        let padded = scratchURL("m4a")
+        let needsPad = try await MediaBridge.normalizeAudio(
+            input: aac, output: padded, options: .init(padToDuration: 3.0))
+        XCTAssertFalse(needsPad.passthrough, "a pad that must happen requires the re-encode")
+        XCTAssertEqual(needsPad.duration, 3.0, accuracy: 0.1)
+
+        let untouched = scratchURL("m4a")
+        let noPad = try await MediaBridge.normalizeAudio(
+            input: aac, output: untouched, options: .init(padToDuration: 1.0))
+        XCTAssertTrue(noPad.passthrough, "a no-op pad must not cost the passthrough")
+        XCTAssertEqual(noPad.duration, 2, accuracy: 0.25)
+    }
+
+    func testMatroskaPadToDuration() async throws {
+        let src = try makeWebM(codecArgs: ["-c:a", "libopus"])
+        let dst = scratchURL("m4a")
+        let result = try await MediaBridge.normalizeAudio(
+            input: src, output: dst, options: .init(padToDuration: 3.0))
+        XCTAssertEqual(result.duration, 3.0, accuracy: 0.1)
+        let facts = try await audioFacts(dst)
+        XCTAssertEqual(facts.codec, kAudioFormatMPEG4AAC)
+    }
+
     func testVideoOnlyInputThrowsNoAudioTrack() async throws {
         let src = try await makeVideoOnlyMP4()
         let dst = scratchURL("m4a")

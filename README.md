@@ -47,8 +47,10 @@ let normalized = try await MediaBridge.normalizeVideoToHEVC(input: mkvURL, outpu
 // Audio-only: any supported input (WAV/MP3/CAF/mp4-family, Opus-in-WebM, …) → an
 // audio-only AAC m4a. Passthrough (no re-encode) when the source stream is already
 // acceptable and no rate/channel change was asked for; video tracks are ignored.
+// padToDuration grid-fits with trailing silence in the same generation (never trims).
 let audio = try await MediaBridge.normalizeAudio(
-    input: voiceWAV, output: m4aURL, options: .init(targetSampleRate: 48_000))
+    input: voiceWAV, output: m4aURL,
+    options: .init(targetSampleRate: 48_000, padToDuration: gridSeconds))
 // audio.passthrough, .sampleRate, .channels, .duration — read back from the artifact.
 
 // Target-quality video: the SMALLEST web H.264 whose 10th-percentile per-frame

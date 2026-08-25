@@ -43,15 +43,24 @@ extension MediaBridge {
         /// (see `passthroughFormatIDs`). `false` forces an AAC re-encode — callers that need the
         /// output to be *literally AAC* set this, since passthrough may retain MP3/Opus/FLAC.
         public var allowPassthrough: Bool
+        /// Pad UP with trailing digital silence to this duration when the content is shorter —
+        /// in the same encode generation, so grid-fitting (an a2v frame grid, a slot length) costs
+        /// no second lossy pass. NEVER trims: a target shorter than the content is a no-op and the
+        /// full content survives. A pad that must extend a passthrough-eligible source disables
+        /// passthrough for that call — silence cannot be spliced into a compressed stream without
+        /// re-encoding — while a source already at/over the target passes through untouched.
+        public var padToDuration: Double?
 
         public init(targetSampleRate: Double? = nil,
                     aacBitrate: Int = 128_000,
                     channels: ChannelPolicy = .passthrough,
-                    allowPassthrough: Bool = true) {
+                    allowPassthrough: Bool = true,
+                    padToDuration: Double? = nil) {
             self.targetSampleRate = targetSampleRate
             self.aacBitrate = aacBitrate
             self.channels = channels
             self.allowPassthrough = allowPassthrough
+            self.padToDuration = padToDuration
         }
     }
 
@@ -188,10 +197,19 @@ extension MediaBridge {
         let outRate = options.targetSampleRate ?? sourceRate
         let wantsConversion = outRate != sourceRate || outChannels != sourceChannels
 
+        // Padding only forces the re-encode when it would actually happen: a source already at or
+        // over the target keeps its passthrough eligibility (the pad is a no-op there).
+        let padTarget = options.padToDuration ?? 0
+        var padNeeded = false
+        if padTarget > 0 {
+            let sourceDuration = (try? await asset.load(.duration).seconds) ?? 0
+            padNeeded = sourceDuration < padTarget - 0.001
+        }
+
         // Passthrough is *opportunistic*: eligibility is checked up front, but AVFoundation gets the
         // final word — a stream it won't mux into m4a (writer refuses the input) falls back to the
         // AAC re-encode instead of failing the normalize.
-        if options.allowPassthrough, !wantsConversion,
+        if options.allowPassthrough, !wantsConversion, !padNeeded,
            mp4FamilyExtensions.contains(input.pathExtension.lowercased()),
            passthroughFormatIDs.contains(CMFormatDescriptionGetMediaSubType(format)) {
             do {
@@ -225,7 +243,10 @@ extension MediaBridge {
         ]
         try await transferNativeAudio(asset: asset, track: track, output: output,
                                       readerSettings: readerSettings, writerSettings: writerSettings,
-                                      sourceFormatHint: nil)
+                                      sourceFormatHint: nil,
+                                      padTo: padTarget > 0
+                                          ? (target: padTarget, rate: effectiveRate, channels: outChannels)
+                                          : nil)
         return try await loadResult(output: output, sourceCodecID: sourceFourCC, passthrough: false)
     }
 
@@ -236,7 +257,8 @@ extension MediaBridge {
     private static func transferNativeAudio(asset: AVURLAsset, track: AVAssetTrack, output: URL,
                                             readerSettings: [String: Any]?,
                                             writerSettings: [String: Any]?,
-                                            sourceFormatHint: CMFormatDescription?) async throws {
+                                            sourceFormatHint: CMFormatDescription?,
+                                            padTo: (target: Double, rate: Double, channels: Int)? = nil) async throws {
         let reader = try AVAssetReader(asset: asset)
         let trackOut = AVAssetReaderTrackOutput(track: track, outputSettings: readerSettings)
         trackOut.alwaysCopiesSampleData = false
@@ -270,14 +292,24 @@ extension MediaBridge {
             }
             writer.startSession(atSourceTime: .zero)
 
+            var contentEnd = 0.0
             while let sample = trackOut.copyNextSampleBuffer() {
                 try await waitReady(input)
                 guard input.append(sample) else {
                     throw NormalizeError.exportFailed("append [\(mode)]: \(writer.error?.localizedDescription ?? "unknown")")
                 }
+                let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+                let duration = CMSampleBufferGetDuration(sample)
+                if pts.isNumeric {
+                    contentEnd = max(contentEnd, CMTimeGetSeconds(duration.isNumeric ? pts + duration : pts))
+                }
             }
             guard reader.status == .completed else {
                 throw NormalizeError.exportFailed("reader: \(reader.error?.localizedDescription ?? "status \(reader.status.rawValue)")")
+            }
+            if let padTo {
+                try await appendSilence(to: input, fromSeconds: contentEnd, toSeconds: padTo.target,
+                                        sampleRate: padTo.rate, channels: padTo.channels)
             }
             input.markAsFinished()
             await writer.finishWriting()
@@ -356,6 +388,14 @@ extension MediaBridge {
                     throw NormalizeError.exportFailed("append [\(mode)]: \(writer.error?.localizedDescription ?? "unknown")")
                 }
             }
+            if let target = options.padToDuration {
+                // Silence continues the pcm-domain timeline in the pcm's own shape — the writer's
+                // converter bridges it to the output settings exactly as it does the content.
+                try await appendSilence(to: input,
+                                        fromSeconds: Double(pcm.frameCount) / pcm.sampleRate,
+                                        toSeconds: target,
+                                        sampleRate: pcm.sampleRate, channels: pcm.channels)
+            }
             input.markAsFinished()
             await writer.finishWriting()
             guard writer.status == .completed else {
@@ -393,6 +433,77 @@ extension MediaBridge {
                                sampleRate: asbd.mSampleRate,
                                channels: Int(asbd.mChannelsPerFrame),
                                passthrough: passthrough)
+    }
+
+    /// Append trailing digital silence from `fromSeconds` up to `toSeconds`, chunked at one second.
+    /// A `fromSeconds` already at/past the target is a no-op — this pads, never trims.
+    private static func appendSilence(to input: AVAssetWriterInput, fromSeconds: Double,
+                                      toSeconds: Double, sampleRate: Double, channels: Int) async throws {
+        guard sampleRate > 0, toSeconds > fromSeconds else { return }
+        let totalFrames = Int(((toSeconds - fromSeconds) * sampleRate).rounded())
+        guard totalFrames > 0 else { return }
+        let chunkFrames = max(1, Int(sampleRate.rounded()))
+        var done = 0
+        while done < totalFrames {
+            let frames = min(chunkFrames, totalFrames - done)
+            let ptsNanos = Int64(((fromSeconds + Double(done) / sampleRate) * 1_000_000_000).rounded())
+            let chunk = try makeSilentBuffer(frames: frames, channels: channels,
+                                             sampleRate: sampleRate, ptsNanos: ptsNanos)
+            try await waitReady(input)
+            guard input.append(chunk) else {
+                throw NormalizeError.exportFailed("append silence @ \(fromSeconds)s → \(toSeconds)s failed")
+            }
+            done += frames
+        }
+    }
+
+    /// Zeroed interleaved Int16 LPCM wrapped as one CMSampleBuffer — the same construction the
+    /// decode path uses for content buffers (`AudioDecodeSession.PCM.makeBuffer`), with the copy
+    /// replaced by calloc's zero fill.
+    private static func makeSilentBuffer(frames: Int, channels: Int, sampleRate: Double,
+                                         ptsNanos: Int64) throws -> CMSampleBuffer {
+        let ch = max(1, channels)
+        let bytesPerFrame = 2 * ch
+        var asbd = AudioStreamBasicDescription(
+            mSampleRate: sampleRate, mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: UInt32(bytesPerFrame), mFramesPerPacket: 1,
+            mBytesPerFrame: UInt32(bytesPerFrame), mChannelsPerFrame: UInt32(ch),
+            mBitsPerChannel: 16, mReserved: 0)
+        var format: CMAudioFormatDescription?
+        var st = CMAudioFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault, asbd: &asbd, layoutSize: 0, layout: nil,
+            magicCookieSize: 0, magicCookie: nil, extensions: nil, formatDescriptionOut: &format)
+        guard st == noErr, let fmt = format else {
+            throw NormalizeError.exportFailed("silence format description: \(st)")
+        }
+        let len = frames * bytesPerFrame
+        guard let mem = calloc(1, len) else {
+            throw NormalizeError.exportFailed("silence allocation (\(len) bytes)")
+        }
+        var block: CMBlockBuffer?
+        st = CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault, memoryBlock: mem, blockLength: len,
+            blockAllocator: kCFAllocatorMalloc, customBlockSource: nil,
+            offsetToData: 0, dataLength: len, flags: 0, blockBufferOut: &block)
+        guard st == noErr, let bb = block else {
+            free(mem)
+            throw NormalizeError.exportFailed("silence block buffer: \(st)")
+        }
+        var timing = CMSampleTimingInfo(
+            duration: CMTime(value: 1, timescale: CMTimeScale(max(1, sampleRate))),
+            presentationTimeStamp: CMTime(value: ptsNanos, timescale: 1_000_000_000),
+            decodeTimeStamp: .invalid)
+        var sampleSize = bytesPerFrame
+        var sample: CMSampleBuffer?
+        st = CMSampleBufferCreateReady(
+            allocator: kCFAllocatorDefault, dataBuffer: bb, formatDescription: fmt,
+            sampleCount: frames, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
+            sampleSizeEntryCount: 1, sampleSizeArray: &sampleSize, sampleBufferOut: &sample)
+        guard st == noErr, let s = sample else {
+            throw NormalizeError.exportFailed("silence sample buffer: \(st)")
+        }
+        return s
     }
 
     /// Same bounded readiness wait as `NativeMP4Writer.waitReady`, minus the HEVC-stall diagnostics:
