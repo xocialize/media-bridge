@@ -48,6 +48,9 @@ public enum MediaBridge {
 
     public enum NormalizeError: Error, Equatable {
         case noVideoTrack
+        /// `normalizeAudio` found no audio track to normalize (video-only file, or a container with
+        /// no tracks AVFoundation/Matroska can see).
+        case noAudioTrack
         /// The source video codec isn't natively decodable (VP9/VP8/…); it must be handled by a
         /// future SupportGate fallback. Surfaced here, never silently produced as a broken file.
         case deferredCodec(String)

@@ -8,7 +8,7 @@ measure quality. Targets:
   (CodecPrivate → `CMFormatDescription`), `VTDecompressionSession`/`AudioConverter` decode. Consumes
   `matroska-swift`'s `MatroskaDemux`. **CMTime conversion (ns→CMTime) happens here**, not in the demuxer.
 - **`MediaBridge`** — convert/normalize orchestration, native HEVC/H.264 + AAC encode (AVAssetWriter),
-  probe, ShotDetector. The public surface.
+  audio-only normalize (`normalizeAudio` → AAC m4a, AB-A-0026), probe, ShotDetector. The public surface.
 - **`ImageBridge`** — stills: ImageIO decode/encode (PNG/JPEG/HEIC/AVIF/TIFF), PDF rasterize, alpha
   split, tiled `FrameProcessor` AI-chain seam (`ModelChain` — how ForgeOptimizer injects
   Real-ESRGAN/NAFNet), decode→process→encode orchestrator. **Salvaged binary-free** — DROPPED on
