@@ -2,6 +2,7 @@ import AVFoundation
 import CoreVideo
 import XCTest
 @testable import MediaBridge
+@testable import MediaImport
 
 /// `MediaBridge.normalizeAudio` (AB-A-0026): any supported audio input → audio-only AAC m4a, with an
 /// opportunistic no-re-encode passthrough. The pure-Swift fixtures (WAV via AVAudioFile, video-only
@@ -54,11 +55,34 @@ final class NormalizeAudioTests: XCTestCase {
         return url
     }
 
-    /// Video-only mp4 (3 black frames through NativeMP4Writer) — the `.noAudioTrack` shape.
-    private func makeVideoOnlyMP4() async throws -> URL {
+    /// Int16 mono sine (amplitude 0.5) in the decode layer's own `PCM` shape — what NativeMP4Writer's
+    /// AAC audio input takes, and the same construction the pad uses for its silence.
+    private func tonePCM(rate: Double, seconds: Double) -> AudioDecodeSession.PCM {
+        let frames = Int(rate * seconds)
+        var data = Data(count: frames * 2)
+        data.withUnsafeMutableBytes { raw in
+            let p = raw.bindMemory(to: Int16.self)
+            for i in 0..<frames { p[i] = Int16(16_000 * sin(2 * .pi * 440 * Double(i) / rate)) }
+        }
+        return AudioDecodeSession.PCM(data: data, sampleRate: rate, channels: 1)
+    }
+
+    /// An mp4 through NativeMP4Writer: `videoSeconds` of 25 fps black frames plus, when
+    /// `audioSeconds > 0`, an AAC track of that length — the A/V shape where the container's duration
+    /// and the audio track's disagree. Audio goes first and is closed (the writer's throttle rule).
+    private func makeAVMP4(videoSeconds: Double, audioSeconds: Double,
+                           rate: Double = 48_000) async throws -> URL {
         let url = scratchURL("mp4")
-        let writer = try NativeMP4Writer(output: url, width: 64, height: 64)
-        for i in 0..<3 {
+        let writer = try NativeMP4Writer(
+            output: url, width: 64, height: 64,
+            audioPCM: audioSeconds > 0 ? (sampleRate: rate, channels: 1) : nil)
+        if audioSeconds > 0 {
+            for chunk in try tonePCM(rate: rate, seconds: audioSeconds).makeSampleBuffers() {
+                try await writer.appendAudio(chunk)
+            }
+            writer.finishAudio()
+        }
+        for i in 0..<Int((videoSeconds * 25).rounded()) {
             var pb: CVPixelBuffer?
             CVPixelBufferCreate(nil, 64, 64, kCVPixelFormatType_32BGRA, nil, &pb)
             let buffer = try XCTUnwrap(pb)
@@ -70,6 +94,11 @@ final class NormalizeAudioTests: XCTestCase {
         }
         try await writer.finish()
         return url
+    }
+
+    /// Video-only mp4 (3 black frames) — the `.noAudioTrack` shape.
+    private func makeVideoOnlyMP4() async throws -> URL {
+        try await makeAVMP4(videoSeconds: 0.12, audioSeconds: 0)
     }
 
     private func tool(_ name: String) -> String? {
@@ -112,6 +141,53 @@ final class NormalizeAudioTests: XCTestCase {
         let duration = try await asset.load(.duration).seconds
         return (CMFormatDescriptionGetMediaSubType(format), asbd.mSampleRate,
                 Int(asbd.mChannelsPerFrame), duration)
+    }
+
+    /// The output decoded to interleaved Int16 the way a consumer would (AVAssetReader) — the samples
+    /// themselves, for the assertions a header cannot make (tone vs silence, exact length).
+    private func decodedPCM(_ url: URL) async throws -> (rate: Double, channels: Int, samples: [Int16]) {
+        let asset = AVURLAsset(url: url)
+        let tracks = try await asset.loadTracks(withMediaType: .audio)
+        let track = try XCTUnwrap(tracks.first)
+        let reader = try AVAssetReader(asset: asset)
+        let out = AVAssetReaderTrackOutput(track: track, outputSettings: [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsNonInterleaved: false,
+        ])
+        reader.add(out)
+        XCTAssertTrue(reader.startReading())
+        var rate = 0.0, channels = 1
+        var samples: [Int16] = []
+        while let s = out.copyNextSampleBuffer() {
+            if let fmt = CMSampleBufferGetFormatDescription(s),
+               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt)?.pointee {
+                rate = asbd.mSampleRate
+                channels = Int(asbd.mChannelsPerFrame)
+            }
+            guard let block = CMSampleBufferGetDataBuffer(s) else { continue }
+            var length = 0
+            var pointer: UnsafeMutablePointer<CChar>?
+            CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil,
+                                        totalLengthOut: &length, dataPointerOut: &pointer)
+            guard let pointer else { continue }
+            pointer.withMemoryRebound(to: Int16.self, capacity: length / 2) { p in
+                samples.append(contentsOf: UnsafeBufferPointer(start: p, count: length / 2))
+            }
+        }
+        return (rate, channels, samples)
+    }
+
+    /// Mean |x| in [0, 1] over the frames in [from, to) seconds: a 0.5-amplitude sine ≈ 0.32,
+    /// digital silence ≈ 0.
+    private func meanAbs(_ pcm: (rate: Double, channels: Int, samples: [Int16]),
+                         from: Double, to: Double) -> Double {
+        let lo = Int(from * pcm.rate) * pcm.channels
+        let hi = min(pcm.samples.count, Int(to * pcm.rate) * pcm.channels)
+        guard hi > lo else { return 0 }
+        var sum = 0.0
+        for i in lo..<hi { sum += Double(abs(Int32(pcm.samples[i]))) }
+        return sum / (Double(hi - lo) * 32768)
     }
 
     // MARK: - Native path
@@ -244,6 +320,11 @@ final class NormalizeAudioTests: XCTestCase {
 
     // MARK: - padToDuration (AB-A-0028: grid-fit silence pad, single generation)
 
+    /// The consumer's grid tolerance (LTX Studio's AudioIngest, ~11 ms): a padded artifact must land
+    /// on the grid at least that precisely, or the caller spends the second generation anyway. The
+    /// old ±0.1 s window was 2.4 frames at 24 fps — wider than the drift the feature exists to remove.
+    private let gridAccuracy = 0.011
+
     /// Short content pads UP with trailing silence to the requested duration — in the same encode
     /// generation, at a fractional (frame-grid-shaped) target, with the source rate preserved.
     func testPadToDurationExtendsShortContent() async throws {
@@ -252,11 +333,28 @@ final class NormalizeAudioTests: XCTestCase {
         let result = try await MediaBridge.normalizeAudio(
             input: src, output: dst, options: .init(padToDuration: 2.52))
         XCTAssertFalse(result.passthrough)
-        XCTAssertEqual(result.duration, 2.52, accuracy: 0.1)
+        XCTAssertEqual(result.duration, 2.52, accuracy: gridAccuracy)
         let facts = try await audioFacts(dst)
         XCTAssertEqual(facts.codec, kAudioFormatMPEG4AAC)
         XCTAssertEqual(facts.rate, 24_000)
-        XCTAssertEqual(facts.duration, 2.52, accuracy: 0.1)
+    }
+
+    /// The README's advertised shape — resample AND pad in one call — checked on the samples, not
+    /// just the header: the head still carries the tone, the tail is digital silence, and the decoded
+    /// length lands on the grid. A pad that wrote garbage, overlapped the content, or arrived in the
+    /// wrong shape would keep the header duration intact and fail here.
+    func testPadTailIsSilentAndContentIntact() async throws {
+        let src = try makeWAV(rate: 24_000, channels: 1, seconds: 1)
+        let dst = scratchURL("m4a")
+        let result = try await MediaBridge.normalizeAudio(
+            input: src, output: dst, options: .init(targetSampleRate: 48_000, padToDuration: 2.52))
+        XCTAssertEqual(result.sampleRate, 48_000)
+        XCTAssertEqual(result.duration, 2.52, accuracy: gridAccuracy)
+        let pcm = try await decodedPCM(dst)
+        XCTAssertEqual(pcm.rate, 48_000)
+        XCTAssertEqual(Double(pcm.samples.count / pcm.channels) / pcm.rate, 2.52, accuracy: gridAccuracy)
+        XCTAssertGreaterThan(meanAbs(pcm, from: 0.1, to: 0.9), 0.2, "the tone must survive the pad")
+        XCTAssertLessThan(meanAbs(pcm, from: 1.05, to: 2.5), 0.005, "the pad must be digital silence")
     }
 
     /// The operator policy the option encodes: pad up, NEVER trim — a target shorter than the
@@ -266,7 +364,7 @@ final class NormalizeAudioTests: XCTestCase {
         let dst = scratchURL("m4a")
         let result = try await MediaBridge.normalizeAudio(
             input: src, output: dst, options: .init(padToDuration: 0.5))
-        XCTAssertEqual(result.duration, 2, accuracy: 0.25)
+        XCTAssertEqual(result.duration, 2, accuracy: gridAccuracy)
     }
 
     /// Padding forces the re-encode only when it would actually happen: a passthrough-eligible
@@ -281,13 +379,73 @@ final class NormalizeAudioTests: XCTestCase {
         let needsPad = try await MediaBridge.normalizeAudio(
             input: aac, output: padded, options: .init(padToDuration: 3.0))
         XCTAssertFalse(needsPad.passthrough, "a pad that must happen requires the re-encode")
-        XCTAssertEqual(needsPad.duration, 3.0, accuracy: 0.1)
+        XCTAssertEqual(needsPad.duration, 3.0, accuracy: gridAccuracy)
 
         let untouched = scratchURL("m4a")
         let noPad = try await MediaBridge.normalizeAudio(
             input: aac, output: untouched, options: .init(padToDuration: 1.0))
         XCTAssertTrue(noPad.passthrough, "a no-op pad must not cost the passthrough")
-        XCTAssertEqual(noPad.duration, 2, accuracy: 0.25)
+        XCTAssertEqual(noPad.duration, 2, accuracy: gridAccuracy)
+    }
+
+    /// "Already at the target" is judged on the AUDIO track, never the container: an mp4 whose video
+    /// outlasts its audio used to read as long enough and pass the short audio through unpadded.
+    func testPadJudgesTheAudioTrackNotTheContainer() async throws {
+        let src = try await makeAVMP4(videoSeconds: 3, audioSeconds: 1)
+
+        let padded = scratchURL("m4a")
+        let needsPad = try await MediaBridge.normalizeAudio(
+            input: src, output: padded, options: .init(padToDuration: 2.0))
+        XCTAssertFalse(needsPad.passthrough, "1 s of audio under 3 s of video is still 1 s of audio")
+        XCTAssertEqual(needsPad.duration, 2.0, accuracy: gridAccuracy)
+
+        let untouched = scratchURL("m4a")
+        let noPad = try await MediaBridge.normalizeAudio(
+            input: src, output: untouched, options: .init(padToDuration: 0.5))
+        XCTAssertTrue(noPad.passthrough, "a no-op pad must not cost the passthrough")
+        XCTAssertEqual(noPad.duration, 1.0, accuracy: gridAccuracy)
+    }
+
+    /// One definition of "at the target" on both routes: a shortfall inside `padTolerance` neither
+    /// costs a passthrough source its remux nor adds a sliver of silence on the re-encode route.
+    func testSubToleranceShortfallCountsAsAtTheTarget() async throws {
+        let wav = try makeWAV(rate: 48_000, channels: 1, seconds: 2)
+        let target = 2.0 + MediaBridge.padTolerance / 2
+
+        let aac = scratchURL("m4a")
+        _ = try await MediaBridge.normalizeAudio(input: wav, output: aac)
+        let remuxed = scratchURL("m4a")
+        let viaPassthrough = try await MediaBridge.normalizeAudio(
+            input: aac, output: remuxed, options: .init(padToDuration: target))
+        XCTAssertTrue(viaPassthrough.passthrough)
+
+        let control = scratchURL("m4a")
+        _ = try await MediaBridge.normalizeAudio(input: wav, output: control)
+        let reencoded = scratchURL("m4a")
+        _ = try await MediaBridge.normalizeAudio(
+            input: wav, output: reencoded, options: .init(padToDuration: target))
+        let padFrames = try await decodedPCM(reencoded).samples.count
+        let controlFrames = try await decodedPCM(control).samples.count
+        XCTAssertEqual(padFrames, controlFrames, "no sub-tolerance sliver of silence")
+    }
+
+    /// A non-finite target (a grid computed against a zero frame rate) is refused before any file is
+    /// touched — it used to trap at the frame-count conversion mid-encode and leave the artifact.
+    func testNonFinitePadThrowsUpFront() async throws {
+        let src = try makeWAV(rate: 48_000, channels: 1, seconds: 1)
+        for bad in [Double.infinity, -.infinity, .nan] {
+            let dst = scratchURL("m4a")
+            do {
+                _ = try await MediaBridge.normalizeAudio(
+                    input: src, output: dst, options: .init(padToDuration: bad))
+                XCTFail("expected a throw for padToDuration \(bad)")
+            } catch let error as MediaBridge.NormalizeError {
+                guard case .exportFailed = error else {
+                    return XCTFail("expected exportFailed, got \(error)")
+                }
+            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: dst.path), "\(bad)")
+        }
     }
 
     func testMatroskaPadToDuration() async throws {
@@ -295,9 +453,11 @@ final class NormalizeAudioTests: XCTestCase {
         let dst = scratchURL("m4a")
         let result = try await MediaBridge.normalizeAudio(
             input: src, output: dst, options: .init(padToDuration: 3.0))
-        XCTAssertEqual(result.duration, 3.0, accuracy: 0.1)
+        XCTAssertFalse(result.passthrough)
+        XCTAssertEqual(result.duration, 3.0, accuracy: gridAccuracy)
         let facts = try await audioFacts(dst)
         XCTAssertEqual(facts.codec, kAudioFormatMPEG4AAC)
+        XCTAssertEqual(facts.duration, 3.0, accuracy: gridAccuracy)
     }
 
     func testVideoOnlyInputThrowsNoAudioTrack() async throws {

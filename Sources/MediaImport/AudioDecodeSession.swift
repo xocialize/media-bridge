@@ -206,6 +206,14 @@ public extension AudioDecodeSession.PCM {
         return buffers
     }
 
+    /// `frames` of digital silence in this layout — zeroed interleaved Int16 (`Data(count:)` is
+    /// zero-filled). The pad primitive `MediaBridge.normalizeAudio(padToDuration:)` continues a track
+    /// with: built HERE so silence and content are one sample-buffer construction that cannot drift.
+    static func silence(frames: Int, sampleRate: Double, channels: Int) -> AudioDecodeSession.PCM {
+        AudioDecodeSession.PCM(data: Data(count: max(0, frames) * 2 * max(1, channels)),
+                               sampleRate: sampleRate, channels: channels)
+    }
+
     /// Wrap the decoded interleaved Int16 PCM as one CMSampleBuffer for an AAC-encoding writer input.
     func makeSampleBuffer(ptsNanos: Int64) throws -> CMSampleBuffer {
         try Self.makeBuffer(data: data, frames: frameCount, channels: max(1, channels),
