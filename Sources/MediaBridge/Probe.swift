@@ -37,15 +37,30 @@ public struct VideoStreamInfo: Sendable, Equatable {
     /// (`MediaMeasure.SourceProfile`): C7 measured that RESOLUTION is the wrong degradation
     /// axis — bits per pixel per frame is what separates "detail missing" from "detail damaged".
     public let estimatedDataRateBPS: Double
+    /// Whether the stream declares an ALPHA channel. Read it before routing anything through an
+    /// opaque path: HEVC- and H.264-in-mp4 have nowhere to put alpha, so an alpha source that
+    /// takes the opaque encode is flattened, and a flatten is invisible in the bytes and in the
+    /// score (SSIMULACRA2 composites over an opaque ground before measuring, so a flattened
+    /// candidate scores against a flattened reference and clears its floor).
+    ///
+    /// Sources: `ContainsAlphaChannel` on the format description for native containers (ProRes
+    /// 4444 `ap4h`, HEVC-with-alpha `hvc1` — both `.mov`); Matroska `AlphaMode` for MKV/WebM
+    /// (VP9-with-alpha). `false` means "the container did not declare alpha", which is a
+    /// declaration-level answer, not a per-pixel one — an opaque-but-alpha-tagged stream reads
+    /// `true`, deliberately: refusing to flatten something that turns out to be opaque costs a
+    /// skip, and the other way costs a wrong file.
+    public let hasAlpha: Bool
 
     public init(codecID: String, width: Int, height: Int, frameRate: Double,
-                nativelyDecodable: Bool, estimatedDataRateBPS: Double = 0) {
+                nativelyDecodable: Bool, estimatedDataRateBPS: Double = 0,
+                hasAlpha: Bool = false) {
         self.codecID = codecID
         self.width = width
         self.height = height
         self.frameRate = frameRate
         self.nativelyDecodable = nativelyDecodable
         self.estimatedDataRateBPS = estimatedDataRateBPS
+        self.hasAlpha = hasAlpha
     }
 }
 
@@ -80,13 +95,20 @@ public extension MediaBridge {
             let size = try await t.load(.naturalSize)
             let fps = try await t.load(.nominalFrameRate)
             let dataRate = (try? await t.load(.estimatedDataRate)) ?? 0
-            let codec = (try await t.load(.formatDescriptions)).first
+            let formatDescription = (try await t.load(.formatDescriptions)).first
+            let codec = formatDescription
                 .map { unifiedCodecID(fourCC: fourCC(CMFormatDescriptionGetMediaSubType($0))) } ?? "?"
+            // ProRes 4444 and HEVC-with-alpha both tag the format description; no decode needed.
+            let hasAlpha = formatDescription.flatMap {
+                CMFormatDescriptionGetExtension(
+                    $0, extensionKey: kCMFormatDescriptionExtension_ContainsAlphaChannel) as? Bool
+            } ?? false
             videos.append(VideoStreamInfo(
                 codecID: codec, width: Int(abs(size.width).rounded()),
                 height: Int(abs(size.height).rounded()), frameRate: Double(fps),
                 nativelyDecodable: true,    // AVFoundation read it → decodable
-                estimatedDataRateBPS: Double(dataRate)))
+                estimatedDataRateBPS: Double(dataRate),
+                hasAlpha: hasAlpha))
         }
 
         var audios: [AudioStreamInfo] = []
@@ -120,7 +142,8 @@ public extension MediaBridge {
             VideoStreamInfo(
                 codecID: t.codecID, width: t.video?.pixelWidth ?? 0, height: t.video?.pixelHeight ?? 0,
                 frameRate: t.defaultDurationNanos.map { 1_000_000_000.0 / Double($0) } ?? 0,
-                nativelyDecodable: SupportGate.status(forCodecID: t.codecID) == .nativeVideo)
+                nativelyDecodable: SupportGate.status(forCodecID: t.codecID) == .nativeVideo,
+                hasAlpha: t.video?.hasAlpha ?? false)     // Matroska AlphaMode (VP9-with-alpha)
         }
         let audios = demuxer.tracks.filter { $0.type == .audio }.map { t in
             AudioStreamInfo(

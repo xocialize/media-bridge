@@ -379,15 +379,26 @@ public enum VideoQualityTarget {
         /// The source decoded partway then the reader/writer aborted (truncated/garbled container,
         /// `FigExport`-class failures). Carries the underlying AVFoundation error when available.
         case sourceAborted(Error?)
+        /// A writer input stopped accepting data and never resumed — the encode is wedged, not slow.
+        /// Raised instead of parking forever so a caller can fail the item and move on. See
+        /// `mezzanineStallTimeout`.
+        case pumpStalled(String)
         public var description: String {
             switch self {
             case .noVideoTrack:        return "no video track"
             case .encodeFailed:        return "video encode failed"
             case .readFailed:          return "source could not be read"
             case .sourceAborted(let e): return "source aborted mid-encode: \(e.map(String.init(describing:)) ?? "unknown")"
+            case .pumpStalled(let why): return "encode pump stalled: \(why)"
             }
         }
     }
+
+    /// How long an inline pump waits for `isReadyForMoreMediaData` before declaring the encode
+    /// wedged. Matches `MediaBridge.NativeMP4Writer.encoderStallTimeout` deliberately: same
+    /// failure shape (an input that stops draining), same number, so the two paths agree about
+    /// what "stalled" means. A healthy mezzanine append becomes ready in milliseconds.
+    static let mezzanineStallTimeout: TimeInterval = 90
 
     /// Binary-search the target bitrate (down from the source bitrate); gate on the p10 frame so one bad
     /// frame can't pass. Smallest output whose p10 ≥ `targetScore` wins.
@@ -1155,9 +1166,49 @@ public enum VideoQualityTarget {
         let cancelled = CancelFlag()
         defer {
             if !completed {
+                // Bring the sibling pump down too: a throw out of the inline video loop leaves the
+                // audio pump registered, and `cancelled` is the only channel into a closure running
+                // on its own queue. `cancelReading()` alone races it.
+                cancelled.set()
                 if reader.status == .reading { reader.cancelReading() }
                 if writer.status == .writing { writer.cancelWriting() }
                 try? FileManager.default.removeItem(at: output)
+            }
+        }
+
+        // ── The AUDIO pump is registered BEFORE any video pumping, on BOTH paths ─────────────
+        // `AVAssetWriter` interleaves: it throttles an input whose media time runs ahead of its
+        // siblings. This registration used to sit BELOW the denoise branch, which pumps video
+        // INLINE — so on a clip WITH audio the video input went not-ready a few seconds in and
+        // then waited for an audio input that had never started. Nothing checked `writer.status`
+        // and the sleep only cancels if someone cancels, so the loop parked at ~0% CPU forever
+        // (AB-A-0055: a 10.7 s 1080p rendered slide with AAC stereo wedged for 7 minutes until it
+        // was killed; audio-less clips never hit it, which is why the GIF corpus passed).
+        // Registering audio first lets it drain to EOF and `markAsFinished()`, which releases the
+        // throttle on video. The callback path always had this shape by accident of ordering;
+        // hoisting makes it true unconditionally rather than for one branch.
+        let group = DispatchGroup()
+        if let audioIn, let audioOut {
+            group.enter()
+            // Its own `Once`: the audio pump runs on BOTH video paths, so cancelling the inline
+            // denoise loop has to bring this one down too.
+            let finishAudio = Once()
+            audioIn.requestMediaDataWhenReady(on: DispatchQueue(label: "vqt.mezz.audio")) {
+                while audioIn.isReadyForMoreMediaData {
+                    if cancelled.isSet {
+                        finishAudio.run { audioIn.markAsFinished(); group.leave() }
+                        return
+                    }
+                    if let s = audioOut.copyNextSampleBuffer() {
+                        if !audioIn.append(s) {
+                            finishAudio.run { audioIn.markAsFinished(); group.leave() }
+                            return
+                        }
+                    } else {
+                        finishAudio.run { audioIn.markAsFinished(); group.leave() }
+                        return
+                    }
+                }
             }
         }
 
@@ -1207,6 +1258,32 @@ public enum VideoQualityTarget {
             let sw = Int(abs(size.width).rounded()), sh = Int(abs(size.height).rounded())
             if sw != outWidth || sh != outHeight {
                 CVPixelBufferCreate(nil, sw, sh, kCVPixelFormatType_32BGRA, nil, &hdrScratch)
+            }
+        }
+
+        /// Bound the inline pump's readiness spin. Three terminal paths instead of one: task
+        /// cancellation, a writer that has left `.writing` (it failed underneath us — the spin
+        /// would otherwise be waiting on a dead session), and a hard timeout. The timeout is the
+        /// backstop for a wedge nobody has diagnosed yet: with the audio pump now registered
+        /// first, the known interleave deadlock cannot form, but a caller that has parked forever
+        /// has no way to tell "slow" from "never", and a background queue needs to fail the item
+        /// and move on. Never fires on healthy encodes — readiness returns in milliseconds.
+        func awaitVideoReady() async throws {
+            var waited: TimeInterval = 0
+            while !videoIn.isReadyForMoreMediaData {
+                try Task.checkCancellation()
+                guard writer.status == .writing else {
+                    throw EncodeError.sourceAborted(writer.error)
+                }
+                try await Task.sleep(nanoseconds: 2_000_000)
+                waited += 0.002
+                if waited > Self.mezzanineStallTimeout {
+                    throw EncodeError.pumpStalled(
+                        "mezzanine video input not draining: isReadyForMoreMediaData=false for "
+                        + "\(Int(Self.mezzanineStallTimeout))s. The usual cause is an AVAssetWriter "
+                        + "interleave stall — a sibling input that is open but receiving nothing "
+                        + "throttles this one; feed every track or mark it finished.")
+                }
             }
         }
 
@@ -1272,18 +1349,16 @@ public enum VideoQualityTarget {
                 } else {
                     guard dn.bgra(from: filtered, into: pb) else { throw EncodeError.encodeFailed }
                 }
-                while !videoIn.isReadyForMoreMediaData {
-                    try await Task.sleep(nanoseconds: 2_000_000)
-                }
+                try await awaitVideoReady()
                 adaptor.append(pb, withPresentationTime: current.pts)
                 if cursor >= 1 { window.removeFirst() } else { cursor += 1 }
                 if let f = readCompressed() { window.append(f) }
             }
             videoIn.markAsFinished()
-            // Audio still pumps below via the callback path; fall through to the shared wait.
+            // Audio has been pumping on its own queue since before this loop started (see the
+            // hoisted registration above); fall through to the shared wait for it to finish.
         }
 
-        let group = DispatchGroup()
         if denoiseStrength == nil {
         group.enter()
         // One `Once` per pump: this closure had TWO unguarded `group.leave()` sites (EOF and
@@ -1330,29 +1405,6 @@ public enum VideoQualityTarget {
             }
         }
         }   // end denoiseStrength == nil (callback video pump)
-        if let audioIn, let audioOut {
-            group.enter()
-            // Its own `Once`: the audio pump runs on BOTH video paths, so cancelling the inline
-            // denoise loop has to bring this one down too.
-            let finishAudio = Once()
-            audioIn.requestMediaDataWhenReady(on: DispatchQueue(label: "vqt.mezz.audio")) {
-                while audioIn.isReadyForMoreMediaData {
-                    if cancelled.isSet {
-                        finishAudio.run { audioIn.markAsFinished(); group.leave() }
-                        return
-                    }
-                    if let s = audioOut.copyNextSampleBuffer() {
-                        if !audioIn.append(s) {
-                            finishAudio.run { audioIn.markAsFinished(); group.leave() }
-                            return
-                        }
-                    } else {
-                        finishAudio.run { audioIn.markAsFinished(); group.leave() }
-                        return
-                    }
-                }
-            }
-        }
         await withTaskCancellationHandler {
             await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
                 group.notify(queue: DispatchQueue(label: "vqt.mezz.done")) { cont.resume() }
