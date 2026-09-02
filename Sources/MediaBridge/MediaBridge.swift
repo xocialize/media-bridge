@@ -165,7 +165,7 @@ public enum MediaBridge {
 
     /// Pure-Swift demux → native decode → native HEVC/AAC encode for non-AVFoundation containers.
     private static func normalizeMatroska(input: URL, output: URL) async throws -> NormalizeResult {
-        let demuxer = MatroskaDemuxer(data: try Data(contentsOf: input))
+        let demuxer = try MatroskaDemuxer.mapped(input)   // file-backed pages, not an anonymous copy
         try demuxer.parseHeaders()
 
         guard let track = demuxer.tracks.first(where: { $0.type == .video }) else {

@@ -368,7 +368,7 @@ extension MediaBridge {
 
     private static func normalizeMatroskaAudio(input: URL, output: URL,
                                                options: AudioNormalizeOptions) async throws -> NormalizedAudio {
-        let demuxer = MatroskaDemuxer(data: try Data(contentsOf: input))
+        let demuxer = try MatroskaDemuxer.mapped(input)   // file-backed pages, not an anonymous copy
         try demuxer.parseHeaders()
 
         let audioTracks = demuxer.tracks.filter { $0.type == .audio }

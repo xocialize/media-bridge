@@ -58,7 +58,7 @@ public extension MediaBridge {
         format: TransparentVideoFormat = .movHEVCAlpha
     ) async throws -> AlphaNormalizeResult {
 
-        let demuxer = MatroskaDemuxer(data: try Data(contentsOf: input))
+        let demuxer = try MatroskaDemuxer.mapped(input)   // file-backed pages, not an anonymous copy
         try demuxer.parseHeaders()
         guard let track = demuxer.tracks.first(where: { $0.type == .video }) else {
             throw AlphaNormalizeError.noVideoTrack

@@ -134,7 +134,9 @@ public extension MediaBridge {
     // MARK: - Matroska / WebM
 
     private static func probeMatroska(url: URL) throws -> MediaInfo {
-        let demuxer = MatroskaDemuxer(data: try Data(contentsOf: url))
+        // Mapped, not read: `parseHeaders` stops at the first Cluster, so a probe touches only
+        // the header pages of what may be a multi-GB master (see `MatroskaDemuxer.mapped`).
+        let demuxer = try MatroskaDemuxer.mapped(url)
         try demuxer.parseHeaders()
         let container: MediaInfo.Container = demuxer.docType == "webm" ? .webm : .matroska
 
