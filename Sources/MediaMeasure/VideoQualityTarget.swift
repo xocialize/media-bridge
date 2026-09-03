@@ -376,6 +376,11 @@ public enum VideoQualityTarget {
 
     public enum EncodeError: Error, CustomStringConvertible {
         case noVideoTrack, encodeFailed, readFailed
+        /// The source declares an alpha channel and every profile here writes opaque HEVC/H.264 in
+        /// mp4, so encoding it would flatten the transparency — silently, because the output is a
+        /// complete, plausible video and the scorer cannot see alpha. Refused unless the caller
+        /// passes `flattenAlpha: true` to composite it away on purpose.
+        case alphaSource
         /// The source decoded partway then the reader/writer aborted (truncated/garbled container,
         /// `FigExport`-class failures). Carries the underlying AVFoundation error when available.
         case sourceAborted(Error?)
@@ -388,6 +393,9 @@ public enum VideoQualityTarget {
             case .noVideoTrack:        return "no video track"
             case .encodeFailed:        return "video encode failed"
             case .readFailed:          return "source could not be read"
+            case .alphaSource:         return "source declares an alpha channel — the mp4 deliverable "
+                                            + "cannot carry it and flattening would be silent; pass "
+                                            + "flattenAlpha: true to composite it away deliberately"
             case .sourceAborted(let e): return "source aborted mid-encode: \(e.map(String.init(describing:)) ?? "unknown")"
             case .pumpStalled(let why): return "encode pump stalled: \(why)"
             }
@@ -413,11 +421,18 @@ public enum VideoQualityTarget {
     /// so a short clip can't collapse p10 to a noisy min-of-3. A fixed stride on a 49-frame clip scored ~3
     /// frames → p10 ≈ the single worst (noisy) frame → a non-monotonic, jittery bitrate search (worst on
     /// temporally-inconsistent AI video). Targeting ≥12 samples gives a stable 10th-percentile.
+    ///
+    /// **Alpha sources are refused** (`EncodeError.alphaSource`): every profile writes opaque
+    /// HEVC/H.264-in-mp4, and a flatten is invisible in the bytes and to the scorer. The refusal
+    /// lives HERE, where the flatten physically happens, so every direct consumer — benches, CLIs,
+    /// the Kit — inherits it. `flattenAlpha: true` is the explicit opt-in for a caller who knows
+    /// the alpha plane is opaque (or wants it composited away) and says so.
     public static func encode(input: URL, output: URL, targetScore: Double, maxHeight: Int? = nil,
                               iterations: Int = 6, searchStride: Int? = nil,
                               minScoredFrames: Int = 12, maxScoredFrames: Int = 16,
                               profile: EncodeProfile = .hevc,
                               denoiseStrength: Float? = nil,
+                              flattenAlpha: Bool = false,
                               onProgress: (@Sendable (SearchProgress) -> Void)? = nil)
         async throws -> Result {
         let mmEncode = MediaMetrics.begin("vqt.encode", lane: "orchestrate",
@@ -442,6 +457,10 @@ public enum VideoQualityTarget {
         // HDR source (HLG/PQ) + an SDR-delivering profile → the mezzanine tone-maps once and the
         // whole search runs SDR-vs-SDR. Detection is by transfer tag; untagged sources are SDR.
         let sourceFormat = try await vtrack.load(.formatDescriptions).first
+        // ── Alpha: refuse, don't flatten (see `EncodeError.alphaSource`) ─────────────────────
+        if let sourceFormat, sourceFormat.declaresAlphaChannel, !flattenAlpha {
+            throw EncodeError.alphaSource
+        }
         let toneMapSDR = profile.deliverSDR && Self.isHDRTransfer(sourceFormat)
 
         // Resolve the output resolution; downscale only (never upscale here — that's the SR path).

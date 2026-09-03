@@ -99,10 +99,8 @@ public extension MediaBridge {
             let codec = formatDescription
                 .map { unifiedCodecID(fourCC: fourCC(CMFormatDescriptionGetMediaSubType($0))) } ?? "?"
             // ProRes 4444 and HEVC-with-alpha both tag the format description; no decode needed.
-            let hasAlpha = formatDescription.flatMap {
-                CMFormatDescriptionGetExtension(
-                    $0, extensionKey: kCMFormatDescriptionExtension_ContainsAlphaChannel) as? Bool
-            } ?? false
+            // One definition, shared with the encoder's and the SR pipeline's refusals.
+            let hasAlpha = formatDescription?.declaresAlphaChannel ?? false
             videos.append(VideoStreamInfo(
                 codecID: codec, width: Int(abs(size.width).rounded()),
                 height: Int(abs(size.height).rounded()), frameRate: Double(fps),

@@ -11,7 +11,13 @@ import CoreVideo
 /// The enhanced frames are larger than the source (super-resolution), and the output size isn't known until the
 /// first frame is enhanced — so we peek frame 0 to size the writer, then stream the rest.
 public enum VideoConsistencyPipeline {
-    public enum PipelineError: Error { case noVideoTrack, emptyClip }
+    public enum PipelineError: Error {
+        case noVideoTrack, emptyClip
+        /// The source declares an alpha channel and this pipeline writes opaque HEVC — the same
+        /// silent flatten `VideoQualityTarget.EncodeError.alphaSource` refuses, for the same
+        /// reason. `flattenAlpha: true` is the explicit opt-in.
+        case alphaSource
+    }
 
     /// Upscale/enhance `input` → temporally-stabilized HEVC `.mp4` at `output`. Returns frames written + the
     /// temporal-stability metric (how much flicker the stabilization removed).
@@ -19,16 +25,24 @@ public enum VideoConsistencyPipeline {
     /// `sceneCut` drives the shot reset the processor documents: at each detected hard cut the temporal
     /// history is cleared, so a new shot never borrows from the flow-warped tail of the previous one
     /// (hard cuts only — dissolves/fades are not detected). Pass nil to disable.
+    ///
+    /// An alpha source is refused (`PipelineError.alphaSource`) unless `flattenAlpha` is true — the
+    /// output is opaque HEVC, and nothing downstream can tell a flattened overlay from a real one.
     @discardableResult
     public static func enhanceToVideo(
         input: URL, output: URL, options: VideoConsistencyOptions = .init(), quality: Float = 0.9,
         sceneCut: SceneCutOptions? = .init(),
+        flattenAlpha: Bool = false,
         enhance: @escaping (CGImage) async throws -> CGImage,
         flow: @escaping (CGImage, CGImage) async throws -> DenseFlow
     ) async throws -> VideoMatteOutcome {
         let asset = AVURLAsset(url: input)
         guard let track = try await asset.loadTracks(withMediaType: .video).first else {
             throw PipelineError.noVideoTrack
+        }
+        if let format = try await track.load(.formatDescriptions).first,
+           format.declaresAlphaChannel, !flattenAlpha {
+            throw PipelineError.alphaSource
         }
         let fpsRaw = try await track.load(.nominalFrameRate)
         let fps = Double(fpsRaw > 0 ? fpsRaw : 30)

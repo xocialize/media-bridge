@@ -68,6 +68,11 @@ print(result.aggregation.summary)
 let hd = try await VideoQualityTarget.encode(
     input: source, output: hdOut, targetScore: 75, maxHeight: 1080, profile: .webH264)
 
+// Alpha sources (ProRes 4444, HEVC-with-alpha) are REFUSED — `EncodeError.alphaSource` —
+// because every profile writes opaque mp4 and a flatten is invisible to the scorer.
+// `flattenAlpha: true` is the explicit opt-in; `MediaBridge.probe(...).videoStreams[0].hasAlpha`
+// answers the question up front. (`VideoConsistencyPipeline.enhanceToVideo` refuses the same way.)
+
 // Score any pair of clips, per-frame (synchronous; GPU when available).
 let score = try VideoQuality.videoScore(reference: a, distorted: b)
 
