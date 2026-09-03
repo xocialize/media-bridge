@@ -376,15 +376,21 @@ public enum VideoQualityTarget {
     /// runs a dedicated search and pays for it; this exists so the choice can be made knowingly.
     /// What became of a `secondaryFloor` request. nil on `Result` when none was made.
     ///
-    /// The two refusals are NOT interchangeable, which is why this is not a bool. `noCandidate`
-    /// says the ladder never produced a file at that quality — persistently, that is the argument
-    /// for spending a real second search. `notSmaller` says one existed and was declined because
-    /// it would not have been a smaller rendition; a second search would not help, the two floors
-    /// are simply landing in the same place on this content.
+    /// The outcomes are NOT interchangeable, which is why this is not a bool — each implies a
+    /// different next move, and collapsing them would send a caller to the wrong one.
+    /// · `noCandidate` — the ladder never produced a file at that quality. Persistently, on content
+    ///   that CAN reach the floor, this is the argument for spending a real second search.
+    /// · `notSmaller` — one existed and was declined because it would not have been a smaller
+    ///   rendition. A second search would not help: the two floors land in the same place here.
+    /// · `deliveryFailed` — a qualifying candidate existed and the COPY failed (disk, permissions).
+    ///   Reported apart from the refusals precisely because it is not one: nothing about the
+    ///   content or the floors was wrong, and retrying is the sensible response where it is not for
+    ///   the other two. The primary is unaffected — the secondary is a bonus and never fails an item.
     public enum SecondaryOutcome: String, Sendable {
         case delivered
         case noCandidate = "no-candidate"
         case notSmaller = "not-smaller"
+        case deliveryFailed = "delivery-failed"
     }
 
     public struct Harvest: Sendable {
@@ -1158,10 +1164,10 @@ public enum VideoQualityTarget {
                         MediaProfile.log("secondary: delivery failed (\(error)) — primary is unaffected")
                         MediaMetrics.event("vqt.secondary.failed", attrs: ["error": "\(error)"])
                         harvested = nil
-                        // The candidate WAS there and did qualify — the copy is what failed. Say
-                        // "not smaller" and you invite a pointless dedicated search; the metrics
-                        // event above is where a delivery fault is diagnosed.
-                        secondaryOutcome = .notSmaller
+                        // The candidate WAS there and did qualify — the copy is what failed. Naming
+                        // it as either refusal would be a lie about the content or the floors, and
+                        // would point a caller at a dedicated search that cannot fix a full disk.
+                        secondaryOutcome = .deliveryFailed
                     }
                 } else {
                     try? FileManager.default.removeItem(at: secondaryOutput)
