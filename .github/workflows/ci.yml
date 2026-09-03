@@ -1,0 +1,80 @@
+name: ci
+
+# NET-CLEAN GATE — media-bridge is the L2 media foundation every downstream layer builds against
+# (ForgeOptimizerKit, the Forge app, the bench tools). Its whole reason to exist is the doctrine in
+# Package.swift's header: NO FFmpeg, no vendored binaries, no `.unsafeFlags`, no copyleft, macOS-14
+# floor, and a dependency closure that stays public. This job turns each of those from a convention
+# into a gate.
+#
+# WHY THIS FILE EXISTS (2026-09-03): it did not, and that cost four releases. A self-shadowing local
+# in `ImageQualityTarget` (`let score: Double = … { try score(…) }`) compiles under the Xcode *beta*
+# toolchain — the only one installed on the dev machine — and is rejected by the stable one. So
+# v0.34.0 through v0.37.2 all shipped a package that could not build on latest-stable Xcode, and the
+# breakage surfaced only in a *consumer's* CI, four pin bumps downstream. Hence:
+#
+#   Build on `latest-stable`, NOT on the beta. The dev machine's beta is a superset; CI's job is to
+#   prove the package builds for everyone else. If a future change compiles locally but fails here,
+#   trust this job — that is precisely the class of defect it was added to catch.
+#
+# If SwiftPM ever fails with "could not read Username for 'https://github.com'", someone added a
+# private dependency — that is the defect, not the network.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: macos-latest
+    # The suite is ~3 min on an M-series dev machine and encode/score-bound, so a runner is slower.
+    # The cap is a safety rail, not a target: a wedged VideoToolbox session must not burn the
+    # 6-hour default (the TNF suite once hard-locked a machine — see TemporalDenoiseTests).
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Select latest stable Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Report toolchain
+        run: swift --version
+
+      - name: Assert net-clean dependency closure
+        run: |
+          swift package resolve
+          fail=0
+          # (a) No MLX / engine — media-bridge must never pull a GPU toolchain or model weights.
+          if grep -riE '"mlx-swift"|mlx-engine-swift' Package.resolved; then
+            echo "::error::MLX entered the dependency graph of the net-clean media foundation"; fail=1
+          fi
+          # (b) No FFmpeg or the copyleft/vendored-binary set the canonical-formats table rules out.
+          if grep -riE 'ffmpeg|libav|libvpx|libjxl|libvmaf|oxipng|dav1d|x264|x265' Package.resolved; then
+            echo "::error::a non-canonical media dependency entered the graph (see Package.swift header)"; fail=1
+          fi
+          # (c) No vendored binaries and no unsafe flags — both make the package un-consumable
+          #     from a tagged URL, which is how every downstream layer takes it. Comments are
+          #     stripped first: the Package.swift header *states* the doctrine ("no .unsafeFlags"),
+          #     so grepping the raw file makes the gate fail on its own prose. The sed drops
+          #     whole-line comments and whitespace-preceded trailing ones, leaving `https://` URLs
+          #     intact and line numbers unchanged.
+          if sed -E 's,[[:space:]]//.*,,; /^[[:space:]]*\/\//d' Package.swift \
+               | grep -nE '\.binaryTarget|\.unsafeFlags'; then
+            echo "::error::binaryTarget/unsafeFlags in Package.swift — breaks tagged-URL consumption"; fail=1
+          fi
+          # (d) A public repo without a LICENSE is all-rights-reserved by default, i.e. legally
+          #     unusable — which silently defeats the point of publishing it.
+          test -f LICENSE || { echo "::error::LICENSE missing"; fail=1; }
+          exit $fail
+
+      - name: Build
+        run: swift build -v
+
+      # Self-contained + synthetic by design: the corpus harnesses (FORGE_CORPUS) and the TNF probe
+      # (MEDIABRIDGE_TNF_TESTS) XCTSkip when unset, so a bare `swift test` is the committed suite.
+      # Do NOT set those here — the corpus is eval-only local media, and TNF once hard-locked a
+      # machine (see TemporalDenoiseTests' header).
+      - name: Test
+        run: swift test
