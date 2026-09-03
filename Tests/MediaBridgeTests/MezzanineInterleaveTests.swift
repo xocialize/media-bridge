@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreVideo
+import VideoToolbox
 import XCTest
 @testable import MediaBridge
 @testable import MediaImport
@@ -114,13 +115,40 @@ final class MezzanineInterleaveTests: XCTestCase {
         try await AVURLAsset(url: url).loadTracks(withMediaType: type).count
     }
 
+    /// Skip unless the temporal noise filter is actually usable at `width`×`height`.
+    ///
+    /// `#available(macOS 26.0, *)` is necessary but NOT sufficient: `VTTemporalNoiseFilter`
+    /// support is a runtime *hardware* property, and a virtualized CI runner reports macOS 26
+    /// while `VTTemporalNoiseFilterConfiguration.isSupported` is false. The denoise branch of
+    /// `renderDownscaleMezzanine` then throws `EncodeError.encodeFailed` — deliberately, since
+    /// the caller explicitly asked to denoise and a silent un-denoised mezzanine would be the
+    /// dishonest option — so an OS-only gate turns "this machine has no TNF" into a red suite.
+    /// Observed exactly that on `macos-latest` when CI was first added.
+    ///
+    /// The gate builds the SAME `TemporalDenoise.Session` the code under test builds, so it
+    /// cannot drift from the condition it stands in for.
+    ///
+    /// Consequence worth stating: where this skips, CI covers none of the denoise path.
+    /// `TemporalDenoiseTests` (opt-in via `MEDIABRIDGE_TNF_TESTS=1`) stays the local-only
+    /// coverage, and these three cases only guard the interleave on TNF-capable hardware.
+    private func requireTemporalNoiseFilter(width: Int, height: Int) throws {
+        guard #available(macOS 26.0, *) else { throw XCTSkip("temporal denoise needs macOS 26+") }
+        guard TemporalDenoise.Session(width: width, height: height) != nil else {
+            throw XCTSkip("""
+                VTTemporalNoiseFilter unusable at \(width)x\(height) on this machine \
+                (isSupported=\(VTTemporalNoiseFilterConfiguration.isSupported)) - the denoise \
+                mezzanine cannot be exercised here.
+                """)
+        }
+    }
+
     // MARK: - The regression
 
     /// **The bug.** A clip WITH audio, rendered through the denoise branch, must return.
     /// Before the fix this never completed; the deadline turns that into a failure in seconds
     /// instead of a hung suite.
     func testDenoiseMezzanineWithAudioCompletes() async throws {
-        guard #available(macOS 26.0, *) else { throw XCTSkip("temporal denoise needs macOS 26+") }
+        try requireTemporalNoiseFilter(width: 320, height: 240)
         let input = try await makeClip(seconds: 5, withAudio: true)
         let output = scratchURL("mp4")
 
@@ -139,7 +167,7 @@ final class MezzanineInterleaveTests: XCTestCase {
 
     /// The audio-less shape that always worked — the hoisted registration must not break it.
     func testDenoiseMezzanineWithoutAudioCompletes() async throws {
-        guard #available(macOS 26.0, *) else { throw XCTSkip("temporal denoise needs macOS 26+") }
+        try requireTemporalNoiseFilter(width: 320, height: 240)
         let input = try await makeClip(seconds: 4, withAudio: false)
         let output = scratchURL("mp4")
 
@@ -173,7 +201,7 @@ final class MezzanineInterleaveTests: XCTestCase {
     /// Cancellation must unwind the inline pump promptly — the wedge's only escape before the fix
     /// was killing the process, so the cancellation path is part of the guarantee.
     func testDenoiseMezzanineHonoursCancellation() async throws {
-        guard #available(macOS 26.0, *) else { throw XCTSkip("temporal denoise needs macOS 26+") }
+        try requireTemporalNoiseFilter(width: 1280, height: 720)
         // 720p, not the 320×240 the other cases use: at that size the whole render finishes in a
         // couple of hundred milliseconds and there is nothing left to cancel. The bigger frame buys
         // seconds of in-flight work, so a cancel a quarter-second in reliably lands mid-pump.
