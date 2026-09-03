@@ -68,6 +68,25 @@ print(result.aggregation.summary)
 let hd = try await VideoQualityTarget.encode(
     input: source, output: hdOut, targetScore: 75, maxHeight: 1080, profile: .webH264)
 
+// A SECOND rendition at a weaker floor, for free: the search encodes and scores a whole
+// ladder of complete deliverables and deletes every one it does not ship. Name a
+// `secondaryFloor` + `secondaryOutput` and the smallest candidate that cleared it is kept
+// instead — same codec, container, resolution and muxed audio, no additional encode.
+let both = try await VideoQualityTarget.encode(
+    input: source, output: heroOut, targetScore: 90,
+    secondaryFloor: 80, secondaryOutput: wifiOut)
+if let rung = both.secondary {
+    print(rung.provenance)   // "harvested @SSIMU2≥80 (from the ≥90 search)"
+    print(rung.overshoot)    // how far above 80 it landed — see the caveat below
+}
+// ⚠️ A harvest is NOT the smallest file that clears 80 — it is whichever bitrate the search
+// for 90 happened to try that also cleared 80, so a receipt must say "harvested". How close
+// it is to a real search is readable from `overshoot`: measured at floor 80 on the signage
+// corpus, an overshoot in the low single digits came within ~10% of a dedicated search,
+// while 7.5 points meant 2.7× larger. The good case is the one that matters — when the
+// primary floor is UNREACHABLE (the reason to want a second rung at all) the search spends
+// its whole ladder near the achievable ceiling, which is exactly where the weaker floor is.
+
 // Alpha sources (ProRes 4444, HEVC-with-alpha) are REFUSED — `EncodeError.alphaSource` —
 // because every profile writes opaque mp4 and a flatten is invisible to the scorer.
 // `flattenAlpha: true` is the explicit opt-in; `MediaBridge.probe(...).videoStreams[0].hasAlpha`

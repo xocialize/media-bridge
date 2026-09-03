@@ -353,6 +353,84 @@ public enum VideoQualityTarget {
         }
     }
 
+    /// A candidate the search **already encoded and scored** that also cleared a second, weaker
+    /// floor — retained instead of being swept with the rest of the temps.
+    ///
+    /// ⚠️ **This is not the result of a floor-`floor` search, and must never be receipted as one.**
+    /// It is whichever bitrate the bisection toward `searchFloor` happened to try that landed at or
+    /// above `floor` — the smallest such candidate by EMITTED bytes, but the ladder was built for a
+    /// different floor, so a dedicated search would land lower. Two further asymmetries follow from
+    /// the same fact and are the reason `summary` says "harvested":
+    ///
+    /// · **The score is a base-density sample.** The near-gate refinement (which doubles sampling
+    ///   density before a verdict) triggers within `nearGateBand` of `searchFloor` — not of `floor`
+    ///   — so a harvested candidate's p10 usually carries the ordinary ~12–16-frame sample, while
+    ///   the primary's may have been refined. Same estimator, one density step coarser.
+    /// · **The ladder thins toward the bottom.** Bisection concentrates its probes around the floor
+    ///   it is chasing; candidates far below `searchFloor` are sparse, so the gap between what was
+    ///   harvested and what a real floor-`floor` search would find widens as the two floors separate.
+    ///
+    /// What it *is*: a complete, playable deliverable — same container, codec, resolution and muxed
+    /// audio as the primary, produced by the same encoder settings — that measurably cleared `floor`
+    /// on this clip, for zero additional encode time. A caller who needs the smallest file at `floor`
+    /// runs a dedicated search and pays for it; this exists so the choice can be made knowingly.
+    /// What became of a `secondaryFloor` request. nil on `Result` when none was made.
+    ///
+    /// The two refusals are NOT interchangeable, which is why this is not a bool. `noCandidate`
+    /// says the ladder never produced a file at that quality — persistently, that is the argument
+    /// for spending a real second search. `notSmaller` says one existed and was declined because
+    /// it would not have been a smaller rendition; a second search would not help, the two floors
+    /// are simply landing in the same place on this content.
+    public enum SecondaryOutcome: String, Sendable {
+        case delivered
+        case noCandidate = "no-candidate"
+        case notSmaller = "not-smaller"
+    }
+
+    public struct Harvest: Sendable {
+        /// The secondary floor asked for — the bar this candidate actually cleared.
+        public let floor: Double
+        /// The floor the SEARCH was run against. `floor` was never searched for.
+        public let searchFloor: Double
+        /// Nominal target bitrate of the harvested candidate (bits/s); ABR emits around it.
+        public let bitrate: Int
+        /// Achieved p10 — at or above `floor`, and (when `searchFloor > floor`) below `searchFloor`.
+        public let score: Double
+        /// The full reduction behind `score`, on the same terms as the primary's.
+        public let aggregation: Aggregation
+        public let outputBytes: Int
+        public let width: Int
+        public let height: Int
+        /// How far ABOVE `floor` this rendition actually landed — and the one number that says
+        /// whether the free version was good enough or a dedicated search is worth paying for.
+        ///
+        /// It measures the thing `Harvest`'s ⚠️ describes: a small overshoot means the ladder had
+        /// probes near `floor` and the harvest is close to what a real search would find; a large
+        /// one means the primary search stopped well above `floor` and never went looking down
+        /// there. Measured on the signage corpus at floor 80 (2026-09-03, AB-A-0059), harvest bytes
+        /// against a dedicated `.balanced` search of the same master:
+        ///
+        /// | overshoot | harvest vs. dedicated |
+        /// |---|---|
+        /// | 0.7 (layersb) · 2.1 (keynote) · 2.8 (ibmplay-1080) | +9% · +10% · +10% |
+        /// | 7.5 (ibmplay master) | **+171%** (10.61 MB vs 3.91 MB) |
+        ///
+        /// The mechanism behind the split: when the primary floor is UNREACHABLE the search spends
+        /// its whole ladder around the achievable ceiling, which is where the weaker floor lives —
+        /// so the harvest is near-optimal. When the primary floor CLEARS, the search stops at the
+        /// smallest candidate meeting it and never probes far below, so the lowest thing it ever
+        /// scored sits just under the primary floor, not near the secondary one.
+        ///
+        /// Four masters is a calibration, not a fit — treat the boundary as "single digits good,
+        /// high single digits suspicious" rather than as a threshold.
+        public var overshoot: Double { score - floor }
+
+        /// One line for a receipt that states the provenance instead of implying a search.
+        public var provenance: String {
+            String(format: "harvested @SSIMU2≥%.0f (from the ≥%.0f search)", floor, searchFloor)
+        }
+    }
+
     public struct Result: Sendable {
         public let bitrate: Int           // AVVideoAverageBitRateKey chosen (bits/s)
         public let score: Double          // achieved p10 per-frame SSIMULACRA2
@@ -369,6 +447,16 @@ public enum VideoQualityTarget {
         /// profile requires it — the output is smaller than the source. Read this, don't re-derive it
         /// from `metTarget` + sizes: the delivery rule is the profile's, not the caller's.
         public let delivered: Bool
+        /// The `secondaryFloor` rendition, when one was asked for AND a candidate the search had
+        /// already encoded cleared that floor AND it is strictly smaller than what shipped at
+        /// `output`. nil otherwise — including when the harvest existed but was not smaller, which
+        /// is a refusal, not an omission: a "smaller rendition" that isn't smaller is not one.
+        /// Read `Harvest`'s doc before quoting its score anywhere: it is a by-product of the
+        /// `targetScore` search, never the result of a search for `Harvest.floor`.
+        public let secondary: Harvest?
+        /// Why `secondary` is what it is — including which of the two refusals happened. nil when
+        /// no `secondaryFloor` was asked for.
+        public let secondaryOutcome: SecondaryOutcome?
         public var savedFraction: Double {
             inputBytes > 0 ? Double(max(0, inputBytes - outputBytes)) / Double(inputBytes) : 0
         }
@@ -427,12 +515,28 @@ public enum VideoQualityTarget {
     /// lives HERE, where the flatten physically happens, so every direct consumer — benches, CLIs,
     /// the Kit — inherits it. `flattenAlpha: true` is the explicit opt-in for a caller who knows
     /// the alpha plane is opaque (or wants it composited away) and says so.
+    ///
+    /// **`secondaryFloor` + `secondaryOutput` harvest a second rendition for free.** Every
+    /// candidate this search encodes is a complete deliverable — right container, right codec,
+    /// muxed audio — that is scored and then deleted. When a weaker floor is also wanted (a
+    /// bad-uplink rung beside the primary), the ladder has usually already produced a file that
+    /// clears it, and running a second search would pay a second full encode for something already
+    /// on disk. Set both and the smallest candidate (by EMITTED bytes) that cleared `secondaryFloor`
+    /// is delivered to `secondaryOutput`, atomically, on the same rules as the primary — and only
+    /// when it is **strictly smaller** than what shipped at `output` (or than the source, when the
+    /// primary declined). Nothing else changes: no extra encode, no extra scoring pass, the search
+    /// trajectory is bit-for-bit the one it would have run anyway. `Result.secondary` describes it.
+    ///
+    /// ⚠️ A harvest is **not** the smallest file that clears `secondaryFloor` — see `Harvest`, which
+    /// documents the three ways it differs from a real search and exists so a receipt can say so.
     public static func encode(input: URL, output: URL, targetScore: Double, maxHeight: Int? = nil,
                               iterations: Int = 6, searchStride: Int? = nil,
                               minScoredFrames: Int = 12, maxScoredFrames: Int = 16,
                               profile: EncodeProfile = .hevc,
                               denoiseStrength: Float? = nil,
                               flattenAlpha: Bool = false,
+                              secondaryFloor: Double? = nil,
+                              secondaryOutput: URL? = nil,
                               onProgress: (@Sendable (SearchProgress) -> Void)? = nil)
         async throws -> Result {
         let mmEncode = MediaMetrics.begin("vqt.encode", lane: "orchestrate",
@@ -581,6 +685,25 @@ public enum VideoQualityTarget {
         var lo = ceiling * (searchPriors && profile.requireSmaller ? 0.35 : 0.04), hi = ceiling
         let initialLo = lo
         var best: (bitrate: Int, score: VideoQualityScore, url: URL)?
+        // The secondary-floor harvest: the smallest scored candidate — by EMITTED bytes, the same
+        // currency the corridor squeeze walks on, because a nominal target overshoots what ABR
+        // actually writes — that cleared `secondaryFloor`. Tracked independently of `best`: the
+        // two floors are different questions, and a candidate that loses the primary search is
+        // exactly the one that can win this. Costs a `stat` per pass and nothing else.
+        var harvest: (bitrate: Int, score: VideoQualityScore, url: URL, bytes: Int)?
+        /// Offer a just-scored candidate to the harvest. Every candidate is eligible — search
+        /// passes, descent passes, corridor-squeeze probes and the ceiling encode alike — because
+        /// each is a real encode of the same input with the same profile, and on a search that
+        /// aborts early the ceiling encode may be the ONLY candidate that clears the weaker floor.
+        func considerHarvest(_ bitrate: Int, _ scored: VideoQualityScore, _ url: URL) {
+            guard let secondaryFloor, secondaryOutput != nil, scored.p10 >= secondaryFloor else { return }
+            let bytes = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            guard bytes > 0 else { return }                 // an unwritten/empty temp is not a deliverable
+            if let harvest, harvest.bytes <= bytes { return }
+            harvest = (bitrate, scored, url, bytes)
+            MediaProfile.log(String(format: "harvest: %.2f MB @ p10 %.1f clears the secondary floor %.0f",
+                                    Double(bytes) / 1e6, scored.p10, secondaryFloor))
+        }
 
         // Pass accounting for `SearchProgress.fraction`: the base plan is the binary-search
         // iterations; descent/squeeze/ceiling passes grow `plannedPasses` as they engage, so the
@@ -785,6 +908,7 @@ public enum VideoQualityTarget {
                                        "cleared": "\(cleared)",
                                        "mbps": String(format: "%.2f", b / 1e6)])
             if cleared { best = (Int(b), scored, tmp) }
+            considerHarvest(Int(b), scored, tmp)
             emit(.passResult(label: label, p10: scored.p10, cleared: cleared,
                              bestBitrate: best?.bitrate, bestP10: best?.score.p10),
                  passFraction(1.0))
@@ -962,6 +1086,7 @@ public enum VideoQualityTarget {
                 // `metTarget`/delivery treat it like any other winner instead of skipping a
                 // legitimately smaller, floor-clearing deliverable.
                 if chosen.score.p10 >= targetScore { best = chosen }
+                considerHarvest(chosen.bitrate, chosen.score, chosen.url)
             }
 
             // Deliverable lands at the host's `output` ONLY on a genuine win (cleared the floor AND smaller),
@@ -988,6 +1113,69 @@ public enum VideoQualityTarget {
             } else {
                 try? FileManager.default.removeItem(at: output)
             }
+
+            // ── Secondary rendition: DELIVER the harvest, never search for it ─────────────────
+            // The file already exists (it is one of `temps`, moments from the sweep), so this is a
+            // copy, not an encode. Same atomic staging as the primary, and the same no-orphan rule:
+            // on any refusal `secondaryOutput` is left holding nothing, so a stale rendition from an
+            // earlier run of this same call site can never masquerade as this one's.
+            //
+            // The bar is STRICTLY SMALLER THAN WHAT SHIPS. When the primary delivered, that is the
+            // primary; when it declined, the original still stands, so it is the source. A rendition
+            // that is not smaller than the file it sits beside is not a bad rendition, it is not a
+            // rendition — and shipping one would put a lower quality claim on the operator's shelf
+            // for no bytes. Refusing is the honest outcome and `Result.secondary` reports nil.
+            //
+            // A failure HERE never fails the item: the primary is already delivered and correct, and
+            // the secondary is by construction a bonus. It is logged and receipted as absent.
+            var harvested: Harvest? = nil
+            var secondaryOutcome: SecondaryOutcome? = nil
+            if let secondaryOutput, let secondaryFloor {
+                secondaryOutcome = harvest == nil ? .noCandidate : .notSmaller
+                let incumbentBytes = didWin ? outBytes : inBytes
+                if let h = harvest, h.bytes < incumbentBytes {
+                    do {
+                        let staging = secondaryOutput.deletingLastPathComponent()
+                            .appendingPathComponent(".forge-\(UUID().uuidString).tmp")
+                        try FileManager.default.copyItem(at: h.url, to: staging)
+                        try? FileManager.default.removeItem(at: secondaryOutput)
+                        try FileManager.default.moveItem(at: staging, to: secondaryOutput)
+                        harvested = Harvest(
+                            floor: secondaryFloor, searchFloor: targetScore, bitrate: h.bitrate,
+                            score: h.score.p10,
+                            aggregation: Aggregation(percentile: 10, percentileScore: h.score.p10,
+                                                     mean: h.score.mean, minimum: h.score.minimum,
+                                                     framesScored: h.score.framesScored,
+                                                     frameCount: frameCount),
+                            outputBytes: h.bytes, width: outW, height: outH)
+                        secondaryOutcome = .delivered
+                        MediaProfile.log(String(format: "secondary: %.2f MB (%.0f%% of the primary's %.2f MB) · %@",
+                                                Double(h.bytes) / 1e6,
+                                                100 * Double(h.bytes) / Double(max(1, incumbentBytes)),
+                                                Double(incumbentBytes) / 1e6, harvested!.provenance))
+                    } catch {
+                        try? FileManager.default.removeItem(at: secondaryOutput)
+                        MediaProfile.log("secondary: delivery failed (\(error)) — primary is unaffected")
+                        MediaMetrics.event("vqt.secondary.failed", attrs: ["error": "\(error)"])
+                        harvested = nil
+                        // The candidate WAS there and did qualify — the copy is what failed. Say
+                        // "not smaller" and you invite a pointless dedicated search; the metrics
+                        // event above is where a delivery fault is diagnosed.
+                        secondaryOutcome = .notSmaller
+                    }
+                } else {
+                    try? FileManager.default.removeItem(at: secondaryOutput)
+                    MediaProfile.log(harvest == nil
+                        ? String(format: "secondary: no candidate the ≥%.0f search encoded cleared %.0f",
+                                 targetScore, secondaryFloor)
+                        : String(format: "secondary: the %.2f MB harvest is not smaller than the %.2f MB "
+                                 + "that ships — refused", Double(harvest!.bytes) / 1e6,
+                                 Double(incumbentBytes) / 1e6))
+                }
+                MediaMetrics.event("vqt.secondary",
+                                   attrs: ["floor": String(format: "%.0f", secondaryFloor),
+                                           "outcome": secondaryOutcome?.rawValue ?? ""])
+            }
             MediaMetrics.end(mmFinalize, extra: ["delivered": "\(didWin)"])   // temps: see the defer above
 
             let profTotal = profTranscodeMs + profScoreMs
@@ -1007,7 +1195,8 @@ public enum VideoQualityTarget {
             return Result(bitrate: chosen.bitrate, score: chosen.score.p10, aggregation: aggregation,
                           inputBytes: inBytes,
                           outputBytes: outBytes, sourceWidth: vw, sourceHeight: vh,
-                          width: outW, height: outH, metTarget: best != nil, delivered: didWin)
+                          width: outW, height: outH, metTarget: best != nil, delivered: didWin,
+                          secondary: harvested, secondaryOutcome: secondaryOutcome)
         } catch {
             // Nothing outlives the search. Cancel first — an unstarted encode never begins and
             // a started one stops at its next pump iteration — then wait for the chain to
