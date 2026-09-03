@@ -78,8 +78,11 @@ public enum ImageQualityTarget {
             let decoded = try MediaMetrics.time("iqt.decode", lane: "decode", detail: 1,
                                                 attrs: ["codec": "heic"]) { try decode(data) }
             let score: Double = try MediaMetrics.time("iqt.score", lane: "score", detail: 1) {
-                try score(reference: image, distorted: decoded,
-                          channelScalars: channelScalars, backend: backend)
+                // `Self.` is load-bearing: the `let score` above is in scope inside its own
+                // initializer, so a bare `score(...)` binds to that Double and fails to compile
+                // on the stable toolchain (Xcode 26.6). Qualified, it resolves to the static func.
+                try Self.score(reference: image, distorted: decoded,
+                               channelScalars: channelScalars, backend: backend)
             }
             bestData = data        // last evaluated; the search ends on the chosen knob
             return score
@@ -179,8 +182,9 @@ public enum ImageQualityTarget {
         let decoded = try MediaMetrics.time("iqt.decode", lane: "decode", detail: 1,
                                             attrs: ["codec": "png"]) { try decode(data) }
         let score: Double = try MediaMetrics.time("iqt.score", lane: "score", detail: 1) {
-            try score(reference: image, distorted: decoded,
-                          channelScalars: channelScalars, backend: backend)
+            // `Self.` is load-bearing — see the note in `encodeHEIC`.
+            try Self.score(reference: image, distorted: decoded,
+                           channelScalars: channelScalars, backend: backend)
         }
         return PNGResult(data: data, score: score)
     }
