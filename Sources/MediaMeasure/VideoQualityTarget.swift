@@ -894,8 +894,11 @@ public enum VideoQualityTarget {
                                                               attrs: ["label": label]) {
                     try await scoreOf(tmp, sampleOffset: max(1, stride / 2))
                 }
-                if let offsetPass {
-                    let refined = VideoQuality.aggregate(scored.scores + offsetPass.scores)
+                if let offsetPass,
+                   /* aggregate() is optional for an empty sample; both passes scored, so this
+                      cannot be nil — and if it somehow were, keeping the base pass is the safe
+                      direction, since the refinement only ever tightens the estimate. */
+                   let refined = VideoQuality.aggregate(scored.scores + offsetPass.scores) {
                     MediaProfile.log(String(format: "%@: near-gate %.1f → merged-refine %.1f (%d frames)",
                                             label, scored.p10, refined.p10, refined.framesScored))
                     scored = refined

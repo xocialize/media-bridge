@@ -4,34 +4,11 @@ import VideoToolbox
 import CoreGraphics
 import MediaMetrics
 
-/// Aggregated per-frame SSIMULACRA2 of a video pair. For "perceptually equivalent" the **worst frames**
-/// matter most (a single bad frame is visible), so `minimum`/`p10` gate the quality target, not just the
-/// mean. The per-frame cost is exactly what gated this — now tractable with the GPU SSIMULACRA2 backend.
-public struct VideoQualityScore: Sendable {
-    public let mean: Double
-    public let minimum: Double
-    public let p10: Double          // 10th-percentile frame (worst-ish)
-    public let framesScored: Int
-    /// The per-frame scores behind the aggregates, in decode order of the SAMPLED frames. Exposed
-    /// so a refinement pass can score only NEW frames and merge (`VideoQuality.aggregate`) instead
-    /// of re-scoring from scratch — the near-gate rescore was measured at 42% of a near-floor
-    /// item's wall precisely because it threw this sample away (PERFORMANCE-BASELINE §4.3).
-    public let scores: [Double]
-}
+// The aggregate type, the p10 law and the sampling stride moved to `MediaMeasureCore` — they are
+// pure arithmetic and they are promises, so a browser compiles the same source rather than a
+// transcription of it. What stays here is the part that needs a decoder.
 
-public enum VideoQuality {
-    public enum ScoreError: Error { case noVideoTrack, dimensionMismatch, noFramesScored }
-
-    /// Reduce per-frame scores to the standard aggregate. Public so callers can MERGE samples —
-    /// e.g. a base pass + an offset refinement pass — and re-aggregate without re-scoring.
-    /// Precondition: `scores` is non-empty.
-    public static func aggregate(_ scores: [Double]) -> VideoQualityScore {
-        let sorted = scores.sorted()
-        let mean = scores.reduce(0, +) / Double(scores.count)
-        let p10 = sorted[Int(Double(sorted.count - 1) * 0.1)]
-        return VideoQualityScore(mean: mean, minimum: sorted[0], p10: p10,
-                                 framesScored: scores.count, scores: scores)
-    }
+public extension VideoQuality {
 
     /// Per-frame SSIMULACRA2 of `distorted` vs `reference` (same frame order assumed), aggregated.
     /// GPU-scored when a Metal device is present. `sampleStride` scores every Nth decoded frame;
@@ -116,7 +93,10 @@ public enum VideoQuality {
         MediaProfile.log(String(format: "  videoScore: advanced %d (decode %.0f ms) · scored %d "
             + "(ssimu2 %.0f ms, %@)", decoded, decodeMs, scores.count, ssimMs, gpu != nil ? "GPU" : "CPU"))
 
-        return aggregate(scores)
+        /* The guard above proves the sample is non-empty; aggregate() returns an optional
+           because "nothing was scored" is a real outcome for callers that have not checked. */
+        guard let result = aggregate(scores) else { throw ScoreError.noFramesScored }
+        return result
     }
 
     /// Per-frame SSIMULACRA2 with **presentation-time pairing** — for scoring across ENCODERS,
@@ -180,7 +160,10 @@ public enum VideoQuality {
         if skipped > 0 {
             MediaProfile.log("  videoScorePTS: \(skipped) sample(s) had no partner within \(tolerance)s — skipped")
         }
-        return aggregate(scores)
+        /* The guard above proves the sample is non-empty; aggregate() returns an optional
+           because "nothing was scored" is a real outcome for callers that have not checked. */
+        guard let result = aggregate(scores) else { throw ScoreError.noFramesScored }
+        return result
     }
 
     /// High-quality CoreGraphics resample to `size` (no-op if `size` is nil or already matches).
