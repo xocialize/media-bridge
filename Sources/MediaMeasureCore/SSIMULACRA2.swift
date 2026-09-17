@@ -12,10 +12,16 @@
 // recursive (IIR) Gaussian; this port uses a true FIR Gaussian at the same σ=1.5 — within a small
 // fraction of a point of the reference (validated against the libjxl binary).
 //
+// **This file is Foundation-only by contract** (it builds for `wasm32-unknown-wasip1`). It takes
+// `RGBA8Image`, never `CGImage`: the CoreGraphics rasterization that used to live in `linearRGB`
+// moved to `MediaMeasure`'s `SSIMULACRA2+CoreGraphics.swift`, which produces exactly the same bytes
+// (sRGB, `noneSkipLast`, `bytesPerRow == width * 4`) and then calls in here. The arithmetic below is
+// untouched, so native scores are unchanged and the wasm build is the same estimator, not a second
+// one. `MediaMetrics` instrumentation is injected as `SpanHook` rather than imported, because the
+// harness is built on `os` / `OSSignpost` and does not exist off Apple platforms.
+//
 
-import CoreGraphics
 import Foundation
-import MediaMetrics
 
 public enum SSIMULACRA2 {
 
@@ -45,32 +51,43 @@ public enum SSIMULACRA2 {
         }
     }
 
-    public static func score(reference: CGImage, distorted: CGImage) throws -> Double {
+    /// Optional span instrumentation, injected so the pure core stays free of `MediaMetrics`
+    /// (which is `os`-backed and Apple-only). Returns the closure that ends the span. `MediaMeasure`
+    /// passes a MediaMetrics-backed hook, so the native detail-2 timeline (`ssimu2.ingest`,
+    /// `ssimu2.channel`) is exactly what it was before the split; a wasm host passes nil.
+    public typealias SpanHook =
+        (_ name: String, _ lane: String, _ detail: Int, _ attrs: [String: String]) -> () -> Void
+
+    public static func score(reference: RGBA8Image, distorted: RGBA8Image) throws -> Double {
         try score(reference: reference, distorted: distorted, channelScalars: cpuChannelScalars(blur: blur))
     }
 
     /// Score with an injected **blur** backend (GPU blur, CPU maps).
-    public static func score(reference: CGImage, distorted: CGImage,
+    public static func score(reference: RGBA8Image, distorted: RGBA8Image,
                              blur: @escaping BlurFunction) throws -> Double {
         try score(reference: reference, distorted: distorted, channelScalars: cpuChannelScalars(blur: blur))
     }
 
     /// Score with a fully-injected **per-channel** backend (e.g. all-GPU).
-    public static func score(reference: CGImage, distorted: CGImage,
-                             channelScalars: ChannelScalars) throws -> Double {
+    public static func score(reference: RGBA8Image, distorted: RGBA8Image,
+                             channelScalars: ChannelScalars,
+                             span: SpanHook? = nil) throws -> Double {
         guard reference.width == distorted.width, reference.height == distorted.height else {
             throw ScoreError.dimensionMismatch
         }
         guard reference.width >= 8, reference.height >= 8 else { throw ScoreError.tooSmall }
-        return try MediaMetrics.time("ssimu2", lane: "score", detail: 1,
-                                     attrs: ["w": "\(reference.width)", "h": "\(reference.height)"]) {
-            try multiScale(reference: reference, distorted: distorted,
-                           kernel: gaussianKernel(sigma: 1.5), channelScalars: channelScalars)
-        }
+        return try multiScale(reference: reference, distorted: distorted,
+                              kernel: gaussianKernel(sigma: 1.5), channelScalars: channelScalars,
+                              span: span)
     }
 
+    /// The default per-channel backend: the built-in FIR σ=1.5 blur + CPU maps. Public so the
+    /// Apple-side `CGImage` overloads can name the same default without reaching for the internal
+    /// `blur` function across the module boundary.
+    public static var defaultChannelScalars: ChannelScalars { cpuChannelScalars(blur: blur) }
+
     /// Default per-channel computation: σ=1.5 blur (injectable) + SSIM/edge maps + L1/L4 reductions, on CPU.
-    static func cpuChannelScalars(blur: @escaping BlurFunction) -> ChannelScalars {
+    public static func cpuChannelScalars(blur: @escaping BlurFunction) -> ChannelScalars {
         { i1, i2, w, h, kernel in
             let mu1 = blur(i1, w, h, kernel)
             let mu2 = blur(i2, w, h, kernel)
@@ -110,17 +127,19 @@ public enum SSIMULACRA2 {
     // Internal (not private): the resident Metal driver reproduces this pipeline on-device and
     // funnels its pooled scalars back through the SAME Scale/finalScore/kernel — one source of
     // truth for the trained weights and the final polynomial.
-    struct Scale {
-        var avgSsim = [Double](repeating: 0, count: 6)    // [c*2 + n]
-        var avgEdge = [Double](repeating: 0, count: 12)   // [c*4 + k]
+    public struct Scale {
+        public init() {}
+        public var avgSsim = [Double](repeating: 0, count: 6)    // [c*2 + n]
+        public var avgEdge = [Double](repeating: 0, count: 12)   // [c*4 + k]
     }
 
-    private static func multiScale(reference: CGImage, distorted: CGImage,
-                                   kernel: [Float], channelScalars: ChannelScalars) throws -> Double {
-        let hIngest = MediaMetrics.begin("ssimu2.ingest", lane: "cpu", detail: 2)
-        var p1 = try linearRGB(from: reference)
-        var p2 = try linearRGB(from: distorted)
-        MediaMetrics.end(hIngest)
+    private static func multiScale(reference: RGBA8Image, distorted: RGBA8Image,
+                                   kernel: [Float], channelScalars: ChannelScalars,
+                                   span: SpanHook?) throws -> Double {
+        let endIngest = span?("ssimu2.ingest", "cpu", 2, [:])
+        var p1 = linearRGB(from: reference)
+        var p2 = linearRGB(from: distorted)
+        endIngest?()
         var w = reference.width, h = reference.height
         var scales: [Scale] = []
 
@@ -139,10 +158,10 @@ public enum SSIMULACRA2 {
 
             var s = Scale()
             for c in 0..<3 {
-                let r = MediaMetrics.time("ssimu2.channel", lane: "score", detail: 2,
-                                          attrs: ["scale": "\(scale)", "c": "\(c)"]) {
-                    channelScalars(x1[c], x2[c], w, h, kernel)
-                }
+                let endChannel = span?("ssimu2.channel", "score", 2,
+                                       ["scale": "\(scale)", "c": "\(c)"])
+                let r = channelScalars(x1[c], x2[c], w, h, kernel)
+                endChannel?()
                 s.avgSsim[c * 2 + 0] = r.ssimL1
                 s.avgSsim[c * 2 + 1] = r.ssimL4
                 s.avgEdge[c * 4 + 0] = r.artifactL1
@@ -156,7 +175,7 @@ public enum SSIMULACRA2 {
         return finalScore(scales)
     }
 
-    static func finalScore(_ scales: [Scale]) -> Double {
+    public static func finalScore(_ scales: [Scale]) -> Double {
         var ssim = 0.0
         var i = 0
         for c in 0..<3 {
@@ -204,9 +223,9 @@ public enum SSIMULACRA2 {
 
     // MARK: - XYB
 
-    static let kB0: Float = 0.0037930732552754493
-    static let cbrtBias: Float = cbrtf(0.0037930732552754493)
-    static let C2 = 0.0009
+    public static let kB0: Float = 0.0037930732552754493
+    public static let cbrtBias: Float = cbrtf(0.0037930732552754493)
+    public static let C2 = 0.0009
 
     /// linear RGB planes → 3 positive-XYB planes (X, Y, B), each `count` long.
     private static func toPositiveXYB(_ r: [Float], _ g: [Float], _ b: [Float],
@@ -237,18 +256,11 @@ public enum SSIMULACRA2 {
 
     // MARK: - Pixel I/O
 
-    /// Rasterize a CGImage to sRGB bytes, then to linear-RGB float planes.
-    private static func linearRGB(from image: CGImage) throws -> ([Float], [Float], [Float]) {
+    /// sRGB RGBA bytes → linear-RGB float planes. Alpha is ignored (the reference metric scores
+    /// colour channels only). Public so a GPU/host ingest can share the exact same conversion.
+    public static func linearRGB(from image: RGBA8Image) -> ([Float], [Float], [Float]) {
         let w = image.width, h = image.height
-        var rgba = [UInt8](repeating: 0, count: w * h * 4)
-        let space = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
-        guard let ctx = CGContext(
-            data: &rgba, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
-            space: space, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else {
-            throw ScoreError.rasterFailed
-        }
-        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
-
+        let rgba = image.pixels
         var r = [Float](repeating: 0, count: w * h)
         var g = [Float](repeating: 0, count: w * h)
         var b = [Float](repeating: 0, count: w * h)
@@ -300,7 +312,7 @@ public enum SSIMULACRA2 {
 
     // MARK: - Gaussian blur (FIR, σ=1.5, separable, edge-clamp)
 
-    static func gaussianKernel(sigma: Float) -> [Float] {
+    public static func gaussianKernel(sigma: Float) -> [Float] {
         let radius = Int(ceilf(sigma * 4))
         var k = [Float](); k.reserveCapacity(radius * 2 + 1)
         var sum: Float = 0
@@ -311,7 +323,7 @@ public enum SSIMULACRA2 {
         return k.map { $0 / sum }
     }
 
-    private static func blur(_ src: [Float], _ w: Int, _ h: Int, _ kernel: [Float]) -> [Float] {
+    static func blur(_ src: [Float], _ w: Int, _ h: Int, _ kernel: [Float]) -> [Float] {
         let r = kernel.count / 2
         var tmp = [Float](repeating: 0, count: w * h)
         for y in 0..<h {
