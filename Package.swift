@@ -19,6 +19,12 @@ let package = Package(
         .library(name: "MediaBridge", targets: ["MediaBridge"]),
         .library(name: "ImageBridge", targets: ["ImageBridge"]),
         .library(name: "MediaMeasure", targets: ["MediaMeasure"]),
+        // The pure metric core — SSIMULACRA2 + QualityTargetSearch with no Apple frameworks.
+        // Dependency-free by contract - not even Foundation, which costs ~51 MB of ICU on WASI -
+        // so it builds small for `wasm32-unknown-wasip1` (ForgeWebOptimizer
+        // runs this exact estimator in the browser). `MediaMeasure` re-exports it, so nothing
+        // downstream has to know it moved.
+        .library(name: "MediaMeasureCore", targets: ["MediaMeasureCore"]),
         // The performance-measurement harness (span timeline + aggregation + Chrome-trace export).
         // Dependency-free; exposed so downstream layers (ForgeOptimizerKit, bench tools) record onto
         // the SAME process timeline as the bridge's own decode/encode/score spans.
@@ -45,8 +51,12 @@ let package = Package(
                                .product(name: "MatroskaDemux", package: "matroska-swift")],
                 swiftSettings: [.swiftLanguageMode(.v5)]),
         .target(name: "ImageBridge", swiftSettings: [.swiftLanguageMode(.v5)]),
-        .target(name: "MediaMeasure", dependencies: ["MediaMetrics"],
+        .target(name: "MediaMeasure", dependencies: ["MediaMetrics", "MediaMeasureCore"],
                 swiftSettings: [.swiftLanguageMode(.v5)]),
+        // Zero dependencies — not even MediaMetrics, which is `os`/OSSignpost-backed and therefore
+        // Apple-only; the core takes an injected `SpanHook` instead. Keep it that way: this target's
+        // whole value is that it compiles for WebAssembly.
+        .target(name: "MediaMeasureCore", swiftSettings: [.swiftLanguageMode(.v5)]),
         // Zero dependencies — the leaf every layer may import (see MediaMetrics.swift header).
         .target(name: "MediaMetrics", swiftSettings: [.swiftLanguageMode(.v5)]),
         .testTarget(name: "MediaBridgeTests",

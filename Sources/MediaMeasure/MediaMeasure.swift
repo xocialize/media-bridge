@@ -12,6 +12,11 @@
 import CoreGraphics
 import Foundation
 
+// The pure estimator + the target search live in `MediaMeasureCore` (Foundation-only, builds for
+// WebAssembly). Re-exported so every existing `import MediaMeasure` call site keeps seeing
+// `SSIMULACRA2` and `QualityTargetSearch` unchanged — the split is an internal one.
+@_exported import MediaMeasureCore
+
 public enum MediaMeasure {
     /// Image-pair SSIMULACRA2 score (100 = identical). See `SSIMULACRA2`.
     ///
