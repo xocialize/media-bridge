@@ -587,19 +587,34 @@ public final class SSIMULACRA2Metal: @unchecked Sendable {
     // for m~1, which fails to cancel and leaves d ~ 1e-4 on every LOW-VARIANCE
     // pixel. Measured symptom: an image scored against ITSELF came back 99.13-99.43
     // instead of 100 on all ten corpus 1080 stills, worst on flat graphic content,
-    // which is made of low-variance pixels. Writing the fmas out removes the
-    // compiler's freedom to contract one side and not the other.
+    // which is made of low-variance pixels. Writing the fmas out denies the
+    // compiler the specific asymmetry it was taking.
+    //
+    // It does NOT make the kernel optimizer-proof, and the comment used to claim it
+    // did. The library is compiled with default options, i.e. fast-math ON, and the
+    // WGSL twin (which reaches Metal through Dawn, so the same fast-math) still
+    // pooled a nonzero d from these very expressions: with a diagnostic that STORES
+    // the live d it is exactly 0 at every scale and channel, and without that store,
+    // same source and same inputs, it is not. A value that changes when you write it
+    // down is the optimizer, not IEEE. So what is verified here is that Metal's
+    // optimizer does not take that latitude on this toolchain — which is a
+    // measurement, not a guarantee, and `testIdenticalPairScoresExactly100` is the
+    // standing guard on it rather than a formality. If a future toolchain reopens
+    // it, the lever is `MTLCompileOptions` math mode on `makeLibrary` (measure the
+    // cost: this kernel is the hot path), not further rearrangement of the algebra —
+    // seven rearrangements were already tried and killed on the WGSL side.
     //
     // Then `1 - (numM*numS)/denomS` is evaluated as `(denomS - numM*numS)/denomS`:
     // fma keeps the product exact so the subtraction is the only rounding, and when
     // the two are close that subtraction is itself exact (Sterbenz). Likewise
     // `(1 + |i2-m2|)/(1 + |i1-m1|) - 1` is `(|i2-m2| - |i1-m1|)/(1 + |i1-m1|)`,
-    // which needs no fma — it is exact as written, and it does not depend on
-    // fast-math declining to turn the division into a reciprocal-multiply.
+    // which needs no fma — it is exact as written, and it does not ask fast-math to
+    // decline turning the division into a reciprocal-multiply.
     //
     // The WGSL port in ForgeWebOptimizer (`src/lib/ssimulacra2Gpu.js`, `map_reduce`)
     // is where this was diagnosed and first fixed; the two kernels are deliberately
-    // the same shape. NOT fixed here: the residual graphic-content bias of up to
+    // the same shape, and its module header carries the store-vs-no-store finding
+    // plus the seven dead candidates. NOT fixed here: the residual graphic-content bias of up to
     // 0.22 vs the CPU path (AB-R-0234) — a different mechanism (f32 variance
     // cancellation in E[x^2]-E[x]^2, rectified by the max(d,0) clamp) whose remedy
     // changes the CPU path too.
