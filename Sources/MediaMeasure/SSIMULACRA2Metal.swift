@@ -571,6 +571,53 @@ public final class SSIMULACRA2Metal: @unchecked Sendable {
         p11[gid] = a * a; p22[gid] = b * b; p12[gid] = a * b;
     }
     // Per-pixel SSIM + edge-diff, reduced to 6 partial sums per threadgroup (tg=256).
+    //
+    // CANCELLATION — why every multiply-add below is an explicit `fma` and every
+    // "ratio minus 1" is written as a difference over a denominator. Both forms are
+    // algebraic rearrangements of the reference expressions, not approximations of
+    // them, and both are load-bearing (AB-T-0136).
+    //
+    // The SSIM numerator and denominator are the SAME quantity when the two images
+    // are identical: with i1 == i2 bitwise, s11 == s12 == s22 and m1 == m2, so
+    // 2*(s12 - m1*m2) + C2 and (s11 - m1*m1) + (s22 - m2*m2) + C2 must agree and d
+    // must be 0. That only holds if all three subtractions round the same way —
+    // and Metal's default fast-math lets the compiler contract `s12 - m1*m2` into
+    // an fma (product left unrounded) while leaving `s11 - m1*m1` uncontracted
+    // (product rounded). The two then differ by the rounding of one product, ~6e-8
+    // for m~1, which fails to cancel and leaves d ~ 1e-4 on every LOW-VARIANCE
+    // pixel. Measured symptom: an image scored against ITSELF came back 99.13-99.43
+    // instead of 100 on all ten corpus 1080 stills, worst on flat graphic content,
+    // which is made of low-variance pixels. Writing the fmas out denies the
+    // compiler the specific asymmetry it was taking.
+    //
+    // It does NOT make the kernel optimizer-proof, and the comment used to claim it
+    // did. The library is compiled with default options, i.e. fast-math ON, and the
+    // WGSL twin (which reaches Metal through Dawn, so the same fast-math) still
+    // pooled a nonzero d from these very expressions: with a diagnostic that STORES
+    // the live d it is exactly 0 at every scale and channel, and without that store,
+    // same source and same inputs, it is not. A value that changes when you write it
+    // down is the optimizer, not IEEE. So what is verified here is that Metal's
+    // optimizer does not take that latitude on this toolchain — which is a
+    // measurement, not a guarantee, and `testIdenticalPairScoresExactly100` is the
+    // standing guard on it rather than a formality. If a future toolchain reopens
+    // it, the lever is `MTLCompileOptions` math mode on `makeLibrary` (measure the
+    // cost: this kernel is the hot path), not further rearrangement of the algebra —
+    // seven rearrangements were already tried and killed on the WGSL side.
+    //
+    // Then `1 - (numM*numS)/denomS` is evaluated as `(denomS - numM*numS)/denomS`:
+    // fma keeps the product exact so the subtraction is the only rounding, and when
+    // the two are close that subtraction is itself exact (Sterbenz). Likewise
+    // `(1 + |i2-m2|)/(1 + |i1-m1|) - 1` is `(|i2-m2| - |i1-m1|)/(1 + |i1-m1|)`,
+    // which needs no fma — it is exact as written, and it does not ask fast-math to
+    // decline turning the division into a reciprocal-multiply.
+    //
+    // The WGSL port in ForgeWebOptimizer (`src/lib/ssimulacra2Gpu.js`, `map_reduce`)
+    // is where this was diagnosed and first fixed; the two kernels are deliberately
+    // the same shape, and its module header carries the store-vs-no-store finding
+    // plus the seven dead candidates. NOT fixed here: the residual graphic-content bias of up to
+    // 0.22 vs the CPU path (AB-R-0234) — a different mechanism (f32 variance
+    // cancellation in E[x^2]-E[x]^2, rectified by the max(d,0) clamp) whose remedy
+    // changes the CPU path too.
     kernel void ssimu2_map_reduce(device const float* i1 [[buffer(0)]], device const float* i2 [[buffer(1)]],
                                   device const float* mu1 [[buffer(2)]], device const float* mu2 [[buffer(3)]],
                                   device const float* s11 [[buffer(4)]], device const float* s22 [[buffer(5)]],
@@ -583,13 +630,17 @@ public final class SSIMULACRA2Metal: @unchecked Sendable {
         if (int(gid) < N) {
             float m1 = mu1[gid], m2 = mu2[gid];
             float md = m1 - m2;
-            float numM = 1.0 - md * md;
-            float numS = 2.0 * (s12[gid] - m1 * m2) + C2;
-            float denomS = (s11[gid] - m1 * m1) + (s22[gid] - m2 * m2) + C2;
-            float d = fmax(1.0 - (numM * numS) / denomS, 0.0);
+            float v12 = fma(-m1, m2, s12[gid]);
+            float v11 = fma(-m1, m1, s11[gid]);
+            float v22 = fma(-m2, m2, s22[gid]);
+            float numM = fma(-md, md, 1.0f);
+            float numS = fma(2.0f, v12, C2);
+            float denomS = (v11 + v22) + C2;
+            float d = fmax(fma(-numM, numS, denomS) / denomS, 0.0f);
             v0 = d; v1 = d * d * d * d;
-            float d1 = (1.0 + fabs(i2[gid] - m2)) / (1.0 + fabs(i1[gid] - m1)) - 1.0;
-            float art = fmax(d1, 0.0), det = fmax(-d1, 0.0);
+            float ea = fabs(i2[gid] - m2), eb = fabs(i1[gid] - m1);
+            float d1 = (ea - eb) / (1.0f + eb);
+            float art = fmax(d1, 0.0f), det = fmax(-d1, 0.0f);
             v2 = art; v3 = art * art * art * art;
             v4 = det; v5 = det * det * det * det;
         }
