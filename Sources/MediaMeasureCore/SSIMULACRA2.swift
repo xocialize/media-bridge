@@ -89,8 +89,27 @@ public enum SSIMULACRA2 {
             throw ScoreError.dimensionMismatch
         }
         guard reference.width >= 8, reference.height >= 8 else { throw ScoreError.tooSmall }
+        return finalScore(try multiScale(reference: reference, distorted: distorted,
+                                         kernel: gaussianKernel(sigma: 1.5),
+                                         channelScalars: channelScalars, span: span))
+    }
+
+    /// The pooled per-scale scalars, before the trained weights turn them into a score.
+    ///
+    /// Exposed because it is the only way to compare this estimator against another implementation
+    /// **term by term**. A score is one number: when a GPU port disagrees by 0.2 there is nothing in
+    /// it to say which octave, channel or map drifted. These 18 values per scale say exactly that,
+    /// and finding the 2026-09-17 graphic-content deviation needed them.
+    public static func scales(reference: RGBA8Image, distorted: RGBA8Image,
+                              channelScalars: ChannelScalars? = nil,
+                              span: SpanHook? = nil) throws -> [Scale] {
+        guard reference.width == distorted.width, reference.height == distorted.height else {
+            throw ScoreError.dimensionMismatch
+        }
+        guard reference.width >= 8, reference.height >= 8 else { throw ScoreError.tooSmall }
         return try multiScale(reference: reference, distorted: distorted,
-                              kernel: gaussianKernel(sigma: 1.5), channelScalars: channelScalars,
+                              kernel: gaussianKernel(sigma: 1.5),
+                              channelScalars: channelScalars ?? defaultChannelScalars,
                               span: span)
     }
 
@@ -148,7 +167,7 @@ public enum SSIMULACRA2 {
 
     private static func multiScale(reference: RGBA8Image, distorted: RGBA8Image,
                                    kernel: [Float], channelScalars: ChannelScalars,
-                                   span: SpanHook?) throws -> Double {
+                                   span: SpanHook?) throws -> [Scale] {
         let endIngest = span?("ssimu2.ingest", "cpu", 2, [:])
         var p1 = linearRGB(from: reference)
         var p2 = linearRGB(from: distorted)
@@ -185,7 +204,7 @@ public enum SSIMULACRA2 {
             scales.append(s)
         }
 
-        return finalScore(scales)
+        return scales
     }
 
     public static func finalScore(_ scales: [Scale]) -> Double {
@@ -283,6 +302,18 @@ public enum SSIMULACRA2 {
             b[p] = srgbToLinear(Float(rgba[p * 4 + 2]) / 255.0)
         }
         return (r, g, b)
+    }
+
+    /// The 256 possible results of the sRGB EOTF on an 8-bit channel.
+    ///
+    /// The ingest reads `UInt8`, so this function has a finite domain and the whole of it fits in a
+    /// table. Exposed because a GPU implementation must not merely *approximate* this step: WGSL's
+    /// `pow` and C's `powf` disagree in the last few bits, and those bits survive into the variance
+    /// term, which on flat content is a difference of two nearly equal numbers with almost no
+    /// significant bits to spare. Handing the GPU these exact values makes the ingest bit-identical
+    /// instead of close.
+    public static func srgbLUT() -> [Float] {
+        (0..<256).map { srgbToLinear(Float($0) / 255.0) }
     }
 
     @inline(__always)
