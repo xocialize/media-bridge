@@ -112,6 +112,61 @@ final class SSIMULACRA2MetalTests: XCTestCase {
                           "resident=\(second) swift=\(swiftScore) Δ=\(abs(second - swiftScore))")
     }
 
+    /// SSIMULACRA2 is DEFINED so an identical pair scores exactly 100 — every per-pixel term is
+    /// a difference of two quantities that are bitwise equal when the images are. The GPU path
+    /// did not: it returned 99.13-99.43 on all ten corpus 1080 masters while the CPU path
+    /// returned exactly 100 (AB-T-0136). Metal's default fast-math had contracted the covariance
+    /// subtraction into an fma and left the variance subtractions uncontracted, so numerator and
+    /// denominator disagreed by the rounding of one product and refused to cancel. The kernel now
+    /// writes every multiply-add out explicitly.
+    ///
+    /// Nothing in this suite caught it: `testResidentScoreMatchesSwiftScore` compares a DISTORTED
+    /// pair within ±0.05 and stayed green throughout, because the defect concentrates at the top
+    /// of the scale. This is the missing test, and it asserts EXACT equality deliberately — with
+    /// i1 == i2 the whole pipeline is bitwise symmetric (same ingest, same XYB, same blur taps,
+    /// so mu1 == mu2 and s11 == s12 == s22), which makes every map term identically zero rather
+    /// than merely small. A tolerance here would re-admit the bug it exists to catch.
+    ///
+    /// Flat content is the worst case (it is all low-variance pixels, which is where the error
+    /// lived, and is exactly what ClassAdaptiveFloor raises the floor on), so both a flat and a
+    /// textured fixture run, through BOTH GPU entry points.
+    func testIdenticalPairScoresExactly100() throws {
+        guard let metal = SSIMULACRA2Metal() else { throw XCTSkip("no Metal device") }
+
+        for (label, image) in [("flat", flatImage(160, 120, level: 128)),
+                               ("textured", noiseImage(160, 120, seed: 0x5E1F_5E1F)),
+                               ("gradient", gradientImage(160, 120, shift: 0))] {
+            // The CPU twin is the definition being matched, not just a second opinion.
+            let cpu = try SSIMULACRA2.score(reference: image, distorted: image)
+            XCTAssertEqual(cpu, 100.0, "\(label): CPU identical pair must be 100, got \(cpu)")
+
+            let gpuScalars = try SSIMULACRA2.score(reference: image, distorted: image,
+                                                   channelScalars: metal.channelScalarsFunction)
+            XCTAssertEqual(gpuScalars, 100.0,
+                           "\(label): channelScalars identical pair must be 100, got \(gpuScalars)")
+
+            if metal.residentAvailable {
+                let resident = try metal.scoreResident(reference: image, distorted: image)
+                XCTAssertEqual(resident, 100.0,
+                               "\(label): resident identical pair must be 100, got \(resident)")
+            }
+        }
+    }
+
+    /// Uniform fill — zero variance everywhere, so `denomS` is C2 alone and the SSIM term has no
+    /// signal to hide a cancellation failure behind. Opaque, like every fixture here but
+    /// `translucentImage`.
+    private func flatImage(_ w: Int, _ h: Int, level: UInt8) -> CGImage {
+        let cs = CGColorSpaceCreateDeviceRGB()
+        let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                            space: cs, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        let buf = ctx.data!.bindMemory(to: UInt8.self, capacity: w * h * 4)
+        for i in 0..<(w * h) {
+            buf[i * 4] = level; buf[i * 4 + 1] = level; buf[i * 4 + 2] = level; buf[i * 4 + 3] = 255
+        }
+        return ctx.makeImage()!
+    }
+
     /// White premultiplied by a left-to-right alpha ramp (B=G=R=A), the `AlphaVideoWriterTests:8`
     /// idiom — the only genuinely non-opaque fixture shape in this suite. `tint` darkens the
     /// colour slightly so a ref/dist pair scores below 100; premultiplication requires RGB ≤ A.
