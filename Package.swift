@@ -20,7 +20,8 @@ let package = Package(
         .library(name: "ImageBridge", targets: ["ImageBridge"]),
         .library(name: "MediaMeasure", targets: ["MediaMeasure"]),
         // The pure metric core — SSIMULACRA2 + QualityTargetSearch with no Apple frameworks.
-        // Foundation-only by contract so it builds for `wasm32-unknown-wasip1` (ForgeWebOptimizer
+        // Dependency-free by contract - not even Foundation, which costs ~51 MB of ICU on WASI -
+        // so it builds small for `wasm32-unknown-wasip1` (ForgeWebOptimizer
         // runs this exact estimator in the browser). `MediaMeasure` re-exports it, so nothing
         // downstream has to know it moved.
         .library(name: "MediaMeasureCore", targets: ["MediaMeasureCore"]),

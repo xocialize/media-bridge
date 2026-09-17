@@ -12,7 +12,7 @@
 // recursive (IIR) Gaussian; this port uses a true FIR Gaussian at the same σ=1.5 — within a small
 // fraction of a point of the reference (validated against the libjxl binary).
 //
-// **This file is Foundation-only by contract** (it builds for `wasm32-unknown-wasip1`). It takes
+// **This file imports nothing but the platform libc** (it builds for `wasm32-unknown-wasip1`). It takes
 // `RGBA8Image`, never `CGImage`: the CoreGraphics rasterization that used to live in `linearRGB`
 // moved to `MediaMeasure`'s `SSIMULACRA2+CoreGraphics.swift`, which produces exactly the same bytes
 // (sRGB, `noneSkipLast`, `bytesPerRow == width * 4`) and then calls in here. The arithmetic below is
