@@ -21,7 +21,20 @@
 // harness is built on `os` / `OSSignpost` and does not exist off Apple platforms.
 //
 
-import Foundation
+// Only the C math functions are needed here (cbrtf/expf/powf/ceilf) — this file uses no Foundation
+// type at all. Importing the platform libc directly instead of Foundation keeps the WebAssembly
+// module small: Foundation on WASI drags in ICU, which is tens of megabytes the estimator has no
+// use for. On Apple platforms `Darwin` is what Foundation would have re-exported anyway, so the
+// native build is unchanged.
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(WASILibc)
+import WASILibc
+#elseif canImport(Musl)
+import Musl
+#endif
 
 public enum SSIMULACRA2 {
 

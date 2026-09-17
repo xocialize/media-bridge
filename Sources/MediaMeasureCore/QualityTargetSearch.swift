@@ -7,7 +7,8 @@
 // (SSIMULACRA2). Assumes score is (roughly) monotonic increasing in quality.
 //
 
-import Foundation
+// No imports needed: this is pure arithmetic over Double. Deliberately kept that way so the search
+// compiles anywhere the estimator does.
 
 public enum QualityTargetSearch {
 
