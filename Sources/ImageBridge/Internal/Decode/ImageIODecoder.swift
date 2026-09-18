@@ -140,6 +140,7 @@ final class ImageIODecoderImpl: StillDecoding, @unchecked Sendable {
             case UTType.tiff.identifier: return .tiff
             case UTType.heic.identifier, "public.heif": return .heic
             case "public.avif": return .avif
+            case UTType.webP.identifier: return .webp
             case UTType.bmp.identifier: return .bmp
             case UTType.gif.identifier: return .gif
             default:
@@ -154,6 +155,7 @@ final class ImageIODecoderImpl: StillDecoding, @unchecked Sendable {
         case "tif", "tiff": return .tiff
         case "heic", "heif": return .heic
         case "avif": return .avif
+        case "webp": return .webp
         case "bmp": return .bmp
         case "gif": return .gif
         // Belt-and-braces: a body whose UTI this OS does not know still routes to the RAW decoder,

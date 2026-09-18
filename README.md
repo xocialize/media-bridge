@@ -187,6 +187,29 @@ The seam is the `ExternalVideoDecoder` protocol (in `MediaImport`) +
 `MediaBridge.register(externalDecoder:)` / `unregisterAllExternalDecoders()`. See
 [`DEFERRED-CODEC-PLAN.md`](DEFERRED-CODEC-PLAN.md) §9.
 
+## External still-encoder seam (WebP without contaminating this package)
+
+The stills twin of the decoder seam. Apple decodes WebP natively (ImageIO, macOS 11+) but ships
+**no encoder** — on macOS 27.2 `CGImageDestinationCopyTypeIdentifiers()` lists 22 writable types and
+WebP is not among them — so encoding needs libwebp, which lives in a **separate** package exactly as
+libvpx does (`webp-swift`: libwebp vendored as *source*, no binary, BSD-3 + PATENTS). Register once;
+anything that runs the floor search can then race WebP beside the native formats.
+
+```swift
+import MediaBridge
+import WebPSwift   // github.com/xocialize/webp-swift — libwebp from source, ~656 KB
+
+WebPStillEncoder.register()                               // once at startup
+let webp = MediaBridge.externalStillEncoder(for: .webp)    // nil when nothing is registered
+```
+
+The seam is the `ExternalStillEncoder` protocol (in `MediaImport`) +
+`MediaBridge.register(externalStillEncoder:)` / `canEncodeStill(_:)` /
+`unregisterAllExternalStillEncoders()`, and the generic floor search
+`ImageQualityTarget.encode(_:targetScore:codec:encoder:)` / `encodeLossless(_:codec:encoder:)` (in
+`MediaMeasure`), which score the **decoded** bytes exactly as the HEIC/JPEG/PNG paths do — JPEG itself
+now runs through the generic search. With nothing registered, nothing changes.
+
 ## Observability
 
 Set `MEDIABRIDGE_VT_LOG=/path/to/log` and every hardware encode writes one fsync'd breadcrumb line

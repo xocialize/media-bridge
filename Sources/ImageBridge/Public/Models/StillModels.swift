@@ -8,6 +8,9 @@ import Foundation
 /// Input still container formats ImageBridge can decode (ImageIO; `pdf` via CoreGraphics).
 public enum StillFormat: String, Sendable, CaseIterable {
     case png, jpeg, tiff, heic, avif, bmp, gif
+    /// WebP — decoded natively by ImageIO since macOS 11. There is no native *encoder*; writing it
+    /// goes through the external still-encoder seam (`ExternalStillEncoder`, `webp-swift`).
+    case webp
     case pdf            // rasterized per page (multi-page → sequence)
     /// Camera RAW (CR2/CR3/NEF/ARW/RAF/ORF/RW2/DNG/…), demosaiced from sensor data.
     ///

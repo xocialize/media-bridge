@@ -29,6 +29,9 @@ public enum ImageQualityTarget {
         public let score: Double        // measured SSIMULACRA2 of the decode round-trip vs the input
     }
 
+    /// The lossless result shape is the same whichever encoder produced it.
+    public typealias LosslessResult = PNGResult
+
     public enum EncodeError: Error { case encodeFailed, decodeFailed }
 
     /// Which SSIMULACRA2 implementation scores the search — stated, rather than inferred from
@@ -110,6 +113,97 @@ public enum ImageQualityTarget {
         }
     }
 
+    // MARK: - Any encoder (the external still-encoder seam's search)
+
+    /// The floor search over ANY lossy still encoder — `encodeHEIC` / `encodeJPEG` with the encode
+    /// step injected. This is what an `ExternalStillEncoder` (the `MediaImport` seam; WebP via
+    /// `webp-swift`) plugs into: hand over `encoder(image, knob)` and get back the same search law,
+    /// the same decode-and-score-the-real-bytes rule and the same `MediaMetrics` spans the built-in
+    /// formats get. `codec` names the lane in those spans.
+    ///
+    /// `knob` runs over [`lo`, `hi`] — the encoder's quality scale normalised to [0, 1] (libwebp's
+    /// 0…100 becomes `knob × 100`), and it MUST stay lossy over the whole range: a top candidate that
+    /// silently switched into a lossless mode would have the search comparing two encoders. Decode is
+    /// ImageIO, so the bytes handed back must be something the platform reads — which is the point.
+    ///
+    /// Scoring backend: see `encodeHEIC`.
+    public static func encode(_ image: CGImage, targetScore: Double,
+                              iterations: Int = 8, lo: Double = 0.1, hi: Double = 1.0,
+                              codec: String,
+                              channelScalars: SSIMULACRA2.ChannelScalars? = nil,
+                              backend: ScoringBackend? = nil,
+                              encoder: (CGImage, Double) throws -> Data) throws -> Result {
+        let mm = MediaMetrics.begin("iqt.search", lane: "orchestrate",
+                                    attrs: ["codec": codec, "target": "\(targetScore)",
+                                            "w": "\(image.width)", "h": "\(image.height)"])
+        defer { MediaMetrics.end(mm) }
+        let search = try QualityTargetSearch.search(target: targetScore, lo: lo, hi: hi,
+                                                    iterations: iterations) { q in
+            let data = try MediaMetrics.time("iqt.encode", lane: "encode", detail: 1,
+                                             attrs: ["codec": codec, "q": String(format: "%.3f", q)]) {
+                try encoder(image, q)
+            }
+            let decoded = try MediaMetrics.time("iqt.decode", lane: "decode", detail: 1,
+                                                attrs: ["codec": codec]) { try decode(data) }
+            return try MediaMetrics.time("iqt.score", lane: "score", detail: 1) {
+                try Self.score(reference: image, distorted: decoded,
+                               channelScalars: channelScalars, backend: backend)
+            }
+        }
+        // Re-encode at the chosen knob so `data` matches the returned `quality` exactly.
+        let data = try MediaMetrics.time("iqt.finalEncode", lane: "encode", detail: 1,
+                                         attrs: ["codec": codec]) {
+            try encoder(image, search.quality)
+        }
+        return Result(data: data, quality: search.quality, score: search.score,
+                      metTarget: search.metTarget)
+    }
+
+    /// Async entry point — off the cooperative pool at `.utility` QoS (EMBED-004), like `encodeHEIC`.
+    public static func encode(_ image: CGImage, targetScore: Double,
+                              iterations: Int = 8, lo: Double = 0.1, hi: Double = 1.0,
+                              codec: String,
+                              channelScalars: SSIMULACRA2.ChannelScalars? = nil,
+                              backend: ScoringBackend? = nil,
+                              encoder: @escaping @Sendable (CGImage, Double) throws -> Data) async throws -> Result {
+        try await ScoringExecutor.run {
+            try encode(image, targetScore: targetScore, iterations: iterations, lo: lo, hi: hi,
+                       codec: codec, channelScalars: channelScalars, backend: backend,
+                       encoder: encoder)
+        }
+    }
+
+    /// The lossless counterpart for an external encoder (WebP's VP8L, say): one encode, and the score
+    /// **measured on the decode round-trip, never asserted** from "lossless" — `encodePNG`'s rule.
+    public static func encodeLossless(_ image: CGImage, codec: String,
+                                      channelScalars: SSIMULACRA2.ChannelScalars? = nil,
+                                      backend: ScoringBackend? = nil,
+                                      encoder: (CGImage) throws -> Data) throws -> LosslessResult {
+        let mm = MediaMetrics.begin("iqt.lossless", lane: "orchestrate",
+                                    attrs: ["codec": codec, "w": "\(image.width)", "h": "\(image.height)"])
+        defer { MediaMetrics.end(mm) }
+        let data = try MediaMetrics.time("iqt.encode", lane: "encode", detail: 1,
+                                         attrs: ["codec": codec]) { try encoder(image) }
+        let decoded = try MediaMetrics.time("iqt.decode", lane: "decode", detail: 1,
+                                            attrs: ["codec": codec]) { try decode(data) }
+        let score: Double = try MediaMetrics.time("iqt.score", lane: "score", detail: 1) {
+            try Self.score(reference: image, distorted: decoded,
+                           channelScalars: channelScalars, backend: backend)
+        }
+        return LosslessResult(data: data, score: score)
+    }
+
+    /// Async entry point for `encodeLossless(_:codec:encoder:)`.
+    public static func encodeLossless(_ image: CGImage, codec: String,
+                                      channelScalars: SSIMULACRA2.ChannelScalars? = nil,
+                                      backend: ScoringBackend? = nil,
+                                      encoder: @escaping @Sendable (CGImage) throws -> Data) async throws -> LosslessResult {
+        try await ScoringExecutor.run {
+            try encodeLossless(image, codec: codec, channelScalars: channelScalars,
+                               backend: backend, encoder: encoder)
+        }
+    }
+
     // MARK: - JPEG (lossy web still — the photo rung)
 
     /// Encode `image` as JPEG at the lowest quality whose decoded result scores ≥ `targetScore` —
@@ -125,29 +219,12 @@ public enum ImageQualityTarget {
                                   iterations: Int = 8,
                                   channelScalars: SSIMULACRA2.ChannelScalars? = nil,
                                   backend: ScoringBackend? = nil) throws -> Result {
-        let mm = MediaMetrics.begin("iqt.search", lane: "orchestrate",
-                                    attrs: ["codec": "jpeg", "target": "\(targetScore)",
-                                            "w": "\(image.width)", "h": "\(image.height)"])
-        defer { MediaMetrics.end(mm) }
-        let search = try QualityTargetSearch.search(target: targetScore, lo: 0.1, hi: 1.0,
-                                                    iterations: iterations) { q in
-            let data = try MediaMetrics.time("iqt.encode", lane: "encode", detail: 1,
-                                             attrs: ["codec": "jpeg", "q": String(format: "%.3f", q)]) {
-                try encode(image, quality: q, type: .jpeg)
-            }
-            let decoded = try MediaMetrics.time("iqt.decode", lane: "decode", detail: 1,
-                                                attrs: ["codec": "jpeg"]) { try decode(data) }
-            return try MediaMetrics.time("iqt.score", lane: "score", detail: 1) {
-                try score(reference: image, distorted: decoded,
-                          channelScalars: channelScalars, backend: backend)
-            }
+        // The generic search with ImageIO's JPEG as the encode step — byte-identical to the
+        // hand-written search it replaced: same knob range, same spans, same final re-encode.
+        try encode(image, targetScore: targetScore, iterations: iterations, lo: 0.1, hi: 1.0,
+                   codec: "jpeg", channelScalars: channelScalars, backend: backend) { img, q in
+            try encode(img, quality: q, type: .jpeg)
         }
-        let data = try MediaMetrics.time("iqt.finalEncode", lane: "encode", detail: 1,
-                                         attrs: ["codec": "jpeg"]) {
-            try encode(image, quality: search.quality, type: .jpeg)
-        }
-        return Result(data: data, quality: search.quality, score: search.score,
-                      metTarget: search.metTarget)
     }
 
     /// Async entry point — off the cooperative pool at `.utility` QoS (EMBED-004), like `encodeHEIC`.
