@@ -67,6 +67,16 @@ public enum ImageQualityTarget {
                                   iterations: Int = 8,
                                   channelScalars: SSIMULACRA2.ChannelScalars? = nil,
                                   backend: ScoringBackend? = nil) throws -> Result {
+        try encodeHEICCore(image, targetScore: targetScore, iterations: iterations,
+                           channelScalars: channelScalars, backend: backend, cancel: nil)
+    }
+
+    /// The HEIC search with a cancellation point before every pass. `cancel` is the one-way flag
+    /// the async entry point sets from `withTaskCancellationHandler` — the search runs on the
+    /// scoring queue, where `Task.isCancelled` is not visible (the video path's rule, `CancelFlag`).
+    static func encodeHEICCore(_ image: CGImage, targetScore: Double, iterations: Int,
+                               channelScalars: SSIMULACRA2.ChannelScalars?,
+                               backend: ScoringBackend?, cancel: CancelFlag?) throws -> Result {
         let mm = MediaMetrics.begin("iqt.search", lane: "orchestrate",
                                     attrs: ["codec": "heic", "target": "\(targetScore)",
                                             "w": "\(image.width)", "h": "\(image.height)"])
@@ -74,6 +84,7 @@ public enum ImageQualityTarget {
         var bestData: Data?
         let search = try QualityTargetSearch.search(target: targetScore, lo: 0.1, hi: 1.0,
                                                     iterations: iterations) { q in
+            try checkCancelled(cancel)
             let data = try MediaMetrics.time("iqt.encode", lane: "encode", detail: 1,
                                              attrs: ["codec": "heic", "q": String(format: "%.3f", q)]) {
                 try encode(image, quality: q)
@@ -91,6 +102,7 @@ public enum ImageQualityTarget {
             return score
         }
         // Re-encode at the chosen quality so `data` matches the returned `quality` exactly.
+        try checkCancelled(cancel)
         let data = try MediaMetrics.time("iqt.finalEncode", lane: "encode", detail: 1,
                                          attrs: ["codec": "heic"]) {
             try encode(image, quality: search.quality)
@@ -107,10 +119,13 @@ public enum ImageQualityTarget {
                                   iterations: Int = 8,
                                   channelScalars: SSIMULACRA2.ChannelScalars? = nil,
                                   backend: ScoringBackend? = nil) async throws -> Result {
-        try await ScoringExecutor.run {
-            try encodeHEIC(image, targetScore: targetScore, iterations: iterations,
-                           channelScalars: channelScalars, backend: backend)
-        }
+        let cancel = CancelFlag()
+        return try await withTaskCancellationHandler {
+            try await ScoringExecutor.run {
+                try encodeHEICCore(image, targetScore: targetScore, iterations: iterations,
+                                   channelScalars: channelScalars, backend: backend, cancel: cancel)
+            }
+        } onCancel: { cancel.set() }
     }
 
     // MARK: - Any encoder (the external still-encoder seam's search)
@@ -133,12 +148,26 @@ public enum ImageQualityTarget {
                               channelScalars: SSIMULACRA2.ChannelScalars? = nil,
                               backend: ScoringBackend? = nil,
                               encoder: (CGImage, Double) throws -> Data) throws -> Result {
+        try encodeCore(image, targetScore: targetScore, iterations: iterations, lo: lo, hi: hi,
+                       codec: codec, channelScalars: channelScalars, backend: backend,
+                       cancel: nil, encoder: encoder)
+    }
+
+    /// The generic search with a cancellation point before every pass (see `encodeHEICCore`).
+    /// A cancelled search throws `CancellationError` at its next pass, never mid-encode: "stop
+    /// now" on a still costs at most one pass, not one item.
+    static func encodeCore(_ image: CGImage, targetScore: Double,
+                           iterations: Int, lo: Double, hi: Double, codec: String,
+                           channelScalars: SSIMULACRA2.ChannelScalars?,
+                           backend: ScoringBackend?, cancel: CancelFlag?,
+                           encoder: (CGImage, Double) throws -> Data) throws -> Result {
         let mm = MediaMetrics.begin("iqt.search", lane: "orchestrate",
                                     attrs: ["codec": codec, "target": "\(targetScore)",
                                             "w": "\(image.width)", "h": "\(image.height)"])
         defer { MediaMetrics.end(mm) }
         let search = try QualityTargetSearch.search(target: targetScore, lo: lo, hi: hi,
                                                     iterations: iterations) { q in
+            try checkCancelled(cancel)
             let data = try MediaMetrics.time("iqt.encode", lane: "encode", detail: 1,
                                              attrs: ["codec": codec, "q": String(format: "%.3f", q)]) {
                 try encoder(image, q)
@@ -151,6 +180,7 @@ public enum ImageQualityTarget {
             }
         }
         // Re-encode at the chosen knob so `data` matches the returned `quality` exactly.
+        try checkCancelled(cancel)
         let data = try MediaMetrics.time("iqt.finalEncode", lane: "encode", detail: 1,
                                          attrs: ["codec": codec]) {
             try encoder(image, search.quality)
@@ -166,11 +196,14 @@ public enum ImageQualityTarget {
                               channelScalars: SSIMULACRA2.ChannelScalars? = nil,
                               backend: ScoringBackend? = nil,
                               encoder: @escaping @Sendable (CGImage, Double) throws -> Data) async throws -> Result {
-        try await ScoringExecutor.run {
-            try encode(image, targetScore: targetScore, iterations: iterations, lo: lo, hi: hi,
-                       codec: codec, channelScalars: channelScalars, backend: backend,
-                       encoder: encoder)
-        }
+        let cancel = CancelFlag()
+        return try await withTaskCancellationHandler {
+            try await ScoringExecutor.run {
+                try encodeCore(image, targetScore: targetScore, iterations: iterations, lo: lo, hi: hi,
+                               codec: codec, channelScalars: channelScalars, backend: backend,
+                               cancel: cancel, encoder: encoder)
+            }
+        } onCancel: { cancel.set() }
     }
 
     /// The lossless counterpart for an external encoder (WebP's VP8L, say): one encode, and the score
@@ -232,10 +265,14 @@ public enum ImageQualityTarget {
                                   iterations: Int = 8,
                                   channelScalars: SSIMULACRA2.ChannelScalars? = nil,
                                   backend: ScoringBackend? = nil) async throws -> Result {
-        try await ScoringExecutor.run {
-            try encodeJPEG(image, targetScore: targetScore, iterations: iterations,
-                           channelScalars: channelScalars, backend: backend)
-        }
+        let cancel = CancelFlag()
+        return try await withTaskCancellationHandler {
+            try await ScoringExecutor.run {
+                try encodeCore(image, targetScore: targetScore, iterations: iterations, lo: 0.1, hi: 1.0,
+                               codec: "jpeg", channelScalars: channelScalars, backend: backend,
+                               cancel: cancel) { img, q in try encode(img, quality: q, type: .jpeg) }
+            }
+        } onCancel: { cancel.set() }
     }
 
     // MARK: - PNG (lossless web still)
@@ -345,6 +382,11 @@ public enum ImageQualityTarget {
         ] as CFDictionary)
         guard CGImageDestinationFinalize(dest) else { throw EncodeError.encodeFailed }
         return out as Data
+    }
+
+    /// The still search's cancellation point: one check per pass, on the scoring queue.
+    static func checkCancelled(_ cancel: CancelFlag?) throws {
+        if let cancel, cancel.isSet { throw CancellationError() }
     }
 
     static func decode(_ data: Data) throws -> CGImage {
