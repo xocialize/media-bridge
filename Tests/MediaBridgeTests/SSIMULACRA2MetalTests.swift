@@ -240,6 +240,30 @@ final class SSIMULACRA2MetalTests: XCTestCase {
         XCTAssertEqual(try metal.scoreResident(reference: ref, distorted: dist), serial)
     }
 
+    /// The pool keeps an idle set for the next score; `trimIdle` hands it back when the caller's work is done, and
+    /// the next score rebuilds a fresh set that answers identically (AB-T-0193: an 8K item's ≈ 3.85 GB set outlived it).
+    func testTrimIdleReleasesIdleSetsAndRescoringIsUnchanged() throws {
+        guard let metal = SSIMULACRA2Metal(), metal.residentAvailable else {
+            throw XCTSkip("no Metal device / resident disabled")
+        }
+        let ref = gradientImage(160, 120, shift: 0)
+        let dist = gradientImage(160, 120, shift: 0.05)
+        XCTAssertEqual(metal.idleWorkingSetBytes, 0, "a fresh scorer holds nothing")
+
+        let first = try metal.scoreResident(reference: ref, distorted: dist)
+        let held = metal.idleWorkingSetBytes
+        XCTAssertGreaterThanOrEqual(held, 160 * 120 * 116, "one idle set: 27 float planes + 2 RGBA uploads")
+
+        XCTAssertEqual(metal.trimIdle(toBytes: held), 0, "already within the budget → nothing released")
+        XCTAssertEqual(metal.idleWorkingSetBytes, held)
+        XCTAssertEqual(metal.trimIdle(toBytes: held - 1), held, "one byte over → the whole set goes")
+        XCTAssertEqual(metal.idleWorkingSetBytes, 0)
+
+        XCTAssertEqual(try metal.scoreResident(reference: ref, distorted: dist), first,
+                       "a rebuilt set must score exactly as the released one did")
+        XCTAssertEqual(metal.idleWorkingSetBytes, held, "and the pool keeps it again for the next score")
+    }
+
     // MARK: - Reference (mirrors SSIMULACRA2.gaussianKernel + blur)
 
     private func firKernel(sigma: Float) -> [Float] {

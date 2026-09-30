@@ -111,6 +111,12 @@ runtime-compiled **Metal path** (~4× on 1080p frames, byte-identical search res
 when no Metal device). Rough calibration: 90+ ≈ visually lossless, 70 ≈ high quality, 50 ≈ visibly
 degraded.
 
+The Metal scorer keeps a **working set per image size**, about 116 B per pixel: ≈ 0.24 GB at 1080p,
+≈ 0.96 GB at 4K and ≈ 3.85 GB at 4320×7680. It keeps the set so that the next score at that size, within
+a search or across a batch, reuses it. Nothing frees it until a score at other dimensions arrives. A host
+that knows a unit of work has ended can check `SSIMULACRA2Metal.shared?.idleWorkingSetBytes` and hand
+memory back with `trimIdle(toBytes:)`. ForgeOptimizerKit does this after every item, keeping 1 GiB warm.
+
 Video scores are **not** stills scores. A clip is scored per frame and gated on the **10th
 percentile** — one bad scene can't hide behind a good mean — and the aggregation travels with the
 number (`percentile / percentileScore / mean / minimum / framesScored / frameCount`) so a receipt

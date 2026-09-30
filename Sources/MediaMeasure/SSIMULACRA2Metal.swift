@@ -240,6 +240,9 @@ public final class SSIMULACRA2Metal: @unchecked Sendable {
     /// ~21 float planes + 2 RGBA uploads ≈ 180 MB at 1080p, ~0.7 GB at 4K, reused across frames.
     private final class WorkingSet {
         let w: Int, h: Int, partialCapacity: Int
+        /// What the set's buffers actually hold (`allocatedSize`): ~116 B per pixel — 27 float planes plus the two
+        /// RGBA uploads — so ≈ 0.24 GB at 1080p, ≈ 0.96 GB at 4K and ≈ 3.85 GB at a 4320×7680 still.
+        let bytes: Int
         var inUse = false
         let rgba1: MTLBuffer, rgba2: MTLBuffer
         var rgb1: [MTLBuffer], rgb2: [MTLBuffer]      // current-scale linear RGB (ping)
@@ -269,6 +272,7 @@ public final class SSIMULACRA2Metal: @unchecked Sendable {
             self.w = w; self.h = h; self.partialCapacity = partialFloats
             rgba1 = ra; rgba2 = rb; rgb1 = r1; rgb2 = r2; rgb1b = r1b; rgb2b = r2b
             xyb1 = x1; xyb2 = x2; work = wk; kernelBuf = kb; partials = pt
+            bytes = ([ra, rb, kb, pt] + r1 + r2 + r1b + r2b + x1 + x2 + wk).reduce(0) { $0 + $1.allocatedSize }
         }
     }
     private let poolLock = NSLock()
@@ -301,6 +305,39 @@ public final class SSIMULACRA2Metal: @unchecked Sendable {
         poolLock.unlock()
         return fresh
     }
+    /// Bytes held by IDLE working sets: what the pool keeps between scores so the next score at the same dimensions
+    /// can reuse it (see `WorkingSet.bytes` for the per-set cost).
+    public var idleWorkingSetBytes: Int {
+        poolLock.lock(); defer { poolLock.unlock() }
+        return pool.reduce(0) { $0 + ($1.inUse ? 0 : $1.bytes) }
+    }
+
+    /// Release idle working sets, largest first, until the idle ones hold at most `maxBytes`. A set in use is never
+    /// touched.
+    ///
+    /// The pool's own policy (reuse by exact dimensions, at most `maxIdleSets` idle) keeps a set for the NEXT score.
+    /// That is right inside a search, which scores one size dozens of times, and across a batch of same-size stills. It
+    /// is wrong after a one-off large search: a 4320×7680 still leaves ≈ 3.85 GB idle, and nothing reclaims it until a
+    /// score at other dimensions arrives — after whatever the host runs next has already stacked on top of it (measured
+    /// in ForgeOptimizer: RealPLKSR's upscale on top of an 8K item's set, 11–12 GB of process phys, AB-T-0193). A caller
+    /// that knows a unit of work has ended calls this.
+    /// - Returns: the bytes released.
+    @discardableResult
+    public func trimIdle(toBytes maxBytes: Int) -> Int {
+        poolLock.lock(); defer { poolLock.unlock() }
+        var held = pool.reduce(0) { $0 + ($1.inUse ? 0 : $1.bytes) }
+        guard held > maxBytes else { return 0 }
+        var released = 0
+        var drop: Set<ObjectIdentifier> = []
+        for set in pool.filter({ !$0.inUse }).sorted(by: { $0.bytes > $1.bytes }) where held > maxBytes {
+            drop.insert(ObjectIdentifier(set))
+            held -= set.bytes
+            released += set.bytes
+        }
+        pool.removeAll { drop.contains(ObjectIdentifier($0)) }
+        return released
+    }
+
     private func checkin(_ set: WorkingSet) {
         poolLock.lock()
         set.inUse = false
