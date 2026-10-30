@@ -25,7 +25,7 @@ public struct RawDecodeOptions: Sendable, Equatable {
         case osDefault
         /// Classical demosaic — the only version whose denoise knobs still respond.
         case version8
-        /// Neural joint demosaic + denoise on the ANE.
+        /// Neural joint demosaic + denoise on the ANE. macOS 27 and later; before that the OS default decodes.
         case version9
     }
 

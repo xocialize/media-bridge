@@ -84,7 +84,8 @@ final class RawDecoderImpl: StillDecoding, @unchecked Sendable {
                 filter.decoderVersion = .version8
             }
         case .version9:
-            if filter.supportedDecoderVersions.contains(.version9) {
+            // `CIRAWDecoderVersion.version9` is macOS 27 API; before it the OS default stays, as for an unsupported version.
+            if #available(macOS 27.0, *), filter.supportedDecoderVersions.contains(.version9) {
                 filter.decoderVersion = .version9
             }
         }
