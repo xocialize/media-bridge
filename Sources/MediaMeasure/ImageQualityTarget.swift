@@ -16,7 +16,7 @@ import UniformTypeIdentifiers
 public enum ImageQualityTarget {
 
     public struct Result: Sendable {
-        public let data: Data           // the encoded HEIC at the chosen quality
+        public let data: Data           // the encoded bytes the search scored at `quality`
         public let quality: Double      // ImageIO lossy-compression-quality used
         public let score: Double        // achieved SSIMULACRA2 vs the original
         public let metTarget: Bool
@@ -77,39 +77,10 @@ public enum ImageQualityTarget {
     static func encodeHEICCore(_ image: CGImage, targetScore: Double, iterations: Int,
                                channelScalars: SSIMULACRA2.ChannelScalars?,
                                backend: ScoringBackend?, cancel: CancelFlag?) throws -> Result {
-        let mm = MediaMetrics.begin("iqt.search", lane: "orchestrate",
-                                    attrs: ["codec": "heic", "target": "\(targetScore)",
-                                            "w": "\(image.width)", "h": "\(image.height)"])
-        defer { MediaMetrics.end(mm) }
-        var bestData: Data?
-        let search = try QualityTargetSearch.search(target: targetScore, lo: 0.1, hi: 1.0,
-                                                    iterations: iterations) { q in
-            try checkCancelled(cancel)
-            let data = try MediaMetrics.time("iqt.encode", lane: "encode", detail: 1,
-                                             attrs: ["codec": "heic", "q": String(format: "%.3f", q)]) {
-                try encode(image, quality: q)
-            }
-            let decoded = try MediaMetrics.time("iqt.decode", lane: "decode", detail: 1,
-                                                attrs: ["codec": "heic"]) { try decode(data) }
-            let score: Double = try MediaMetrics.time("iqt.score", lane: "score", detail: 1) {
-                // `Self.` is load-bearing: the `let score` above is in scope inside its own
-                // initializer, so a bare `score(...)` binds to that Double and fails to compile
-                // on the stable toolchain (Xcode 26.6). Qualified, it resolves to the static func.
-                try Self.score(reference: image, distorted: decoded,
-                               channelScalars: channelScalars, backend: backend)
-            }
-            bestData = data        // last evaluated; the search ends on the chosen knob
-            return score
-        }
-        // Re-encode at the chosen quality so `data` matches the returned `quality` exactly.
-        try checkCancelled(cancel)
-        let data = try MediaMetrics.time("iqt.finalEncode", lane: "encode", detail: 1,
-                                         attrs: ["codec": "heic"]) {
-            try encode(image, quality: search.quality)
-        }
-        _ = bestData
-        return Result(data: data, quality: search.quality, score: search.score,
-                      metTarget: search.metTarget)
+        // The generic search with ImageIO's HEIC as the encode step: same knob range, same spans.
+        try encodeCore(image, targetScore: targetScore, iterations: iterations, lo: 0.1, hi: 1.0,
+                       codec: "heic", channelScalars: channelScalars, backend: backend,
+                       cancel: cancel) { img, q in try encode(img, quality: q) }
     }
 
     /// Async entry point: identical to the sync `encodeHEIC` but runs the CPU-bound search **off the
@@ -165,6 +136,11 @@ public enum ImageQualityTarget {
                                     attrs: ["codec": codec, "target": "\(targetScore)",
                                             "w": "\(image.width)", "h": "\(image.height)"])
         defer { MediaMetrics.end(mm) }
+        // The bytes the search may hand back, kept from the probe that produced them: the ceiling
+        // (returned as-is when even `hi` misses the target) and, after it, each probe that meets the
+        // target (the search's best moves to it). Never "the last evaluated" — a bisection's last
+        // probe is often a rejected one. One candidate at a time, not every probe's bytes.
+        var kept: ScoredProbe?
         let search = try QualityTargetSearch.search(target: targetScore, lo: lo, hi: hi,
                                                     iterations: iterations) { q in
             try checkCancelled(cancel)
@@ -174,19 +150,37 @@ public enum ImageQualityTarget {
             }
             let decoded = try MediaMetrics.time("iqt.decode", lane: "decode", detail: 1,
                                                 attrs: ["codec": codec]) { try decode(data) }
-            return try MediaMetrics.time("iqt.score", lane: "score", detail: 1) {
+            let score: Double = try MediaMetrics.time("iqt.score", lane: "score", detail: 1) {
                 try Self.score(reference: image, distorted: decoded,
                                channelScalars: channelScalars, backend: backend)
             }
+            if kept == nil || score >= targetScore { kept = ScoredProbe(quality: q, data: data) }
+            return score
         }
-        // Re-encode at the chosen knob so `data` matches the returned `quality` exactly.
         try checkCancelled(cancel)
-        let data = try MediaMetrics.time("iqt.finalEncode", lane: "encode", detail: 1,
-                                         attrs: ["codec": codec]) {
-            try encoder(image, search.quality)
+        let data = try shippedBytes(kept, for: search) { q in
+            try MediaMetrics.time("iqt.finalEncode", lane: "encode", detail: 1,
+                                  attrs: ["codec": codec]) { try encoder(image, q) }
         }
         return Result(data: data, quality: search.quality, score: search.score,
                       metTarget: search.metTarget)
+    }
+
+    /// One probe's knob and the exact bytes it scored.
+    struct ScoredProbe {
+        let quality: Double
+        let data: Data
+    }
+
+    /// The deliverable for a finished search: the bytes the search scored at exactly the returned
+    /// knob, so `Result.data` is what `Result.score` describes. Re-encoding the chosen knob instead
+    /// costs one encode per item (~84 ms for a 1080p WebP) and, on an encoder that is not
+    /// deterministic, ships bytes nobody scored. Only when no kept probe sits at that knob — which
+    /// the search law never produces today, but a future law could — is the knob encoded again.
+    static func shippedBytes(_ kept: ScoredProbe?, for search: QualityTargetSearch.Result,
+                             encode: (Double) throws -> Data) rethrows -> Data {
+        if let kept, kept.quality == search.quality { return kept.data }
+        return try encode(search.quality)
     }
 
     /// Async entry point — off the cooperative pool at `.utility` QoS (EMBED-004), like `encodeHEIC`.
@@ -253,7 +247,7 @@ public enum ImageQualityTarget {
                                   channelScalars: SSIMULACRA2.ChannelScalars? = nil,
                                   backend: ScoringBackend? = nil) throws -> Result {
         // The generic search with ImageIO's JPEG as the encode step — byte-identical to the
-        // hand-written search it replaced: same knob range, same spans, same final re-encode.
+        // hand-written search it replaced: same knob range, same spans.
         try encode(image, targetScore: targetScore, iterations: iterations, lo: 0.1, hi: 1.0,
                    codec: "jpeg", channelScalars: channelScalars, backend: backend) { img, q in
             try encode(img, quality: q, type: .jpeg)

@@ -111,7 +111,7 @@ final class ExternalStillEncoderTests: XCTestCase {
 
     /// A registered encoder is driven through the generic search exactly like a native format: the
     /// result is decodable by ImageIO, meets the floor (or says it did not), and its bytes are the
-    /// final re-encode at the chosen knob.
+    /// encoder's output at the chosen knob (the scored probe's; the stub is deterministic).
     func testARegisteredEncoderRunsTheSameSearch() throws {
         MediaBridge.register(externalStillEncoder: Stub(id: "stub"))
         let encoder = try XCTUnwrap(MediaBridge.externalStillEncoder(for: .webp))
